@@ -53,6 +53,21 @@ def build_text_for_ai(df, max_blocks=250):
     return "\n".join(lines)
 
 
+def clean_ai_json_output(raw_output):
+    raw_output = raw_output.strip()
+
+    if raw_output.startswith("```json"):
+        raw_output = raw_output.replace("```json", "", 1).strip()
+
+    if raw_output.startswith("```"):
+        raw_output = raw_output.replace("```", "", 1).strip()
+
+    if raw_output.endswith("```"):
+        raw_output = raw_output[:-3].strip()
+
+    return raw_output
+
+
 def check_text_with_ai(df):
     api_key = st.secrets.get("OPENAI_API_KEY")
 
@@ -92,6 +107,8 @@ Svarīgi:
 - Atbildi tikai JSON formātā.
 - JSON jābūt masīvam ar objektiem.
 - Ja nav drošu piezīmju, atgriez tukšu masīvu [].
+- Neizmanto Markdown.
+- Neievieto atbildi ```json blokā.
 
 Katram objektam jābūt šādiem laukiem:
 - block_id
@@ -130,9 +147,10 @@ Teksts pārbaudei:
     )
 
     raw_output = response.output_text.strip()
+    cleaned_output = clean_ai_json_output(raw_output)
 
     try:
-        issues = json.loads(raw_output)
+        issues = json.loads(cleaned_output)
     except json.JSONDecodeError:
         st.error("AI neatgrieza derīgu JSON. Zemāk ir neapstrādāta AI atbilde:")
         st.code(raw_output)
