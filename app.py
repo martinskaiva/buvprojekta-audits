@@ -43,11 +43,10 @@ def extract_pdf_text(file_bytes):
     return pd.DataFrame(rows), len(doc)
 
 
-def build_text_for_ai(df, max_blocks=250):
-    selected = df.head(max_blocks)
-
+def build_text_for_ai(df_chunk):
     lines = []
-    for index, row in selected.iterrows():
+
+    for index, row in df_chunk.iterrows():
         lines.append(f"[ID {index}] [Lapa {row['page']}] {row['text']}")
 
     return "\n".join(lines)
@@ -68,16 +67,8 @@ def clean_ai_json_output(raw_output):
     return raw_output
 
 
-def check_text_with_ai(df):
-    api_key = st.secrets.get("OPENAI_API_KEY")
-
-    if not api_key:
-        st.error("Nav atrasta OPENAI_API_KEY vērtība Streamlit Secrets sadaļā.")
-        return pd.DataFrame()
-
-    client = OpenAI(api_key=api_key)
-
-    text_for_ai = build_text_for_ai(df)
+def analyze_chunk_with_ai(client, df_chunk):
+    text_for_ai = build_text_for_ai(df_chunk)
 
     prompt = f"""
 Tu esi ļoti piesardzīgs būvprojekta dokumentācijas kvalitātes pārbaudītājs Latvijā.
@@ -97,6 +88,12 @@ DRĪKST atzīmēt tikai šādus gadījumus:
 5. Neaizpildītus vietturus, piemēram, dd.mm.gggg, Nr.X, XXX, TODO, [ievietot], ____, ???.
 6. Acīmredzami bojātus datumus vai tehniskus pierakstus, piemēram, 00.00.0000, XX.XX.XXXX, dd.mm.gggg.
 7. Vienā dokumentā skaidri pretrunīgus skaitļus, nosaukumus vai marķējumus, ja pretruna redzama dotajā tekstā.
+
+ĻOTI SVARĪGI PAR RASĒJUMU MARĶĒJUMIEM:
+Būvprojekta rasējumos bieži ir īsi tehniski kodi, piemēram:
+K1, K2, K3, U1, U1RU, PN10, PE100, D160, TS-L, UKT, ZZ, TP, Ø110.
+Šādus kodus, cauruļvadu, tīklu, aku, mezglu, līniju un materiālu marķējumus NEDRĪKST atzīmēt kā valodas kļūdas.
+Atzīmē tehnisku kodu tikai tad, ja redzama skaidra pretruna vai acīmredzams vietturis.
 
 TULKOJUMU PĀRBAUDE:
 Pārbaudi latviešu/angļu tekstus tikai tad, ja blakus vai vienā blokā redzams skaidrs LV/EN pāris.
@@ -142,7 +139,8 @@ NEDRĪKST atzīmēt:
 - vārdus, kur piedāvātais labojums būtiski neatšķiras no esošā teksta;
 - pareizus savienojumus, piemēram, “zaļo toņu gammā”;
 - nākotnes datumus, ja tie ir normālā Latvijas datuma formātā;
-- rasējumu titullauku vērtības, ja tās nav acīmredzami bojātas.
+- rasējumu titullauku vērtības, ja tās nav acīmredzami bojātas;
+- īsus tehniskus rasējuma marķējumus.
 
 NEPĀRBAUDI:
 - būvnormatīvu atbilstību;
@@ -209,15 +207,63 @@ Teksts pārbaudei:
     except json.JSONDecodeError:
         st.error("AI neatgrieza derīgu JSON. Zemāk ir neapstrādāta AI atbilde:")
         st.code(raw_output)
+        return []
+
+    if not isinstance(issues, list):
+        return []
+
+    return issues
+
+
+def check_text_with_ai(df, max_blocks_to_check, chunk_size=200):
+    api_key = st.secrets.get("OPENAI_API_KEY")
+
+    if not api_key:
+        st.error("Nav atrasta OPENAI_API_KEY vērtība Streamlit Secrets sadaļā.")
         return pd.DataFrame()
 
-    if not issues:
+    client = OpenAI(api_key=api_key)
+
+    df_to_check = df.head(max_blocks_to_check)
+    total_blocks = len(df_to_check)
+
+    all_issues = []
+
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+
+    chunks = []
+    for start in range(0, total_blocks, chunk_size):
+        end = min(start + chunk_size, total_blocks)
+        chunks.append((start, end, df_to_check.iloc[start:end]))
+
+    for i, (start, end, df_chunk) in enumerate(chunks, start=1):
+        status_text.write(
+            f"AI pārbauda teksta blokus {start + 1}–{end} no {total_blocks}..."
+        )
+
+        issues = analyze_chunk_with_ai(client, df_chunk)
+        all_issues.extend(issues)
+
+        progress_bar.progress(i / len(chunks))
+
+    status_text.write("AI pārbaude pabeigta.")
+
+    if not all_issues:
         return pd.DataFrame()
 
-    issues_df = pd.DataFrame(issues)
+    issues_df = pd.DataFrame(all_issues)
 
     if "block_id" in issues_df.columns:
         issues_df["block_id"] = pd.to_numeric(issues_df["block_id"], errors="coerce")
+        issues_df = issues_df.dropna(subset=["block_id"])
+        issues_df["block_id"] = issues_df["block_id"].astype(int)
+
+        issues_df = issues_df.drop_duplicates(
+            subset=["block_id", "category", "source_text", "comment"],
+            keep="first",
+        )
+
         issues_df = issues_df.merge(
             df.reset_index().rename(columns={"index": "block_id"}),
             on="block_id",
@@ -324,14 +370,31 @@ if uploaded_file is not None:
 
         st.subheader("AI pārbaude")
 
-        st.warning(
-            "Pirmajā AI versijā tiek pārbaudīti pirmie 250 teksta bloki. "
-            "Tas ir drošības un izmaksu kontroles dēļ."
+        st.write(
+            "Lieliem rasējumiem teksts tiek pārbaudīts pa daļām. "
+            "Tas ļauj pārbaudīt ne tikai pirmos 250 blokus, bet visu failu."
+        )
+
+        max_blocks_to_check = st.number_input(
+            "Cik teksta blokus pārbaudīt?",
+            min_value=1,
+            max_value=len(df),
+            value=len(df),
+            step=50,
+        )
+
+        st.caption(
+            f"Šajā failā kopā ir {len(df)} teksta bloki. "
+            f"Pašlaik pārbaudei atlasīti {max_blocks_to_check} bloki."
         )
 
         if st.button("Pārbaudīt tekstu ar AI"):
             with st.spinner("AI pārbauda tekstu..."):
-                issues_df = check_text_with_ai(df)
+                issues_df = check_text_with_ai(
+                    df=df,
+                    max_blocks_to_check=max_blocks_to_check,
+                    chunk_size=200,
+                )
 
             st.session_state["issues_df"] = issues_df
             st.session_state["file_bytes"] = file_bytes
