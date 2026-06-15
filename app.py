@@ -12,8 +12,8 @@ st.set_page_config(page_title="Būvprojekta PDF pārbaude", layout="wide")
 st.title("Būvprojekta PDF teksta pārbaudes prototips")
 
 st.write(
-    "Augšupielādē PDF failu. Sistēma izvelk tekstu no PDF un var palaist AI pārbaudi "
-    "gramatikas, tulkojumu un tekstuālu neatbilstību meklēšanai."
+    "Augšupielādē PDF failu. Sistēma izvelk tekstu no PDF, palaiž AI pārbaudi "
+    "un var ģenerēt PDF ar komentāriem konkrētās vietās."
 )
 
 
@@ -97,7 +97,8 @@ Nemeklē un neatzīmē:
 - atsevišķus virsrakstus vai tabulu šūnas, kas vieni paši izskatās nepilnīgi;
 - terminus, ja tie nav acīmredzami kļūdaini;
 - normatīvu neatbilstības;
-- rasējuma grafisko simbolu kļūdas.
+- rasējuma grafisko simbolu kļūdas;
+- vārdus, kas var būt īpašvārdi, uzņēmumu nosaukumi, vietvārdi vai projekta specifiski nosaukumi, ja nav pilnīgas pārliecības par kļūdu.
 
 Svarīgi:
 - Neizdomā kļūdas.
@@ -173,6 +174,72 @@ Teksts pārbaudei:
     return issues_df
 
 
+def create_annotated_pdf(file_bytes, issues_df):
+    doc = fitz.open(stream=file_bytes, filetype="pdf")
+
+    for _, issue in issues_df.iterrows():
+        try:
+            page_number = int(issue.get("page_pdf", issue.get("page", 0)))
+            x0 = float(issue.get("x0", 50))
+            y0 = float(issue.get("y0", 50))
+            x1 = float(issue.get("x1", x0 + 100))
+            y1 = float(issue.get("y1", y0 + 20))
+        except (TypeError, ValueError):
+            continue
+
+        if page_number < 1 or page_number > len(doc):
+            continue
+
+        page = doc[page_number - 1]
+
+        category = str(issue.get("category", "other"))
+        severity = str(issue.get("severity", ""))
+        source_text = str(issue.get("source_text", ""))
+        comment = str(issue.get("comment", ""))
+        suggestion = str(issue.get("suggestion", ""))
+        confidence = issue.get("confidence", "")
+
+        annotation_text = (
+            f"AI piezīme\n"
+            f"Kategorija: {category}\n"
+            f"Nopietnība: {severity}\n"
+            f"Ticamība: {confidence}\n\n"
+            f"Atrastais teksts:\n{source_text}\n\n"
+            f"Komentārs:\n{comment}\n\n"
+            f"Ieteikums:\n{suggestion}"
+        )
+
+        # Teksta bloka iezīmēšana ar taisnstūri.
+        rect = fitz.Rect(x0, y0, x1, y1)
+        square_annot = page.add_rect_annot(rect)
+        square_annot.set_info(
+            title="AI būvprojekta pārbaude",
+            content=annotation_text,
+        )
+        square_annot.set_colors(stroke=(1, 0, 0))
+        square_annot.set_border(width=1)
+        square_annot.update()
+
+        # Komentāra ikona blakus tekstam.
+        note_x = max(x1 + 5, x0 + 5)
+        note_y = y0
+        note_point = fitz.Point(note_x, note_y)
+
+        text_annot = page.add_text_annot(note_point, annotation_text)
+        text_annot.set_info(
+            title="AI būvprojekta pārbaude",
+            content=annotation_text,
+        )
+        text_annot.update()
+
+    output = BytesIO()
+    doc.save(output)
+    output.seek(0)
+    doc.close()
+
+    return output
+
+
 uploaded_file = st.file_uploader("Augšupielādē PDF", type=["pdf"])
 
 if uploaded_file is not None:
@@ -210,6 +277,12 @@ if uploaded_file is not None:
             with st.spinner("AI pārbauda tekstu..."):
                 issues_df = check_text_with_ai(df)
 
+            st.session_state["issues_df"] = issues_df
+            st.session_state["file_bytes"] = file_bytes
+
+        issues_df = st.session_state.get("issues_df")
+
+        if issues_df is not None:
             if issues_df.empty:
                 st.info("AI neatrada drošas piezīmes vai atgrieza tukšu rezultātu.")
             else:
@@ -226,6 +299,15 @@ if uploaded_file is not None:
                     data=issues_excel_buffer,
                     file_name="ai_piezimes.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                )
+
+                annotated_pdf = create_annotated_pdf(file_bytes, issues_df)
+
+                st.download_button(
+                    label="Lejupielādēt PDF ar AI piezīmēm",
+                    data=annotated_pdf,
+                    file_name="pdf_ar_ai_piezimem.pdf",
+                    mime="application/pdf",
                 )
 
     else:
