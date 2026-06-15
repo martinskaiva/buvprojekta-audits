@@ -80,21 +80,56 @@ def check_text_with_ai(df):
     text_for_ai = build_text_for_ai(df)
 
     prompt = f"""
-Tu esi būvprojekta dokumentācijas kvalitātes pārbaudītājs Latvijā.
+Tu esi ļoti piesardzīgs būvprojekta dokumentācijas kvalitātes pārbaudītājs Latvijā.
+
+GALVENAIS PRINCIPS:
+Atzīmē tikai drošas, acīmredzamas un praktiski labojamas kļūdas.
+Ja ir kaut nelielas šaubas, piezīmi neliec.
+Labāk neatgriezt piezīmi nekā atgriezt viltus pozitīvu piezīmi.
 
 Pārbaudi zemāk doto PDF izvilkto tekstu no būvprojekta sadaļas.
 
-Meklē tikai skaidras, praktiski labojamas kļūdas:
-1. acīmredzamas latviešu valodas pareizrakstības kļūdas;
-2. acīmredzamas latviešu valodas gramatikas kļūdas;
-3. acīmredzamas angļu valodas pareizrakstības kļūdas;
-4. neaizpildītus vietturus, piemēram, dd.mm.gggg, Nr.X, XXX, TODO;
-5. acīmredzami nepareizus datumus vai tehniskus pierakstus;
-6. vienā dokumentā skaidri pretrunīgus skaitļus, nosaukumus vai marķējumus.
+DRĪKST atzīmēt tikai šādus gadījumus:
+1. Acīmredzamas latviešu valodas pareizrakstības kļūdas.
+2. Acīmredzamas latviešu valodas gramatikas kļūdas.
+3. Acīmredzamas angļu valodas pareizrakstības kļūdas.
+4. Acīmredzami nepareizus latviešu/angļu tulkojumu pārus, ja tulkojums maina nozīmi vai ir skaidri kļūdains.
+5. Neaizpildītus vietturus, piemēram, dd.mm.gggg, Nr.X, XXX, TODO, [ievietot], ____, ???.
+6. Acīmredzami bojātus datumus vai tehniskus pierakstus, piemēram, 00.00.0000, XX.XX.XXXX, dd.mm.gggg.
+7. Vienā dokumentā skaidri pretrunīgus skaitļus, nosaukumus vai marķējumus, ja pretruna redzama dotajā tekstā.
 
-Īpaši svarīgi — NEDRĪKST atzīmēt:
+TULKOJUMU PĀRBAUDE:
+Pārbaudi latviešu/angļu tekstus tikai tad, ja blakus vai vienā blokā redzams skaidrs LV/EN pāris.
+Atzīmē tikai nepārprotamas tulkojuma kļūdas:
+- ja angļu teksts nozīmē kaut ko citu nekā latviešu teksts;
+- ja angļu tekstā ir acīmredzama drukas kļūda;
+- ja LV/EN titullauka pāris ir acīmredzami sajaukts.
+
+NEATZĪMĒ pieņemamus būvprojekta tulkojumu variantus, piemēram:
+- VISPĀRĪGIE RĀDĪTĀJI / GENERAL DATA;
+- RASĒJUMA NR. / SHEET ID;
+- MĒROGS / SCALE;
+- DATUMS / DATE;
+- IZMAIŅA / REVISION;
+- STĀVS / FLOOR;
+- NOSAUKUMS / TITLE vai NAME, ja kontekstā tas ir saprotams.
+
+DATUMU NOTEIKUMS:
+Neatzīmē datumus formātā dd.mm.yyyy vai dd.mm.yyyy. kā kļūdu.
+Piemēri, kurus nedrīkst atzīmēt kā kļūdu:
+- 23.03.2026
+- 23.03.2026.
+- 01.12.2025
+Nākotnes datums pats par sevi nav kļūda būvprojekta dokumentācijā.
+Datumu atzīmē tikai tad, ja tas ir acīmredzams vietturis vai bojāts pieraksts, piemēram:
+- dd.mm.gggg
+- XX.XX.XXXX
+- 00.00.0000
+
+NEDRĪKST atzīmēt:
 - stilistiskus uzlabojumus;
 - gaumes jautājumus;
+- pieņemamus sinonīmus;
 - virsrakstus;
 - attēlu parakstus;
 - tabulu šūnas;
@@ -102,16 +137,20 @@ Meklē tikai skaidras, praktiski labojamas kļūdas:
 - atsauces uz pielikumiem;
 - frāzes, kas izskatās nepilnīgas tikai tāpēc, ka PDF teksts ir sadalīts blokos;
 - tehniskus terminus, ja tie var būt pieņemami projektēšanas dokumentācijā;
-- vietvārdus, īpašvārdus, uzņēmumu nosaukumus vai projekta specifiskus nosaukumus, ja nav pilnīgas pārliecības;
+- vietvārdus, īpašvārdus, uzņēmumu nosaukumus vai projekta specifiskus nosaukumus;
 - vārdu locījumus, ja tie var būt gramatiski pareizi konkrētajā teikumā;
 - vārdus, kur piedāvātais labojums būtiski neatšķiras no esošā teksta;
-- pareizus savienojumus, piemēram, “zaļo toņu gammā”.
+- pareizus savienojumus, piemēram, “zaļo toņu gammā”;
+- nākotnes datumus, ja tie ir normālā Latvijas datuma formātā;
+- rasējumu titullauku vērtības, ja tās nav acīmredzami bojātas.
 
-Nepārbaudi:
+NEPĀRBAUDI:
 - būvnormatīvu atbilstību;
 - rasējuma grafiskos simbolus;
 - attēlu saturu;
-- tehniskā risinājuma pareizību.
+- tehniskā risinājuma pareizību;
+- vai datums atbilst projekta grafikam;
+- vai revīzijas numurs ir pareizs.
 
 Svarīgi:
 - Neizdomā kļūdas.
@@ -119,7 +158,7 @@ Svarīgi:
 - Ja kļūda ir tikai stila jautājums, neliec piezīmi.
 - Ja kļūda balstās tikai uz to, ka viens PDF teksta bloks izskatās nepabeigts, neliec piezīmi.
 - Atgriez tikai piezīmes, kuras cilvēkam tiešām būtu vērts pārbaudīt.
-- Labāk atgriezt mazāk piezīmju, bet ar augstu ticamību.
+- Labāk atgriezt 0 piezīmes nekā 1 nepamatotu piezīmi.
 - Atbildi tikai JSON formātā.
 - JSON jābūt masīvam ar objektiem.
 - Ja nav drošu piezīmju, atgriez tukšu masīvu [].
@@ -150,7 +189,7 @@ Severity izmanto:
 - high
 
 Confidence norādi kā skaitli no 0 līdz 1.
-Atgriez tikai piezīmes ar confidence 0.90 vai augstāku.
+Atgriez tikai piezīmes ar confidence 0.93 vai augstāku.
 
 Teksts pārbaudei:
 {text_for_ai}
