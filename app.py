@@ -66,8 +66,64 @@ def check_text_with_ai(df):
 
     text_for_ai = build_text_for_ai(df)
 
-    prompt = f"""
+prompt = f"""
 Tu esi būvprojekta dokumentācijas kvalitātes pārbaudītājs Latvijā.
+
+Pārbaudi zemāk doto PDF izvilkto tekstu no būvprojekta sadaļas.
+
+Meklē tikai skaidras, praktiski labojamas kļūdas:
+1. acīmredzamas latviešu valodas pareizrakstības vai gramatikas kļūdas;
+2. acīmredzamas angļu valodas pareizrakstības kļūdas;
+3. neaizpildītus vietturus, piemēram, dd.mm.gggg, Nr.X, XXX, TODO;
+4. acīmredzami nepareizus datumus vai nepabeigtas frāzes;
+5. vienā dokumentā skaidri pretrunīgus skaitļus, nosaukumus vai marķējumus.
+
+Nemeklē un neatzīmē:
+- stilistiskus uzlabojumus;
+- formulējumus, kas var būt pieņemami tehniskā dokumentācijā;
+- atsevišķus virsrakstus vai tabulu šūnas, kas vieni paši izskatās nepilnīgi;
+- terminus, ja tie nav acīmredzami kļūdaini;
+- normatīvu neatbilstības;
+- rasējuma grafisko simbolu kļūdas.
+
+Svarīgi:
+- Neizdomā kļūdas.
+- Ja neesi pārliecināts, neliec piezīmi.
+- Ja kļūda ir tikai gaumes/stila jautājums, neliec piezīmi.
+- Atgriez tikai piezīmes, kuras cilvēkam tiešām būtu vērts pārbaudīt.
+- Atbildi tikai JSON formātā.
+- JSON jābūt masīvam ar objektiem.
+- Ja nav drošu piezīmju, atgriez tukšu masīvu [].
+
+Katram objektam jābūt šādiem laukiem:
+- block_id
+- page
+- category
+- severity
+- source_text
+- comment
+- suggestion
+- confidence
+
+Kategorijas izmanto no šī saraksta:
+- grammar
+- spelling
+- translation
+- contradiction
+- placeholder
+- other
+
+Severity izmanto:
+- low
+- medium
+- high
+
+Confidence norādi kā skaitli no 0 līdz 1.
+Atgriez tikai piezīmes ar confidence 0.85 vai augstāku.
+
+Teksts pārbaudei:
+{text_for_ai}
+"""
 
 Pārbaudi zemāk doto PDF izvilkto tekstu no būvprojekta sadaļas.
 Meklē:
