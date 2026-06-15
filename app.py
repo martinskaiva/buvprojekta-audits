@@ -48,9 +48,7 @@ def build_text_for_ai(df, max_blocks=250):
 
     lines = []
     for index, row in selected.iterrows():
-        lines.append(
-            f"[ID {index}] [Lapa {row['page']}] {row['text']}"
-        )
+        lines.append(f"[ID {index}] [Lapa {row['page']}] {row['text']}")
 
     return "\n".join(lines)
 
@@ -66,7 +64,7 @@ def check_text_with_ai(df):
 
     text_for_ai = build_text_for_ai(df)
 
-prompt = f"""
+    prompt = f"""
 Tu esi būvprojekta dokumentācijas kvalitātes pārbaudītājs Latvijā.
 
 Pārbaudi zemāk doto PDF izvilkto tekstu no būvprojekta sadaļas.
@@ -120,44 +118,6 @@ Severity izmanto:
 
 Confidence norādi kā skaitli no 0 līdz 1.
 Atgriez tikai piezīmes ar confidence 0.85 vai augstāku.
-
-Teksts pārbaudei:
-{text_for_ai}
-"""
-
-Pārbaudi zemāk doto PDF izvilkto tekstu no būvprojekta sadaļas.
-Meklē:
-1. gramatikas kļūdas latviešu valodā;
-2. acīmredzamas angļu valodas pareizrakstības/tulkojuma kļūdas;
-3. nekorektus vai aizdomīgus formulējumus;
-4. acīmredzamas tekstuālas pretrunas;
-5. dīvainus datumus, vietturus vai nepabeigtas frāzes.
-
-Svarīgi:
-- Neizdomā kļūdas.
-- Ja neesi pārliecināts, neliec piezīmi.
-- Atgriez tikai reālas un pārbaudāmas piezīmes.
-- Pagaidām nepārbaudi būvnormatīvus.
-- Pagaidām nepārbaudi rasējuma grafiskos simbolus.
-- Atbildi tikai JSON formātā.
-- JSON jābūt masīvam ar objektiem.
-- Katram objektam jābūt šādiem laukiem:
-  - block_id
-  - page
-  - category
-  - source_text
-  - comment
-  - suggestion
-  - confidence
-
-Kategorijas izmanto no šī saraksta:
-- grammar
-- spelling
-- translation
-- terminology
-- contradiction
-- placeholder
-- other
 
 Teksts pārbaudei:
 {text_for_ai}
