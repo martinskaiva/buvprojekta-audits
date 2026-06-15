@@ -85,26 +85,41 @@ Tu esi būvprojekta dokumentācijas kvalitātes pārbaudītājs Latvijā.
 Pārbaudi zemāk doto PDF izvilkto tekstu no būvprojekta sadaļas.
 
 Meklē tikai skaidras, praktiski labojamas kļūdas:
-1. acīmredzamas latviešu valodas pareizrakstības vai gramatikas kļūdas;
-2. acīmredzamas angļu valodas pareizrakstības kļūdas;
-3. neaizpildītus vietturus, piemēram, dd.mm.gggg, Nr.X, XXX, TODO;
-4. acīmredzami nepareizus datumus vai nepabeigtas frāzes;
-5. vienā dokumentā skaidri pretrunīgus skaitļus, nosaukumus vai marķējumus.
+1. acīmredzamas latviešu valodas pareizrakstības kļūdas;
+2. acīmredzamas latviešu valodas gramatikas kļūdas;
+3. acīmredzamas angļu valodas pareizrakstības kļūdas;
+4. neaizpildītus vietturus, piemēram, dd.mm.gggg, Nr.X, XXX, TODO;
+5. acīmredzami nepareizus datumus vai tehniskus pierakstus;
+6. vienā dokumentā skaidri pretrunīgus skaitļus, nosaukumus vai marķējumus.
 
-Nemeklē un neatzīmē:
+Īpaši svarīgi — NEDRĪKST atzīmēt:
 - stilistiskus uzlabojumus;
-- formulējumus, kas var būt pieņemami tehniskā dokumentācijā;
-- atsevišķus virsrakstus vai tabulu šūnas, kas vieni paši izskatās nepilnīgi;
-- terminus, ja tie nav acīmredzami kļūdaini;
-- normatīvu neatbilstības;
-- rasējuma grafisko simbolu kļūdas;
-- vārdus, kas var būt īpašvārdi, uzņēmumu nosaukumi, vietvārdi vai projekta specifiski nosaukumi, ja nav pilnīgas pārliecības par kļūdu.
+- gaumes jautājumus;
+- virsrakstus;
+- attēlu parakstus;
+- tabulu šūnas;
+- sarakstu punktus;
+- atsauces uz pielikumiem;
+- frāzes, kas izskatās nepilnīgas tikai tāpēc, ka PDF teksts ir sadalīts blokos;
+- tehniskus terminus, ja tie var būt pieņemami projektēšanas dokumentācijā;
+- vietvārdus, īpašvārdus, uzņēmumu nosaukumus vai projekta specifiskus nosaukumus, ja nav pilnīgas pārliecības;
+- vārdu locījumus, ja tie var būt gramatiski pareizi konkrētajā teikumā;
+- vārdus, kur piedāvātais labojums būtiski neatšķiras no esošā teksta;
+- pareizus savienojumus, piemēram, “zaļo toņu gammā”.
+
+Nepārbaudi:
+- būvnormatīvu atbilstību;
+- rasējuma grafiskos simbolus;
+- attēlu saturu;
+- tehniskā risinājuma pareizību.
 
 Svarīgi:
 - Neizdomā kļūdas.
 - Ja neesi pārliecināts, neliec piezīmi.
-- Ja kļūda ir tikai gaumes/stila jautājums, neliec piezīmi.
+- Ja kļūda ir tikai stila jautājums, neliec piezīmi.
+- Ja kļūda balstās tikai uz to, ka viens PDF teksta bloks izskatās nepabeigts, neliec piezīmi.
 - Atgriez tikai piezīmes, kuras cilvēkam tiešām būtu vērts pārbaudīt.
+- Labāk atgriezt mazāk piezīmju, bet ar augstu ticamību.
 - Atbildi tikai JSON formātā.
 - JSON jābūt masīvam ar objektiem.
 - Ja nav drošu piezīmju, atgriez tukšu masīvu [].
@@ -135,7 +150,7 @@ Severity izmanto:
 - high
 
 Confidence norādi kā skaitli no 0 līdz 1.
-Atgriez tikai piezīmes ar confidence 0.85 vai augstāku.
+Atgriez tikai piezīmes ar confidence 0.90 vai augstāku.
 
 Teksts pārbaudei:
 {text_for_ai}
@@ -170,6 +185,9 @@ Teksts pārbaudei:
             how="left",
             suffixes=("", "_pdf"),
         )
+
+    if not issues_df.empty:
+        issues_df.insert(0, "include_in_pdf", True)
 
     return issues_df
 
@@ -209,8 +227,8 @@ def create_annotated_pdf(file_bytes, issues_df):
             f"Ieteikums:\n{suggestion}"
         )
 
-        # Teksta bloka iezīmēšana ar taisnstūri.
         rect = fitz.Rect(x0, y0, x1, y1)
+
         square_annot = page.add_rect_annot(rect)
         square_annot.set_info(
             title="AI būvprojekta pārbaude",
@@ -220,7 +238,6 @@ def create_annotated_pdf(file_bytes, issues_df):
         square_annot.set_border(width=1)
         square_annot.update()
 
-        # Komentāra ikona blakus tekstam.
         note_x = max(x1 + 5, x0 + 5)
         note_y = y0
         note_point = fitz.Point(note_x, note_y)
@@ -288,10 +305,22 @@ if uploaded_file is not None:
             else:
                 st.success(f"AI atrada {len(issues_df)} iespējamas piezīmes.")
 
-                st.dataframe(issues_df, use_container_width=True)
+                st.write(
+                    "Pārbaudi AI piezīmes. Ja kāda piezīme nav pamatota, noņem ķeksi kolonnā "
+                    "**include_in_pdf**. PDF tiks ģenerēts tikai ar atzīmētajām piezīmēm."
+                )
+
+                edited_issues_df = st.data_editor(
+                    issues_df,
+                    use_container_width=True,
+                    num_rows="fixed",
+                    key="issues_editor",
+                )
 
                 issues_excel_buffer = BytesIO()
-                issues_df.to_excel(issues_excel_buffer, index=False, engine="openpyxl")
+                edited_issues_df.to_excel(
+                    issues_excel_buffer, index=False, engine="openpyxl"
+                )
                 issues_excel_buffer.seek(0)
 
                 st.download_button(
@@ -301,14 +330,26 @@ if uploaded_file is not None:
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 )
 
-                annotated_pdf = create_annotated_pdf(file_bytes, issues_df)
+                approved_issues_df = edited_issues_df[
+                    edited_issues_df["include_in_pdf"] == True
+                ].copy()
 
-                st.download_button(
-                    label="Lejupielādēt PDF ar AI piezīmēm",
-                    data=annotated_pdf,
-                    file_name="pdf_ar_ai_piezimem.pdf",
-                    mime="application/pdf",
+                st.info(
+                    f"PDF anotācijām atlasītas {len(approved_issues_df)} no "
+                    f"{len(edited_issues_df)} piezīmēm."
                 )
+
+                if not approved_issues_df.empty:
+                    annotated_pdf = create_annotated_pdf(file_bytes, approved_issues_df)
+
+                    st.download_button(
+                        label="Lejupielādēt PDF ar atlasītajām AI piezīmēm",
+                        data=annotated_pdf,
+                        file_name="pdf_ar_ai_piezimem.pdf",
+                        mime="application/pdf",
+                    )
+                else:
+                    st.warning("Nav atlasīta neviena piezīme PDF anotācijām.")
 
     else:
         st.warning(
