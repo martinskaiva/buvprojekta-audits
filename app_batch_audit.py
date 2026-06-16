@@ -13,10 +13,14 @@ st.set_page_config(page_title="Būvprojekta komplekta audits", layout="wide")
 st.title("Būvprojekta komplekta audits")
 
 st.write(
-    "Augšupielādē vairākus PDF failus. Rīks izvelk teksta laukus, veic AI auditu visa "
-    "failu komplekta kontekstā, ļauj atķeksēt piezīmes un lejupielādēt anotētus PDF."
+    "Augšupielādē vairākus PDF failus. Rīks izvelk teksta laukus, veic vairākposmu AI auditu "
+    "visa failu komplekta kontekstā, ļauj atķeksēt piezīmes un lejupielādēt anotētus PDF."
 )
 
+
+# ----------------------------
+# Pamata funkcijas
+# ----------------------------
 
 def get_openai_client():
     api_key = st.secrets.get("OPENAI_API_KEY")
@@ -146,74 +150,108 @@ def clean_ai_json_output(raw_output):
     return raw_output
 
 
-def build_audit_text(all_blocks_df, max_blocks_per_file):
-    parts = []
+def call_ai_json(client, prompt, error_title):
+    response = client.responses.create(
+        model="gpt-4.1-mini",
+        input=prompt,
+        temperature=0,
+    )
 
-    for source_file, file_df in all_blocks_df.groupby("source_file"):
-        document_type = file_df["document_type"].iloc[0]
-        selected = file_df.head(max_blocks_per_file)
+    raw_output = response.output_text.strip()
+    cleaned_output = clean_ai_json_output(raw_output)
 
-        parts.append(
-            f"\n=== DOKUMENTS: {source_file} | TIPS: {document_type} | BLOKI ANALĪZEI: {len(selected)} ==="
+    try:
+        data = json.loads(cleaned_output)
+    except json.JSONDecodeError:
+        st.error(error_title)
+        st.code(raw_output)
+        return []
+
+    if not isinstance(data, list):
+        return []
+
+    return data
+
+
+def normalize_issues(issues, default_source_file=None, default_issue_scope=None):
+    if not issues:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(issues)
+
+    required_columns = [
+        "include_in_pdf",
+        "priority",
+        "issue_type",
+        "category",
+        "source_file",
+        "page",
+        "block_id",
+        "source_text",
+        "comment",
+        "suggestion",
+        "related_files",
+        "confidence",
+    ]
+
+    for col in required_columns:
+        if col not in df.columns:
+            if col == "include_in_pdf":
+                df[col] = True
+            elif col == "source_file" and default_source_file:
+                df[col] = default_source_file
+            else:
+                df[col] = ""
+
+    if default_issue_scope:
+        df["audit_scope"] = default_issue_scope
+    elif "audit_scope" not in df.columns:
+        df["audit_scope"] = ""
+
+    df["priority"] = pd.to_numeric(df["priority"], errors="coerce").fillna(0).astype(int)
+    df["page"] = pd.to_numeric(df["page"], errors="coerce")
+    df["block_id"] = pd.to_numeric(df["block_id"], errors="coerce")
+    df["confidence"] = pd.to_numeric(df["confidence"], errors="coerce").fillna(0)
+
+    return df[required_columns + ["audit_scope"]]
+
+
+def build_blocks_text(blocks_df):
+    lines = []
+
+    for _, row in blocks_df.iterrows():
+        lines.append(
+            f"[source_file={row['source_file']}] "
+            f"[document_type={row['document_type']}] "
+            f"[page={row['page']}] "
+            f"[block_id={row['block_id']}] "
+            f"{row['text']}"
         )
 
-        for _, row in selected.iterrows():
-            parts.append(
-                f"[source_file={row['source_file']}] "
-                f"[document_type={row['document_type']}] "
-                f"[page={row['page']}] "
-                f"[block_id={row['block_id']}] "
-                f"{row['text']}"
-            )
-
-    return "\n".join(parts)
+    return "\n".join(lines)
 
 
-def audit_documents_with_ai(client, all_blocks_df, priority_threshold, max_blocks_per_file):
-    audit_text = build_audit_text(all_blocks_df, max_blocks_per_file)
+# ----------------------------
+# Prompta kopīgā audita loģika
+# ----------------------------
 
-    prompt = f"""
-Tu esi ļoti piesardzīgs būvprojekta dokumentācijas auditors Latvijā.
-
-Tavs uzdevums:
-Auditēt vairākus viena būvprojekta PDF dokumentus kopā. Dokumenti var būt:
-- skaidrojošie apraksti;
-- rasējumi, shēmas, stāvu plāni, ģenerālplāni, griezumi;
-- specifikācijas un apjomu tabulas.
-
+def audit_rules_text(priority_threshold):
+    return f"""
 Lietotāja izvēlētais kļūdu svarīguma slieksnis:
 {priority_threshold}
 
-Atgriez tikai tās piezīmes, kuru priority ir >= {priority_threshold}.
+Atgriez tikai piezīmes, kuru priority >= {priority_threshold}.
 
 GALVENAIS PRINCIPS:
 - Neizdomā kļūdas.
 - Ja ir šaubas, piezīmi neliec.
-- Labāk neatgriezt piezīmi nekā atgriezt viltus pozitīvu.
+- Tomēr drīkst uzdot pamatotu audita jautājumu, ja tas balstās konkrētā tekstā un ir praktiski svarīgs.
 - Piezīmei jābūt piesaistāmai konkrētam failam, lapai un teksta blokam.
-- Ja piezīmi nevar droši piesaistīt blokam, to drīkst dot tikai tad, ja tā ir būtiska, bet block_id liec null.
-
-Dokumentu tipi:
-1. Skaidrojošais apraksts:
-   Parasti nosaukumā ir explanatory note, description, apraksts, skaidrojoš.
-   Meklē sistēmu aprakstus, prasības, diametrus, materiālus, apjomus, aprēķinus,
-   normatīvus, saistītos projektus un atsauces uz rasējumiem/specifikāciju.
-
-2. Rasējums / shēma / plāns / griezums:
-   Parasti nosaukumā ir scheme, layout, section, plan, floor, general data, site plan, drawing, rasējums, plāns, griezums, RA.
-   Meklē titullaukus, rasējuma numurus, nosaukumus, revīzijas, datumus, mērogus,
-   leģendas, tīklu apzīmējumus, marķējumus, diametrus, materiālus, spiediena/stingrības klases.
-
-3. Specifikācija / apjomu tabula:
-   Parasti nosaukumā ir specification, specifikācija, apjomi, works, BOQ, MS.
-   Meklē pozīcijas, pozīciju numurus, markas, daudzumus, mērvienības, LV/EN aprakstus,
-   diametrus, materiālus, spiediena/stingrības klases un tukšas/izlaistas pozīcijas.
-
-Iebūvētā audita loģika pēc lietotāja piemēra:
+- Ja piezīmi nevar droši piesaistīt blokam, block_id liec null.
 
 PRIORITĀTE 10 — obligāti ziņot, ja ir drošs pamats:
 - adreses drukas kļūdas, piemēram ANREJOSTAS pret ANDREJOSTAS;
-- būtiskas gramatikas kļūdas, piemēram “centralizētājā” pret “centralizētajā”;
+- būtiskas gramatikas kļūdas;
 - acīmredzami kļūdaini angļu tulkojumi vispārīgajos rādītājos, leģendās vai specifikācijās;
 - drukas kļūdas specifikācijās, piemēram “Skataka”, “pārsedzī”, “grūžu ķērājs”, “adatflitriem”;
 - LV/EN virsrakstu sajaukšana, piemēram Vispārīgie rādītāji / Drawing list vai Rasējumu saraksts / General Data;
@@ -228,7 +266,6 @@ PRIORITĀTE 10 — obligāti ziņot, ja ir drošs pamats:
 - saistīto projektu saraksta neatbilstības starp dokumentiem;
 - revīzijas/apjomu aktualizācijas jautājumi pēc izmaiņām;
 - A15 slodzes klases risks akām transporta/slodzes zonā;
-- diametru pamatojuma trūkums, ja tekstā redzama acīmredzama neatbilstība vai nepilnība;
 - 3 gab. D110 vienvirziena vārsti bez skaidras piesaistes akām/ievadiem;
 - formulējumi specifikācijā, kas neatbilst faktiskajam darbu apjomam;
 - ārējās ugunsdzēsības vai citu būtisku risinājumu atkarība no saistītā projekta, ja nav skaidrs risinājums.
@@ -253,15 +290,6 @@ PRIORITĀTE 0 — neziņot:
 - datumu atšķirības, ja nav skaidra pamata tās uzskatīt par kļūdu;
 - revīzijas/titullauka sīkumi, ja nav pierādīta ietekme;
 - stila jautājumi.
-
-Īpaši pārbaudi:
-1. Gramatiku un drukas kļūdas — tikai drošas.
-2. Tulkojumus — īpaši LV/EN pārus rasējumos, leģendās, specifikācijās un vispārīgajos rādītājos.
-3. Specifikācijas struktūru — tukšas pozīcijas, izlaistas pozīcijas, trūkstošas markas, neskaidri apjomi.
-4. Starpdokumentu pretrunas — SA pret rasējumiem un specifikāciju.
-5. U1/K1/K2/K3 sistēmas — U1 pievads, K1 tauku atsūknēšana, K2/K3 teknes, K3 tīkli, vienvirziena vārsti.
-6. Normatīvus un saistītos projektus.
-7. Aprēķinus un summas.
 
 Svarīgi, lai nebūtu viltus pozitīvu:
 - PN10 pret SN8 NAV pretruna. PN ir spiediena klase, SN ir stingrības klase.
@@ -311,54 +339,305 @@ issue_type vērtības:
 - normative
 - related_project
 - other
-
-Atgriez tikai piezīmes ar priority >= {priority_threshold}.
-Confidence norādi kā skaitli no 0 līdz 1.
-
-PDF teksta bloki:
-{audit_text}
 """
 
-    response = client.responses.create(
-        model="gpt-4.1-mini",
-        input=prompt,
-        temperature=0,
+
+# ----------------------------
+# 1. Lokālais audits pa dokumentiem
+# ----------------------------
+
+def local_document_audit(client, file_df, priority_threshold, chunk_size):
+    source_file = file_df["source_file"].iloc[0]
+    document_type = file_df["document_type"].iloc[0]
+
+    all_issues = []
+
+    chunks = []
+    for start in range(0, len(file_df), chunk_size):
+        end = min(start + chunk_size, len(file_df))
+        chunks.append(file_df.iloc[start:end])
+
+    for chunk_index, chunk_df in enumerate(chunks, start=1):
+        blocks_text = build_blocks_text(chunk_df)
+
+        prompt = f"""
+Tu esi ļoti piesardzīgs būvprojekta dokumentācijas auditors Latvijā.
+
+Šis ir LOKĀLAIS audits vienam dokumentam.
+Meklē kļūdas tikai šajā dokumentā:
+{source_file}
+
+Dokumenta tips:
+{document_type}
+
+Audita daļa:
+{chunk_index} no {len(chunks)}
+
+{audit_rules_text(priority_threshold)}
+
+Šajā lokālajā auditā īpaši meklē:
+1. Gramatikas un drukas kļūdas.
+2. Tulkojuma kļūdas LV/EN tekstos.
+3. Tukšas vai izlaistas specifikācijas pozīcijas.
+4. Neskaidras specifikācijas rindas.
+5. Nepabeigtus aprēķinus.
+6. Acīmredzamas summu kļūdas.
+7. Vietturus vai nepabeigtus teksta laukus.
+8. Iekšējas pretrunas vienā dokumentā.
+9. Normatīvu vai saistīto projektu sarakstu problēmas, ja tās redzamas šajā dokumentā.
+
+Ja dokumenta tips ir specification:
+- īpaši meklē pozīciju numerācijas caurumus;
+- tukšas pozīcijas;
+- trūkstošas markas;
+- LV/EN rindas neatbilstības;
+- daudzumu vai mērvienību neskaidrības;
+- pozīcijas ar “nepieciešamības gadījumā”, kur dots konkrēts apjoms.
+
+Ja dokumenta tips ir drawing:
+- īpaši meklē nepareizus LV/EN titullauku tulkojumus;
+- leģendu tulkojuma kļūdas;
+- rasējuma nosaukuma neatbilstības;
+- acīmredzamus vietturus vai drukas kļūdas.
+
+Teksta bloki auditam:
+{blocks_text}
+"""
+
+        issues = call_ai_json(
+            client,
+            prompt,
+            f"AI neatgrieza derīgu JSON lokālajam auditam failā {source_file}.",
+        )
+
+        all_issues.extend(issues)
+
+    return normalize_issues(
+        all_issues,
+        default_source_file=source_file,
+        default_issue_scope="local_document_audit",
     )
 
-    raw_output = response.output_text.strip()
-    cleaned_output = clean_ai_json_output(raw_output)
 
-    try:
-        issues = json.loads(cleaned_output)
-    except json.JSONDecodeError:
-        st.error("AI neatgrieza derīgu JSON. Zemāk ir neapstrādāta AI atbilde:")
-        st.code(raw_output)
+# ----------------------------
+# 2. Specifikāciju strukturālais audits
+# ----------------------------
+
+def specification_structure_audit(client, all_blocks_df, priority_threshold, max_blocks_per_spec):
+    spec_df = all_blocks_df[all_blocks_df["document_type"] == "specification"].copy()
+
+    if spec_df.empty:
         return pd.DataFrame()
 
-    if not isinstance(issues, list) or not issues:
+    all_issues = []
+
+    for source_file, file_df in spec_df.groupby("source_file"):
+        selected = file_df.head(max_blocks_per_spec)
+        blocks_text = build_blocks_text(selected)
+
+        prompt = f"""
+Tu esi ļoti piesardzīgs būvprojekta specifikāciju auditors Latvijā.
+
+Šis audits ir paredzēts tikai specifikācijas/apjomu tabulas struktūrai.
+
+Fails:
+{source_file}
+
+{audit_rules_text(priority_threshold)}
+
+Īpaši meklē:
+1. Tukšas pozīcijas.
+2. Izlaistus pozīciju numurus.
+3. Pozīcijas bez markas, ja marka ir nepieciešama.
+4. Pozīcijas, kur LV un EN apraksti atsaucas uz dažādām sistēmām vai marķējumiem.
+5. Pozīcijas, kur norādīts konkrēts apjoms, bet tekstā rakstīts “nepieciešamības gadījumā”.
+6. Vienvirziena vārstus, lūkas, teknes, akas, caurules bez skaidras piesaistes.
+7. Diametrus/materiālus/spiediena klases, kas specifikācijā izskatās pretrunīgi.
+8. Redzamas drukas kļūdas specifikācijas rindās.
+
+Atceries:
+- PN un SN nav viens un tas pats.
+- K2 un K2-T1 nav automātiska pretruna.
+- Ziņo tikai par praktiski pārbaudāmām problēmām.
+
+Specifikācijas teksta bloki:
+{blocks_text}
+"""
+
+        issues = call_ai_json(
+            client,
+            prompt,
+            f"AI neatgrieza derīgu JSON specifikācijas auditam failā {source_file}.",
+        )
+
+        all_issues.extend(issues)
+
+    return normalize_issues(
+        all_issues,
+        default_issue_scope="specification_structure_audit",
+    )
+
+
+# ----------------------------
+# 3. Starpdokumentu audits
+# ----------------------------
+
+def build_cross_document_summary(all_blocks_df, max_blocks_per_file):
+    parts = []
+
+    for source_file, file_df in all_blocks_df.groupby("source_file"):
+        document_type = file_df["document_type"].iloc[0]
+        selected = file_df.head(max_blocks_per_file)
+
+        parts.append(
+            f"\n=== DOKUMENTS: {source_file} | TIPS: {document_type} | BLOKI: {len(selected)} ==="
+        )
+
+        for _, row in selected.iterrows():
+            text = str(row["text"]).strip()
+
+            keep = False
+            lower = text.lower()
+
+            keywords = [
+                "u1", "k1", "k2", "k3",
+                "od", "d110", "d160", "d75", "d50", "dn", "ø",
+                "pn10", "pn16", "sn8", "sn4",
+                "pe", "pe100", "pvc", "pp",
+                "gab", "m ", "90 m", "3 gab",
+                "vienvirziena", "vārst", "varst",
+                "tekne", "aka", "lūka", "luka",
+                "normat", "lbn", "mk ",
+                "saistīt", "saistit",
+                "ugunsdzēs", "ugunsdzes",
+                "tauku", "atsūkn", "atsukn",
+                "andrejostas", "anrejostas",
+                "specifik", "apjomi",
+                "izmaiņa", "izmaina", "revision",
+            ]
+
+            if any(keyword in lower for keyword in keywords):
+                keep = True
+
+            if keep:
+                parts.append(
+                    f"[source_file={row['source_file']}] "
+                    f"[document_type={row['document_type']}] "
+                    f"[page={row['page']}] "
+                    f"[block_id={row['block_id']}] "
+                    f"{row['text']}"
+                )
+
+    return "\n".join(parts)
+
+
+def cross_document_audit(client, all_blocks_df, priority_threshold, max_blocks_per_file):
+    summary_text = build_cross_document_summary(all_blocks_df, max_blocks_per_file)
+
+    if not summary_text.strip():
         return pd.DataFrame()
 
-    issues_df = pd.DataFrame(issues)
+    prompt = f"""
+Tu esi ļoti piesardzīgs būvprojekta starpdokumentu auditors Latvijā.
 
-    if "include_in_pdf" not in issues_df.columns:
-        issues_df.insert(0, "include_in_pdf", True)
+Šis ir STARPDOUMENTU audits visam augšupielādēto PDF komplektam.
+Salīdzini skaidrojošos aprakstus, rasējumus un specifikācijas savā starpā.
 
-    if "priority" in issues_df.columns:
-        issues_df["priority"] = pd.to_numeric(issues_df["priority"], errors="coerce").fillna(0)
-        issues_df = issues_df[issues_df["priority"] >= priority_threshold].copy()
+{audit_rules_text(priority_threshold)}
 
-    if "block_id" in issues_df.columns:
-        issues_df["block_id"] = pd.to_numeric(issues_df["block_id"], errors="coerce")
+Šajā starpdokumentu auditā īpaši meklē:
+1. SA pret rasējumiem:
+   - vai diametri sakrīt;
+   - vai materiāli sakrīt;
+   - vai sistēmu apzīmējumi sakrīt;
+   - vai aprakstītie elementi ir redzami rasējumu/specifikāciju tekstā.
 
-    if "page" in issues_df.columns:
-        issues_df["page"] = pd.to_numeric(issues_df["page"], errors="coerce")
+2. Rasējumi pret specifikāciju:
+   - D110 pret D160;
+   - D75 pret D50;
+   - OD75 pret OD110;
+   - PE pret PP/PVC;
+   - PN10 pret PN16;
+   - K2 pret K3, ja attiecas uz vienu pozīciju;
+   - teknes, akas, vārsti, lūkas, caurules.
 
-    return issues_df
+3. U1/K1/K2/K3:
+   - U1 ūdensvada pievads;
+   - K1 tauku atsūknēšanas caurule;
+   - K2/K3 teknes;
+   - K3 tīkli;
+   - vienvirziena vārsti.
+
+4. Normatīvi un saistītie projekti:
+   - normatīvu sarakstu atšķirības;
+   - saistīto projektu sarakstu atšķirības;
+   - ārējās ugunsdzēsības atkarība no saistītā projekta.
+
+5. Apjomi:
+   - 3 gab. elementi bez piesaistes;
+   - 90 m pozīcijas bez skaidras trases;
+   - “nepieciešamības gadījumā” ar konkrētu apjomu.
+
+Atceries:
+- Ja viens dokuments kaut ko nemin, tā nav automātiska pretruna.
+- Tomēr, ja skaidrojošajā aprakstā un rasējumā ir būtisks elements, bet specifikācijā nav skaidri redzamas atbilstošas pozīcijas, drīkst ziņot kā audita jautājumu.
+- Piezīmi piesaisti tam failam/blokam, kur problēma vislabāk redzama.
+
+Starpdokumentu salīdzināšanai atlasītie teksta bloki:
+{summary_text}
+"""
+
+    issues = call_ai_json(
+        client,
+        prompt,
+        "AI neatgrieza derīgu JSON starpdokumentu auditam.",
+    )
+
+    return normalize_issues(
+        issues,
+        default_issue_scope="cross_document_audit",
+    )
+
+
+# ----------------------------
+# Rezultātu apvienošana
+# ----------------------------
+
+def combine_and_filter_issues(issue_frames, priority_threshold):
+    frames = [df for df in issue_frames if df is not None and not df.empty]
+
+    if not frames:
+        return pd.DataFrame()
+
+    combined = pd.concat(frames, ignore_index=True)
+
+    combined["priority"] = pd.to_numeric(combined["priority"], errors="coerce").fillna(0).astype(int)
+    combined = combined[combined["priority"] >= priority_threshold].copy()
+
+    combined["source_file"] = combined["source_file"].astype(str)
+    combined["source_text"] = combined["source_text"].astype(str)
+    combined["comment"] = combined["comment"].astype(str)
+
+    combined = combined.drop_duplicates(
+        subset=["source_file", "page", "block_id", "issue_type", "category", "source_text", "comment"],
+        keep="first",
+    )
+
+    combined = combined.sort_values(
+        by=["priority", "source_file", "page"],
+        ascending=[False, True, True],
+    ).reset_index(drop=True)
+
+    return combined
 
 
 def merge_issue_coordinates(issues_df, all_blocks_df):
     if issues_df.empty:
         return issues_df
+
+    issues_df = issues_df.copy()
+    issues_df["block_id"] = pd.to_numeric(issues_df["block_id"], errors="coerce")
+    issues_df["page"] = pd.to_numeric(issues_df["page"], errors="coerce")
 
     merged = issues_df.merge(
         all_blocks_df[
@@ -381,6 +660,10 @@ def merge_issue_coordinates(issues_df, all_blocks_df):
 
     return merged
 
+
+# ----------------------------
+# Eksports
+# ----------------------------
 
 def make_excel_bytes(issues_df, all_blocks_df):
     output = BytesIO()
@@ -435,6 +718,7 @@ def create_annotated_pdf(file_bytes, file_issues_df):
         annotation_text = (
             f"AI piezīme\n"
             f"Prioritāte: {issue.get('priority', '')}\n"
+            f"Audita posms: {issue.get('audit_scope', '')}\n"
             f"Tips: {issue.get('issue_type', '')}\n"
             f"Kategorija: {issue.get('category', '')}\n"
             f"Ticamība: {issue.get('confidence', '')}\n\n"
@@ -487,6 +771,10 @@ def create_zip_with_results(uploaded_file_bytes, approved_issues_df, all_blocks_
     return zip_buffer
 
 
+# ----------------------------
+# UI
+# ----------------------------
+
 uploaded_files = st.file_uploader(
     "Augšupielādē auditējamos PDF failus",
     type=["pdf"],
@@ -508,6 +796,15 @@ max_blocks_per_file = st.number_input(
     max_value=1500,
     value=700,
     step=50,
+)
+
+chunk_size = st.number_input(
+    "Lokālā audita porcijas izmērs",
+    min_value=50,
+    max_value=400,
+    value=200,
+    step=50,
+    help="Mazāka porcija nozīmē rūpīgāku, bet lēnāku auditu.",
 )
 
 if uploaded_files:
@@ -550,7 +847,9 @@ if uploaded_files:
         else pd.DataFrame()
     )
 
-    st.success(f"Kopā izvilkti {len(all_blocks_df)} teksta bloki no {len(uploaded_files)} PDF failiem.")
+    st.success(
+        f"Kopā izvilkti {len(all_blocks_df)} teksta bloki no {len(uploaded_files)} PDF failiem."
+    )
 
     with st.expander("Apskatīt izvilktos teksta blokus"):
         st.dataframe(all_blocks_df, use_container_width=True)
@@ -559,17 +858,75 @@ if uploaded_files:
         client = get_openai_client()
 
         if client is not None:
-            with st.spinner("AI auditē visu dokumentu komplektu..."):
-                issues_df = audit_documents_with_ai(
+            progress = st.progress(0)
+            status = st.empty()
+
+            issue_frames = []
+
+            grouped_files = list(all_blocks_df.groupby("source_file"))
+            total_steps = len(grouped_files) + 2
+            current_step = 0
+
+            for source_file, file_df in grouped_files:
+                current_step += 1
+                status.write(f"Lokālais audits: {source_file}")
+
+                selected_file_df = file_df.head(max_blocks_per_file)
+
+                with st.spinner(f"AI lokāli auditē {source_file}..."):
+                    local_issues_df = local_document_audit(
+                        client=client,
+                        file_df=selected_file_df,
+                        priority_threshold=priority_threshold,
+                        chunk_size=chunk_size,
+                    )
+
+                if not local_issues_df.empty:
+                    issue_frames.append(local_issues_df)
+
+                progress.progress(current_step / total_steps)
+
+            current_step += 1
+            status.write("Specifikāciju strukturālais audits...")
+
+            with st.spinner("AI pārbauda specifikāciju struktūru..."):
+                spec_issues_df = specification_structure_audit(
+                    client=client,
+                    all_blocks_df=all_blocks_df,
+                    priority_threshold=priority_threshold,
+                    max_blocks_per_spec=max_blocks_per_file,
+                )
+
+            if not spec_issues_df.empty:
+                issue_frames.append(spec_issues_df)
+
+            progress.progress(current_step / total_steps)
+
+            current_step += 1
+            status.write("Starpdokumentu audits...")
+
+            with st.spinner("AI salīdzina dokumentus savā starpā..."):
+                cross_issues_df = cross_document_audit(
                     client=client,
                     all_blocks_df=all_blocks_df,
                     priority_threshold=priority_threshold,
                     max_blocks_per_file=max_blocks_per_file,
                 )
 
-            issues_df = merge_issue_coordinates(issues_df, all_blocks_df)
+            if not cross_issues_df.empty:
+                issue_frames.append(cross_issues_df)
 
-            st.session_state["batch_audit_issues_df"] = issues_df
+            progress.progress(current_step / total_steps)
+            status.write("Audits pabeigts.")
+
+            combined_issues_df = combine_and_filter_issues(
+                issue_frames=issue_frames,
+                priority_threshold=priority_threshold,
+            )
+
+            combined_issues_df = merge_issue_coordinates(combined_issues_df, all_blocks_df)
+
+            st.session_state["batch_audit_issues_df"] = combined_issues_df
             st.session_state["batch_audit_blocks_df"] = all_blocks_df
             st.session_state["batch_audit_file_bytes_map"] = file_bytes_map
 
