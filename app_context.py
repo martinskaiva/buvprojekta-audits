@@ -13,7 +13,8 @@ st.title("Būvprojekta projekta konteksta prototips")
 
 st.write(
     "Šis rīks izveido projekta kontekstu no vairākiem PDF dokumentiem un pēc tam ļauj "
-    "pārbaudīt jaunu PDF pret iepriekš izveidoto projekta kontekstu."
+    "pārbaudīt jaunu PDF pret iepriekš izveidoto projekta kontekstu. "
+    "Papildus tiek pārbaudītas arī drošas valodas/tulkojuma kļūdas jaunajā PDF."
 )
 
 
@@ -189,33 +190,28 @@ Dokuments:
 Automātiski noteiktais dokumenta tips:
 {document_type} — {doc_type_readable}
 
-Dokumenta tipi un atpazīšana:
+Dokumenta tipi:
 1. Skaidrojošais apraksts:
-   Parasti faila nosaukumā ir "explanatory note", "description", "apraksts", "skaidrojoš".
-   Šādos dokumentos meklē pilnus teikumus, sistēmu aprakstus, prasības, diametrus, materiālus,
-   projektēšanas pieņēmumus, apjomus, stadiju, kārtu, adresi, objektu un atsauces uz rasējumiem.
+   Faila nosaukumā parasti ir "explanatory note", "description", "apraksts", "skaidrojoš".
+   Meklē sistēmu aprakstus, prasības, diametrus, materiālus, daudzumus, stadiju, kārtu,
+   adresi, objektu un atsauces uz rasējumiem.
 
 2. Rasējums, shēma, stāva plāns, ģenerālplāns vai griezums:
-   Parasti faila nosaukumā ir "scheme", "layout", "section", "plan", "floor", "general data",
-   "site plan", "drawing", "rasējums", "plāns", "stāva plāns", "griezums".
-   Šādos dokumentos teksts bieži ir īss, tabulveida vai titullaukos.
-   Te jāmeklē rasējuma numurs, rasējuma nosaukums, sadaļas kods, titullauka dati, revīzija,
-   datums, mērogs, lapas ID, sistēmu/tīklu marķējumi, leģenda, apzīmējumi, diametri,
-   materiāli, spiediena klases un piezīmes.
-   Īsi kodi rasējumos var būt derīgi fakti, ja tiem ir tehnisks konteksts.
+   Faila nosaukumā parasti ir "scheme", "layout", "section", "plan", "floor",
+   "general data", "site plan", "drawing", "rasējums", "plāns", "griezums".
+   Meklē rasējuma numuru, nosaukumu, sadaļas kodu, titullauka datus, revīziju,
+   datumu, mērogu, lapas ID, sistēmu/tīklu marķējumus, leģendu, apzīmējumus,
+   diametrus, materiālus, spiediena klases un piezīmes.
 
 3. Specifikācija vai apjomu tabula:
-   Parasti faila nosaukumā ir "specification", "specifikācija", "apjomi", "works", "boq",
-   "bill of quantities".
-   Šādos dokumentos meklē pozīcijas, pozīciju numurus, markas, sistēmas, diametrus, materiālus,
-   spiediena klases, daudzumus, mērvienības, LV/EN aprakstus un iespējamas vienas rindas
-   tehniskās neatbilstības.
+   Faila nosaukumā parasti ir "specification", "specifikācija", "apjomi", "works", "boq".
+   Meklē pozīcijas, pozīciju numurus, markas, sistēmas, diametrus, materiālus,
+   spiediena klases, daudzumus, mērvienības un LV/EN aprakstus.
 
 GALVENAIS PRINCIPS:
 Izvelc tikai konkrētus, pārbaudāmus faktus.
 Neizdomā informāciju.
 Ja nav pārliecības, faktu neizvelc.
-Neveido secinājumus par normatīvu atbilstību.
 Šis nav gramatikas pārbaudes uzdevums.
 
 Meklē šādus faktu tipus:
@@ -244,6 +240,7 @@ Meklē šādus faktu tipus:
 - pipe_diameter
 - pipe_material
 - pressure_class
+- stiffness_class
 - quantity
 - unit
 - material_or_parameter
@@ -256,42 +253,42 @@ Ja dokumenta tips ir explanatory_note:
 - Meklē objekta nosaukumu, adresi, stadiju, kārtu.
 - Meklē sistēmu nosaukumus un aprakstus.
 - Meklē diametrus, materiālus, spiediena klases un daudzumus, ja tie minēti tekstā.
-- Meklē atsauces uz konkrētiem rasējumiem, sistēmām, mezgliem, pozīcijām.
 - Meklē prasības, piemēram, kur jāuzstāda konkrēti elementi.
 
 Ja dokumenta tips ir drawing:
 - Neignorē titullaukus un īsus blokus.
 - Izvelc rasējuma numuru, nosaukumu, lapas ID, datumu, revīziju, mērogu, sadaļas kodu.
-- Izvelc GENERAL DATA / VISPĀRĪGIE RĀDĪTĀJI tipa nosaukumus kā drawing_title vai document_title.
-- Izvelc SITE PLAN, WATER AND SEWERAGE NETWORKS, STĀVA PLĀNS, SHĒMA, GRIEZUMS tipa nosaukumus kā drawing_title.
+- Izvelc GENERAL DATA / VISPĀRĪGIE RĀDĪTĀJI kā drawing_title vai document_title.
+- Izvelc SITE PLAN, WATER AND SEWERAGE NETWORKS, STĀVA PLĀNS, SHĒMA, GRIEZUMS kā drawing_title.
 - Izvelc tīklu un sistēmu kodus, piemēram U1, K1, K2, K3, ja tie parādās kopā ar diametru,
   materiālu, leģendu, līniju, tīklu vai piezīmēm.
-- Izvelc diametrus un parametrus, piemēram D110, D160, OD75, OD110, Ø110, DN100, PE, PE100, PN10, PN16.
+- Izvelc parametrus, piemēram D110, D160, OD75, OD110, Ø110, DN100, PE, PE100, PN10, PN16, SN8.
+- PN10/PN16 klasificē kā pressure_class.
+- SN4/SN8/SN16 klasificē kā stiffness_class, nevis pressure_class.
 - Izvelc leģendas un apzīmējumu ierakstus kā legend_item.
 - Izvelc rasējuma piezīmes kā note vai technical_requirement.
-- Neuzskati īsu tekstu par nederīgu tikai tāpēc, ka tas ir īss; rasējumos īss teksts bieži ir nozīmīgs.
 
 Ja dokumenta tips ir specification:
 - Izvelc specifikācijas rindas kā specification_item.
 - Izvelc pozīciju numurus kā specification_position.
 - Izvelc markas, mezglus, akas, teknes, caurules, vārstus, lūkas un citas pozīcijas.
 - Izvelc daudzumus un mērvienības.
-- Izvelc diametrus, materiālus, spiediena klases.
+- Izvelc diametrus, materiālus, spiediena klases un stingrības klases.
+- PN10/PN16 klasificē kā pressure_class.
+- SN4/SN8/SN16 klasificē kā stiffness_class.
 - Ja rindā ir latviešu un angļu apraksts, izvelc to kā lv_en_description_pair.
-- Ja vienā rindā parādās atšķirīgi marķējumi LV un EN aprakstā, saglabā tos kā faktus,
-  jo vēlāk tos var salīdzināt.
+- Ja vienā rindā parādās atšķirīgi marķējumi LV un EN aprakstā, saglabā tos kā faktus.
 
 Svarīgi par tehniskajiem kodiem:
 - Tehniskos kodus drīkst izvilkt kā faktus, ja tiem ir konteksts.
 - Neizvelc pilnīgi izolētus kodus bez skaidra konteksta.
 - Ja vienā blokā redzami vairāki parametri, izvelc tos kā atsevišķus faktus.
-- Piemēri derīgiem faktiem ar kontekstu: U1 OD110 PE PN10, K2-T1, K3-5, OD75, D160, PN10, PE100.
+- Piemēri derīgiem faktiem ar kontekstu: U1 OD110 PE PN10, K2-T1, K3-5, OD75, D160, PN10, PE100, SN8.
 
 Nedrīkst izvilkt:
 - pieņēmumus;
 - attēlu saturu;
 - grafiskus elementus;
-- frāzes, kas ir pilnīgi nesaprotamas PDF teksta izvilkšanas kļūdas dēļ;
 - faktus, kuri nav redzami ievadītajā tekstā.
 
 Atbildi tikai JSON formātā.
@@ -309,18 +306,7 @@ Katram objektam jābūt šādiem laukiem:
 - evidence
 - confidence
 
-Lauku skaidrojums:
-- fact_id: īss unikāls ID šajā dokumentā, piemēram, F001
-- block_id: PDF teksta bloka ID no ievades
-- page: lapas numurs
-- fact_type: viens no atļautajiem faktu tipiem
-- label: cilvēkam saprotams lauka nosaukums
-- value: konkrētā vērtība
-- evidence: īss fragments no teksta, kas pamato faktu
-- confidence: skaitlis no 0 līdz 1
-
 Atgriez tikai faktus ar confidence 0.70 vai augstāku.
-Faktu izvilkšanai drīkst būt zemāks slieksnis nekā pretrunu ziņošanai, jo vēlāk pretrunas tiks filtrētas stingrāk.
 
 PDF teksts:
 {document_text}
@@ -353,6 +339,129 @@ PDF teksts:
     facts_df.insert(1, "source_document_type", document_type)
 
     return facts_df
+
+
+def check_language_in_new_document(client, document_name, document_type, text_df, max_blocks):
+    document_text = build_document_text(text_df, max_blocks)
+    doc_type_readable = document_type_label(document_type)
+
+    prompt = f"""
+Tu esi ļoti piesardzīgs būvprojekta dokumentācijas valodas un tulkojumu pārbaudītājs Latvijā.
+
+Tavs uzdevums:
+Pārbaudi JAUNĀ PDF dokumenta izvilkto tekstu un atrodi tikai drošas, acīmredzamas un praktiski labojamas
+valodas, pareizrakstības vai tulkojuma kļūdas.
+
+Dokuments:
+{document_name}
+
+Dokumenta tips:
+{document_type} — {doc_type_readable}
+
+GALVENAIS PRINCIPS:
+Atzīmē tikai drošas kļūdas.
+Ja ir kaut nelielas šaubas, piezīmi neliec.
+Labāk atgriezt 0 piezīmes nekā 1 nepamatotu piezīmi.
+
+Drīkst atzīmēt:
+1. Acīmredzamas latviešu valodas pareizrakstības kļūdas.
+2. Acīmredzamas latviešu valodas gramatikas kļūdas.
+3. Acīmredzamas angļu valodas pareizrakstības kļūdas.
+4. Acīmredzami nepareizus LV/EN tulkojumu pārus, ja tie maina nozīmi.
+5. Neaizpildītus vietturus, piemēram dd.mm.gggg, Nr.X, XXX, TODO, [ievietot].
+6. Acīmredzami bojātus tehniskus pierakstus.
+
+Tulkojumu pārbaude:
+- Pārbaudi LV/EN pārus rasējumu titullaukos, tabulās un specifikācijās.
+- Atzīmē tikai tad, ja tulkojums ir acīmredzami nepareizs vai maina tehnisko nozīmi.
+- Neatzīmē pieņemamus variantus:
+  VISPĀRĪGIE RĀDĪTĀJI / GENERAL DATA,
+  RASĒJUMA NR. / SHEET ID,
+  MĒROGS / SCALE,
+  DATUMS / DATE,
+  IZMAIŅA / REVISION,
+  STĀVS / FLOOR.
+
+Datumu noteikums:
+Neatzīmē datumus formātā dd.mm.yyyy vai dd.mm.yyyy. kā kļūdu.
+Nākotnes datums pats par sevi nav kļūda.
+Atzīmē tikai vietturus vai bojātus datumus, piemēram dd.mm.gggg, XX.XX.XXXX, 00.00.0000.
+
+Nedrīkst atzīmēt:
+- stilistiskus uzlabojumus;
+- pieņemamus sinonīmus;
+- virsrakstus vai tabulu šūnas kā nepilnīgas frāzes;
+- tehniskus kodus kā valodas kļūdas;
+- PN10, SN8, OD110, D160, PE100 un līdzīgus tehniskus pierakstus kā valodas kļūdas;
+- vietvārdus, īpašvārdus un projekta specifiskus nosaukumus, ja nav pilnīgas pārliecības;
+- frāzes, kas izskatās nepilnīgas tikai PDF teksta bloku sadalījuma dēļ.
+
+Atbildi tikai JSON formātā.
+JSON jābūt masīvam ar objektiem.
+Ja nav drošu piezīmju, atgriez tukšu masīvu [].
+Neizmanto Markdown.
+
+Katram objektam jābūt šādiem laukiem:
+- include_in_pdf
+- issue_type
+- block_id
+- page
+- category
+- severity
+- source_text
+- comment
+- suggestion
+- confidence
+
+Kategorijas:
+- grammar
+- spelling
+- translation
+- placeholder
+- other
+
+Severity:
+- low
+- medium
+- high
+
+Confidence norādi kā skaitli no 0 līdz 1.
+Atgriez tikai piezīmes ar confidence 0.93 vai augstāku.
+
+PDF teksts:
+{document_text}
+"""
+
+    issues = call_ai_json(
+        client=client,
+        prompt=prompt,
+        error_title="AI neatgrieza derīgu JSON jaunā dokumenta valodas pārbaudei.",
+    )
+
+    if not issues:
+        return pd.DataFrame()
+
+    issues_df = pd.DataFrame(issues)
+
+    if "include_in_pdf" not in issues_df.columns:
+        issues_df.insert(0, "include_in_pdf", True)
+
+    if "issue_type" not in issues_df.columns:
+        issues_df.insert(1, "issue_type", "language")
+
+    if "block_id" in issues_df.columns:
+        issues_df["block_id"] = pd.to_numeric(issues_df["block_id"], errors="coerce")
+        issues_df = issues_df.dropna(subset=["block_id"])
+        issues_df["block_id"] = issues_df["block_id"].astype(int)
+
+        issues_df = issues_df.merge(
+            text_df.reset_index().rename(columns={"index": "block_id"}),
+            on="block_id",
+            how="left",
+            suffixes=("", "_pdf"),
+        )
+
+    return issues_df
 
 
 def make_context_excel(all_text_df, all_facts_df):
@@ -428,28 +537,35 @@ Ja ir kaut nelielas šaubas, pretrunu neliec.
 Atgriez tikai tādas pretrunas, kuras cilvēkam tiešām būtu vērts pārbaudīt.
 
 Drīkst atzīmēt:
-1. Atšķirīgu objekta nosaukumu, ja atšķirība nav tikai locījums vai saīsinājums.
-2. Atšķirīgu adresi, ja tā izskatās kā reāla pretruna vai pārrakstīšanās kļūda.
-3. Atšķirīgu projekta stadiju vai kārtu, ja vērtības tiešām konfliktē.
-4. Sadaļas, rasējuma numura vai dokumenta nosaukuma pretrunu.
-5. Diametra pretrunu, piemēram OD75 pret OD110, D110 pret D160, ja abas vērtības attiecas uz vienu un to pašu elementu.
-6. Materiāla pretrunu, piemēram PE100 pret PVC, ja abas vērtības attiecas uz vienu un to pašu elementu.
-7. Spiediena klases pretrunu, piemēram PN10 pret PN16.
-8. Daudzuma pretrunu, piemēram 3 gab. pret 4 gab., ja tas attiecas uz vienu un to pašu pozīciju.
-9. Marķējuma pretrunu, piemēram viena un tā pati tekne vai aka vienā vietā piesaistīta K2, citur K3.
-10. LV/EN apraksta pretrunu specifikācijas rindā, ja tā maina tehnisko nozīmi.
-11. Ja kontekstā ir zināma iepriekšēja problēma, un jaunais dokuments rāda, ka tā joprojām var būt aktuāla.
+1. Atšķirīgu objekta nosaukumu, adresi, stadiju vai kārtu, ja vērtības tiešām konfliktē.
+2. Sadaļas, rasējuma numura vai dokumenta nosaukuma pretrunu.
+3. Diametra pretrunu, piemēram OD75 pret OD110, D110 pret D160, ja abas vērtības attiecas uz vienu un to pašu elementu.
+4. Materiāla pretrunu, piemēram PE100 pret PVC, ja abas vērtības attiecas uz vienu un to pašu elementu.
+5. Spiediena klases pretrunu, piemēram PN10 pret PN16.
+6. Stingrības klases pretrunu, piemēram SN4 pret SN8.
+7. Daudzuma pretrunu, piemēram 3 gab. pret 4 gab., ja tā attiecas uz vienu un to pašu pozīciju.
+8. Marķējuma pretrunu, piemēram viena un tā pati tekne vai aka vienā vietā piesaistīta K2, citur K3.
+9. LV/EN apraksta pretrunu specifikācijas rindā, ja tā maina tehnisko nozīmi.
 
-Īpaši meklē būvprojekta tehniskās pretrunas:
+Īpaši meklē:
 - OD75 pret OD110;
 - D110 pret D160;
 - Ø110 pret Ø160;
 - PN10 pret PN16;
+- SN4 pret SN8;
 - PE100 pret PVC;
 - K2 pret K3 vienai un tai pašai pozīcijai;
-- K1-1 pret K2-2 vai K3-4, ja tie parādās vienas specifikācijas pozīcijas LV/EN aprakstos;
-- 3 gab. vienvirziena vārsti bez skaidras piesaistes akām/ievadiem;
-- apjomi, piemēram 90 m, bez skaidras piesaistes trases posmiem, ja kontekstā šis jautājums jau ir aktuāls.
+- K1-1 pret K2-2 vai K3-4 vienas specifikācijas pozīcijas LV/EN aprakstos.
+
+Ļoti svarīgi:
+- PN un SN nav viena un tā pati parametru grupa.
+- PN10/PN16 ir spiediena klase.
+- SN4/SN8/SN16 ir stingrības klase.
+- NEDRĪKST atzīmēt PN10 pret SN8 kā pretrunu, jo tie nav salīdzināmi parametri.
+- PE pret PP drīkst atzīmēt tikai tad, ja skaidrs, ka abi attiecas uz vienu un to pašu elementu.
+- D110 pret D160 drīkst atzīmēt tikai tad, ja skaidrs, ka abi attiecas uz vienu un to pašu elementu.
+- K2 pret K2-T1 nav automātiska pretruna, jo K2-T1 var būt K2 sistēmas apakšmezgls.
+- K2 pret K3 var būt pretruna tikai tad, ja tie attiecas uz vienu un to pašu pozīciju vai elementu.
 
 Nedrīkst atzīmēt:
 - faktu, kas ir tikai vienā pusē un otrā pusē nav minēts, ja nav skaidra iemesla to uzskatīt par problēmu;
@@ -461,9 +577,7 @@ Nedrīkst atzīmēt:
 - grafiskus simbolus vai attēlus;
 - tehniskus kodus bez konteksta.
 
-Ļoti svarīgi:
 Pretruna ir tikai tad, ja var saprast, ka abas vērtības attiecas uz vienu un to pašu elementu, sistēmu, pozīciju, dokumentu, tīklu vai prasību.
-Ja jaunajā dokumentā nav atrasta vērtība, kas bija kontekstā, formulē piesardzīgi: “pārbaudītajā tekstā nav skaidri identificēts”, nevis “nav”.
 
 Atbildi tikai JSON formātā.
 JSON jābūt masīvam ar objektiem.
@@ -471,12 +585,14 @@ Ja nav drošu pretrunu, atgriez tukšu masīvu [].
 Neizmanto Markdown.
 
 Katram objektam jābūt šādiem laukiem:
-- include_in_report
+- include_in_pdf
+- issue_type
 - category
 - field
 - context_source_document
 - context_value
 - context_page
+- new_document_fact_id
 - new_document_value
 - new_document_page
 - comment
@@ -496,6 +612,7 @@ Kategorijas:
 - diameter
 - material
 - pressure_class
+- stiffness_class
 - quantity
 - marking
 - specification
@@ -523,20 +640,152 @@ JAUNĀ DOKUMENTA FAKTI:
 
     contradictions_df = pd.DataFrame(contradictions)
 
-    if "include_in_report" not in contradictions_df.columns:
-        contradictions_df.insert(0, "include_in_report", True)
+    if "include_in_pdf" not in contradictions_df.columns:
+        contradictions_df.insert(0, "include_in_pdf", True)
+
+    if "issue_type" not in contradictions_df.columns:
+        contradictions_df.insert(1, "issue_type", "context_contradiction")
+
+    if "new_document_fact_id" in contradictions_df.columns and "fact_id" in new_facts_df.columns:
+        contradictions_df = contradictions_df.merge(
+            new_facts_df[
+                [
+                    "fact_id",
+                    "block_id",
+                    "page",
+                    "x0",
+                    "y0",
+                    "x1",
+                    "y1",
+                    "text",
+                    "source_document",
+                ]
+            ],
+            left_on="new_document_fact_id",
+            right_on="fact_id",
+            how="left",
+            suffixes=("", "_new_fact"),
+        )
 
     return contradictions_df
 
 
-def make_review_excel(new_facts_df, contradictions_df):
+def make_review_excel(new_facts_df, language_issues_df, contradictions_df):
     output = BytesIO()
 
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         new_facts_df.to_excel(writer, sheet_name="new_document_facts", index=False)
+        language_issues_df.to_excel(writer, sheet_name="language_issues", index=False)
         contradictions_df.to_excel(writer, sheet_name="context_contradictions", index=False)
 
     output.seek(0)
+    return output
+
+
+def add_pdf_annotation(page, x0, y0, x1, y1, annotation_text, stroke_color=(1, 0, 0)):
+    rect = fitz.Rect(float(x0), float(y0), float(x1), float(y1))
+
+    square_annot = page.add_rect_annot(rect)
+    square_annot.set_info(
+        title="AI būvprojekta pārbaude",
+        content=annotation_text,
+    )
+    square_annot.set_colors(stroke=stroke_color)
+    square_annot.set_border(width=1)
+    square_annot.update()
+
+    note_x = max(float(x1) + 5, float(x0) + 5)
+    note_y = float(y0)
+    note_point = fitz.Point(note_x, note_y)
+
+    text_annot = page.add_text_annot(note_point, annotation_text)
+    text_annot.set_info(
+        title="AI būvprojekta pārbaude",
+        content=annotation_text,
+    )
+    text_annot.update()
+
+
+def create_annotated_new_pdf(new_file_bytes, approved_language_df, approved_contradictions_df):
+    doc = fitz.open(stream=new_file_bytes, filetype="pdf")
+
+    for _, issue in approved_language_df.iterrows():
+        try:
+            page_number = int(issue.get("page_pdf", issue.get("page", 0)))
+            x0 = float(issue.get("x0", 50))
+            y0 = float(issue.get("y0", 50))
+            x1 = float(issue.get("x1", x0 + 100))
+            y1 = float(issue.get("y1", y0 + 20))
+        except (TypeError, ValueError):
+            continue
+
+        if page_number < 1 or page_number > len(doc):
+            continue
+
+        page = doc[page_number - 1]
+
+        category = str(issue.get("category", "language"))
+        severity = str(issue.get("severity", ""))
+        source_text = str(issue.get("source_text", ""))
+        comment = str(issue.get("comment", ""))
+        suggestion = str(issue.get("suggestion", ""))
+        confidence = issue.get("confidence", "")
+
+        annotation_text = (
+            f"AI piezīme — valoda/tulkojums\n"
+            f"Kategorija: {category}\n"
+            f"Nopietnība: {severity}\n"
+            f"Ticamība: {confidence}\n\n"
+            f"Atrastais teksts:\n{source_text}\n\n"
+            f"Komentārs:\n{comment}\n\n"
+            f"Ieteikums:\n{suggestion}"
+        )
+
+        add_pdf_annotation(page, x0, y0, x1, y1, annotation_text, stroke_color=(1, 0, 0))
+
+    for _, issue in approved_contradictions_df.iterrows():
+        try:
+            page_number = int(issue.get("page", issue.get("new_document_page", 0)))
+            x0 = float(issue.get("x0", 50))
+            y0 = float(issue.get("y0", 50))
+            x1 = float(issue.get("x1", x0 + 100))
+            y1 = float(issue.get("y1", y0 + 20))
+        except (TypeError, ValueError):
+            continue
+
+        if page_number < 1 or page_number > len(doc):
+            continue
+
+        page = doc[page_number - 1]
+
+        category = str(issue.get("category", "context_contradiction"))
+        field = str(issue.get("field", ""))
+        context_source = str(issue.get("context_source_document", ""))
+        context_value = str(issue.get("context_value", ""))
+        new_value = str(issue.get("new_document_value", ""))
+        comment = str(issue.get("comment", ""))
+        suggestion = str(issue.get("suggestion", ""))
+        confidence = issue.get("confidence", "")
+
+        annotation_text = (
+            f"AI piezīme — pretruna pret projekta kontekstu\n"
+            f"Kategorija: {category}\n"
+            f"Lauks: {field}\n"
+            f"Ticamība: {confidence}\n\n"
+            f"Konteksta avots:\n{context_source}\n\n"
+            f"Konteksta vērtība:\n{context_value}\n\n"
+            f"Jaunā dokumenta vērtība:\n{new_value}\n\n"
+            f"Komentārs:\n{comment}\n\n"
+            f"Ieteikums:\n{suggestion}"
+        )
+
+        add_pdf_annotation(page, x0, y0, x1, y1, annotation_text, stroke_color=(1, 0, 0))
+
+    output = BytesIO()
+    doc.save(output)
+    output.seek(0)
+    doc.close()
+
     return output
 
 
@@ -601,6 +850,7 @@ with tab1:
                 for i, uploaded_file in enumerate(context_files, start=1):
                     document_name = uploaded_file.name
                     document_type = detect_document_type(document_name)
+
                     status.write(
                         f"Apstrādā dokumentu {i}/{len(context_files)}: "
                         f"{document_name} ({document_type_label(document_type)})"
@@ -638,15 +888,17 @@ with tab1:
 
                     progress_bar.progress(i / len(context_files))
 
-                if all_text_frames:
-                    all_text_df = pd.concat(all_text_frames, ignore_index=True)
-                else:
-                    all_text_df = pd.DataFrame()
+                all_text_df = (
+                    pd.concat(all_text_frames, ignore_index=True)
+                    if all_text_frames
+                    else pd.DataFrame()
+                )
 
-                if all_fact_frames:
-                    all_facts_df = pd.concat(all_fact_frames, ignore_index=True)
-                else:
-                    all_facts_df = pd.DataFrame()
+                all_facts_df = (
+                    pd.concat(all_fact_frames, ignore_index=True)
+                    if all_fact_frames
+                    else pd.DataFrame()
+                )
 
                 st.session_state["project_context_text_df"] = all_text_df
                 st.session_state["project_context_facts_df"] = all_facts_df
@@ -684,7 +936,7 @@ with tab2:
 
     st.write(
         "Augšupielādē iepriekš izveidoto `project_context.xlsx` un jaunu PDF dokumentu. "
-        "Rīks pēc faila nosaukuma mēģinās noteikt jaunā dokumenta tipu, izvilks faktus un salīdzinās tos ar projekta kontekstu."
+        "Rīks pārbaudīs jauno PDF valodas/tulkojuma kļūdas un salīdzinās to ar projekta kontekstu."
     )
 
     uploaded_context = st.file_uploader(
@@ -705,7 +957,7 @@ with tab2:
         key="new_document_name",
     )
 
-    col1, col2 = st.columns(2)
+    col1, col2, col3 = st.columns(3)
 
     with col1:
         max_blocks_new_document = st.number_input(
@@ -725,6 +977,16 @@ with tab2:
             value=300,
             step=50,
             key="max_context_facts",
+        )
+
+    with col3:
+        max_language_blocks = st.number_input(
+            "Cik teksta blokus pārbaudīt valodai/tulkojumam?",
+            min_value=50,
+            max_value=1500,
+            value=500,
+            step=50,
+            key="max_language_blocks",
         )
 
     if uploaded_context is not None and new_pdf is not None:
@@ -758,9 +1020,23 @@ with tab2:
                         detected_new_type,
                     )
 
+                    st.session_state["new_file_bytes"] = new_file_bytes
+                    st.session_state["new_text_df"] = new_text_df
+
                     st.write(
                         f"No jaunā dokumenta izvilkti {len(new_text_df)} teksta bloki no {new_page_count} lapām."
                     )
+
+                    with st.spinner("AI pārbauda jaunā dokumenta valodu un tulkojumu..."):
+                        language_issues_df = check_language_in_new_document(
+                            client=client,
+                            document_name=actual_new_document_name,
+                            document_type=detected_new_type,
+                            text_df=new_text_df,
+                            max_blocks=min(len(new_text_df), max_language_blocks),
+                        )
+
+                    st.session_state["language_issues_df"] = language_issues_df
 
                     with st.spinner("AI izvelk faktus no jaunā dokumenta..."):
                         new_facts_df = extract_facts_from_document(
@@ -787,8 +1063,29 @@ with tab2:
 
                         st.session_state["context_contradictions_df"] = contradictions_df
 
+        language_issues_df = st.session_state.get("language_issues_df")
         new_facts_df = st.session_state.get("new_facts_df")
         contradictions_df = st.session_state.get("context_contradictions_df")
+        new_file_bytes = st.session_state.get("new_file_bytes")
+
+        if language_issues_df is not None:
+            st.divider()
+            st.subheader("Valodas un tulkojuma piezīmes jaunajā dokumentā")
+
+            if language_issues_df.empty:
+                st.info("AI neatrada drošas valodas/tulkojuma piezīmes jaunajā dokumentā.")
+                edited_language_issues_df = pd.DataFrame()
+            else:
+                st.success(f"AI atrada {len(language_issues_df)} valodas/tulkojuma piezīmes.")
+
+                edited_language_issues_df = st.data_editor(
+                    language_issues_df,
+                    use_container_width=True,
+                    num_rows="fixed",
+                    key="language_issues_editor",
+                )
+
+                st.session_state["edited_language_issues_df"] = edited_language_issues_df
 
         if new_facts_df is not None:
             st.divider()
@@ -806,6 +1103,7 @@ with tab2:
 
             if contradictions_df.empty:
                 st.info("AI neatrada drošas pretrunas pret projekta kontekstu.")
+                edited_contradictions_df = pd.DataFrame()
             else:
                 st.success(f"AI atrada {len(contradictions_df)} iespējamas pretrunas.")
 
@@ -816,25 +1114,74 @@ with tab2:
                     key="context_contradictions_editor",
                 )
 
-                approved_df = edited_contradictions_df[
-                    edited_contradictions_df["include_in_report"] == True
+                st.session_state["edited_contradictions_df"] = edited_contradictions_df
+
+            edited_language_issues_df = st.session_state.get(
+                "edited_language_issues_df",
+                language_issues_df if language_issues_df is not None else pd.DataFrame(),
+            )
+
+            edited_contradictions_df = st.session_state.get(
+                "edited_contradictions_df",
+                contradictions_df if contradictions_df is not None else pd.DataFrame(),
+            )
+
+            if edited_language_issues_df is None:
+                edited_language_issues_df = pd.DataFrame()
+
+            if edited_contradictions_df is None:
+                edited_contradictions_df = pd.DataFrame()
+
+            approved_language_df = (
+                edited_language_issues_df[
+                    edited_language_issues_df["include_in_pdf"] == True
                 ].copy()
+                if not edited_language_issues_df.empty and "include_in_pdf" in edited_language_issues_df.columns
+                else pd.DataFrame()
+            )
 
-                st.info(
-                    f"Atskaitē atlasītas {len(approved_df)} no "
-                    f"{len(edited_contradictions_df)} pretrunām."
-                )
+            approved_contradictions_df = (
+                edited_contradictions_df[
+                    edited_contradictions_df["include_in_pdf"] == True
+                ].copy()
+                if not edited_contradictions_df.empty and "include_in_pdf" in edited_contradictions_df.columns
+                else pd.DataFrame()
+            )
 
-                review_excel = make_review_excel(
-                    new_facts_df if new_facts_df is not None else pd.DataFrame(),
-                    edited_contradictions_df,
+            st.info(
+                f"PDF anotācijām atlasītas {len(approved_language_df)} valodas/tulkojuma piezīmes "
+                f"un {len(approved_contradictions_df)} pretrunas pret kontekstu."
+            )
+
+            review_excel = make_review_excel(
+                new_facts_df if new_facts_df is not None else pd.DataFrame(),
+                edited_language_issues_df,
+                edited_contradictions_df,
+            )
+
+            st.download_button(
+                label="Lejupielādēt pārbaudes rezultātus Excel formātā",
+                data=review_excel,
+                file_name="jauna_dokumenta_parbaude_pret_kontekstu.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+
+            if new_file_bytes is not None and (
+                not approved_language_df.empty or not approved_contradictions_df.empty
+            ):
+                annotated_pdf = create_annotated_new_pdf(
+                    new_file_bytes,
+                    approved_language_df,
+                    approved_contradictions_df,
                 )
 
                 st.download_button(
-                    label="Lejupielādēt pārbaudes rezultātus Excel formātā",
-                    data=review_excel,
-                    file_name="jauna_dokumenta_parbaude_pret_kontekstu.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    label="Lejupielādēt jauno PDF ar atlasītajām AI piezīmēm",
+                    data=annotated_pdf,
+                    file_name="jaunais_pdf_ar_ai_piezimem.pdf",
+                    mime="application/pdf",
                 )
+            else:
+                st.warning("Nav atlasītu piezīmju PDF anotācijām.")
     else:
         st.info("Augšupielādē gan project_context.xlsx, gan jauno PDF dokumentu.")
