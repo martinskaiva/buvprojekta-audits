@@ -18,10 +18,6 @@ st.write(
 )
 
 
-# ----------------------------
-# Pamata funkcijas
-# ----------------------------
-
 def get_openai_client():
     api_key = st.secrets.get("OPENAI_API_KEY")
 
@@ -105,7 +101,6 @@ def document_type_label(document_type):
 def extract_pdf_text(file_bytes, file_name, document_type):
     doc = fitz.open(stream=file_bytes, filetype="pdf")
     rows = []
-
     local_block_id = 0
 
     for page_index, page in enumerate(doc):
@@ -230,10 +225,6 @@ def build_blocks_text(blocks_df):
 
     return "\n".join(lines)
 
-
-# ----------------------------
-# Prompta kopīgā audita loģika
-# ----------------------------
 
 def audit_rules_text(priority_threshold):
     return f"""
