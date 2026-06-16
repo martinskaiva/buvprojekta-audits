@@ -27,7 +27,73 @@ def get_openai_client():
     return OpenAI(api_key=api_key)
 
 
-def extract_pdf_text(file_bytes, document_name):
+def detect_document_type(file_name):
+    name = file_name.lower()
+
+    explanatory_keywords = [
+        "explanatory note",
+        "explanatory",
+        "description",
+        "apraksts",
+        "skaidrojo",
+        "td_",
+        "_td_",
+    ]
+
+    specification_keywords = [
+        "specification",
+        "specifik",
+        "apjomi",
+        "works",
+        "boq",
+        "tāme",
+        "estimate",
+        "bill of quantities",
+    ]
+
+    drawing_keywords = [
+        "scheme",
+        "layout",
+        "section",
+        "plan",
+        "floor",
+        "general data",
+        "site plan",
+        "drawing",
+        "rasēj",
+        "stāva",
+        "stava",
+        "griezums",
+        "shēma",
+        "shema",
+        "plāns",
+        "plans",
+    ]
+
+    if any(keyword in name for keyword in explanatory_keywords):
+        return "explanatory_note"
+
+    if any(keyword in name for keyword in specification_keywords):
+        return "specification"
+
+    if any(keyword in name for keyword in drawing_keywords):
+        return "drawing"
+
+    return "unknown"
+
+
+def document_type_label(document_type):
+    labels = {
+        "explanatory_note": "Skaidrojošais apraksts",
+        "drawing": "Rasējums / shēma / plāns / griezums",
+        "specification": "Specifikācija / apjomu tabula",
+        "unknown": "Neatpazīts dokumenta tips",
+    }
+
+    return labels.get(document_type, "Neatpazīts dokumenta tips")
+
+
+def extract_pdf_text(file_bytes, document_name, document_type):
     doc = fitz.open(stream=file_bytes, filetype="pdf")
     rows = []
 
@@ -42,6 +108,7 @@ def extract_pdf_text(file_bytes, document_name):
                 rows.append(
                     {
                         "document_name": document_name,
+                        "document_type": document_type,
                         "page": page_index + 1,
                         "x0": round(x0, 2),
                         "y0": round(y0, 2),
@@ -99,14 +166,15 @@ def build_document_text(df, max_blocks):
     for index, row in selected.iterrows():
         lines.append(
             f"[ID {index}] [Dokuments: {row['document_name']}] "
-            f"[Lapa {row['page']}] {row['text']}"
+            f"[Tips: {row['document_type']}] [Lapa {row['page']}] {row['text']}"
         )
 
     return "\n".join(lines)
 
 
-def extract_facts_from_document(client, document_name, text_df, max_blocks):
+def extract_facts_from_document(client, document_name, document_type, text_df, max_blocks):
     document_text = build_document_text(text_df, max_blocks)
+    doc_type_readable = document_type_label(document_type)
 
     prompt = f"""
 Tu esi ļoti piesardzīgs būvprojekta dokumentācijas analizētājs Latvijā.
@@ -117,6 +185,31 @@ projekta konteksta veidošanai un salīdzināšanai ar citiem dokumentiem.
 
 Dokuments:
 {document_name}
+
+Automātiski noteiktais dokumenta tips:
+{document_type} — {doc_type_readable}
+
+Dokumenta tipi un atpazīšana:
+1. Skaidrojošais apraksts:
+   Parasti faila nosaukumā ir "explanatory note", "description", "apraksts", "skaidrojoš".
+   Šādos dokumentos meklē pilnus teikumus, sistēmu aprakstus, prasības, diametrus, materiālus,
+   projektēšanas pieņēmumus, apjomus, stadiju, kārtu, adresi, objektu un atsauces uz rasējumiem.
+
+2. Rasējums, shēma, stāva plāns, ģenerālplāns vai griezums:
+   Parasti faila nosaukumā ir "scheme", "layout", "section", "plan", "floor", "general data",
+   "site plan", "drawing", "rasējums", "plāns", "stāva plāns", "griezums".
+   Šādos dokumentos teksts bieži ir īss, tabulveida vai titullaukos.
+   Te jāmeklē rasējuma numurs, rasējuma nosaukums, sadaļas kods, titullauka dati, revīzija,
+   datums, mērogs, lapas ID, sistēmu/tīklu marķējumi, leģenda, apzīmējumi, diametri,
+   materiāli, spiediena klases un piezīmes.
+   Īsi kodi rasējumos var būt derīgi fakti, ja tiem ir tehnisks konteksts.
+
+3. Specifikācija vai apjomu tabula:
+   Parasti faila nosaukumā ir "specification", "specifikācija", "apjomi", "works", "boq",
+   "bill of quantities".
+   Šādos dokumentos meklē pozīcijas, pozīciju numurus, markas, sistēmas, diametrus, materiālus,
+   spiediena klases, daudzumus, mērvienības, LV/EN aprakstus un iespējamas vienas rindas
+   tehniskās neatbilstības.
 
 GALVENAIS PRINCIPS:
 Izvelc tikai konkrētus, pārbaudāmus faktus.
@@ -140,9 +233,14 @@ Meklē šādus faktu tipus:
 - scale
 - system_name
 - network_name
+- legend_item
+- note
 - specification_item
+- specification_position
 - equipment_mark
 - pipe_mark
+- manhole_mark
+- trench_or_route_section
 - pipe_diameter
 - pipe_material
 - pressure_class
@@ -150,39 +248,44 @@ Meklē šādus faktu tipus:
 - unit
 - material_or_parameter
 - technical_requirement
+- lv_en_description_pair
 - previous_issue_reference
 - other
 
-Īpaši svarīgi fakti būvprojekta salīdzināšanai:
-- objekta nosaukums;
-- adrese;
-- projekta stadija;
-- kārta;
-- sadaļa vai sadaļas kods;
-- rasējuma numurs;
-- rasējuma nosaukums;
-- dokumenta vai lapas nosaukums;
-- revīzija;
-- datums;
-- sistēmas nosaukums;
-- tīkla nosaukums;
-- specifikācijas pozīcijas;
-- marķējumi, piemēram U1, K1, K2, K3, K2-T1, K3-5;
-- diametri, piemēram D110, D160, OD75, OD110, Ø110, DN100;
-- materiāli, piemēram PE, PE100, PVC, tērauds;
-- spiediena klases, piemēram PN10, PN16;
-- daudzumi, piemēram 3 gab., 90 m;
-- tehniskās prasības, ja tās ir skaidri formulētas.
+Ja dokumenta tips ir explanatory_note:
+- Meklē objekta nosaukumu, adresi, stadiju, kārtu.
+- Meklē sistēmu nosaukumus un aprakstus.
+- Meklē diametrus, materiālus, spiediena klases un daudzumus, ja tie minēti tekstā.
+- Meklē atsauces uz konkrētiem rasējumiem, sistēmām, mezgliem, pozīcijām.
+- Meklē prasības, piemēram, kur jāuzstāda konkrēti elementi.
+
+Ja dokumenta tips ir drawing:
+- Neignorē titullaukus un īsus blokus.
+- Izvelc rasējuma numuru, nosaukumu, lapas ID, datumu, revīziju, mērogu, sadaļas kodu.
+- Izvelc GENERAL DATA / VISPĀRĪGIE RĀDĪTĀJI tipa nosaukumus kā drawing_title vai document_title.
+- Izvelc SITE PLAN, WATER AND SEWERAGE NETWORKS, STĀVA PLĀNS, SHĒMA, GRIEZUMS tipa nosaukumus kā drawing_title.
+- Izvelc tīklu un sistēmu kodus, piemēram U1, K1, K2, K3, ja tie parādās kopā ar diametru,
+  materiālu, leģendu, līniju, tīklu vai piezīmēm.
+- Izvelc diametrus un parametrus, piemēram D110, D160, OD75, OD110, Ø110, DN100, PE, PE100, PN10, PN16.
+- Izvelc leģendas un apzīmējumu ierakstus kā legend_item.
+- Izvelc rasējuma piezīmes kā note vai technical_requirement.
+- Neuzskati īsu tekstu par nederīgu tikai tāpēc, ka tas ir īss; rasējumos īss teksts bieži ir nozīmīgs.
+
+Ja dokumenta tips ir specification:
+- Izvelc specifikācijas rindas kā specification_item.
+- Izvelc pozīciju numurus kā specification_position.
+- Izvelc markas, mezglus, akas, teknes, caurules, vārstus, lūkas un citas pozīcijas.
+- Izvelc daudzumus un mērvienības.
+- Izvelc diametrus, materiālus, spiediena klases.
+- Ja rindā ir latviešu un angļu apraksts, izvelc to kā lv_en_description_pair.
+- Ja vienā rindā parādās atšķirīgi marķējumi LV un EN aprakstā, saglabā tos kā faktus,
+  jo vēlāk tos var salīdzināt.
 
 Svarīgi par tehniskajiem kodiem:
 - Tehniskos kodus drīkst izvilkt kā faktus, ja tiem ir konteksts.
 - Neizvelc pilnīgi izolētus kodus bez skaidra konteksta.
 - Ja vienā blokā redzami vairāki parametri, izvelc tos kā atsevišķus faktus.
-
-Specifikācijām un apjomu tabulām:
-- Izvelc specifikācijas rindas vai būtiskus rindu fragmentus kā specification_item.
-- Ja redzams pozīcijas numurs, marka, diametrs, materiāls, daudzums vai mērvienība, izvelc tos kā atsevišķus faktus.
-- Ja vari saprast, ka fakts attiecas uz konkrētu sistēmu vai marku, norādi to value vai label laukā.
+- Piemēri derīgiem faktiem ar kontekstu: U1 OD110 PE PN10, K2-T1, K3-5, OD75, D160, PN10, PE100.
 
 Nedrīkst izvilkt:
 - pieņēmumus;
@@ -216,7 +319,8 @@ Lauku skaidrojums:
 - evidence: īss fragments no teksta, kas pamato faktu
 - confidence: skaitlis no 0 līdz 1
 
-Atgriez tikai faktus ar confidence 0.75 vai augstāku.
+Atgriez tikai faktus ar confidence 0.70 vai augstāku.
+Faktu izvilkšanai drīkst būt zemāks slieksnis nekā pretrunu ziņošanai, jo vēlāk pretrunas tiks filtrētas stingrāk.
 
 PDF teksts:
 {document_text}
@@ -246,6 +350,7 @@ PDF teksts:
         )
 
     facts_df.insert(0, "source_document", document_name)
+    facts_df.insert(1, "source_document_type", document_type)
 
     return facts_df
 
@@ -280,6 +385,7 @@ def facts_to_compact_text(facts_df, prefix, max_facts=250):
 
     for index, row in selected.iterrows():
         source_document = row.get("source_document", row.get("document_name", ""))
+        source_document_type = row.get("source_document_type", row.get("document_type", ""))
         fact_id = row.get("fact_id", f"{prefix}_{index}")
         fact_type = row.get("fact_type", "")
         label = row.get("label", "")
@@ -288,7 +394,8 @@ def facts_to_compact_text(facts_df, prefix, max_facts=250):
         evidence = row.get("evidence", "")
 
         lines.append(
-            f"[{prefix} FACT {fact_id}] [source={source_document}] [type={fact_type}] "
+            f"[{prefix} FACT {fact_id}] [source={source_document}] "
+            f"[document_type={source_document_type}] [type={fact_type}] "
             f"[page={page}] {label}: {value} | evidence: {evidence}"
         )
 
@@ -445,8 +552,8 @@ with tab1:
     st.subheader("1. Izveidot projekta kontekstu no vairākiem PDF")
 
     st.write(
-        "Augšupielādē vairākus viena projekta PDF dokumentus. Rīks no tiem izvilks tekstu un faktus, "
-        "un beigās varēsi lejupielādēt `project_context.xlsx`."
+        "Augšupielādē vairākus viena projekta PDF dokumentus. Rīks pēc faila nosaukuma mēģinās noteikt, "
+        "vai fails ir skaidrojošais apraksts, rasējums vai specifikācija, un faktus izvilks atbilstoši dokumenta tipam."
     )
 
     context_files = st.file_uploader(
@@ -467,6 +574,20 @@ with tab1:
     if context_files:
         st.info(f"Augšupielādēti {len(context_files)} PDF dokumenti.")
 
+        detected_rows = []
+        for uploaded_file in context_files:
+            detected_type = detect_document_type(uploaded_file.name)
+            detected_rows.append(
+                {
+                    "file_name": uploaded_file.name,
+                    "detected_document_type": detected_type,
+                    "document_type_label": document_type_label(detected_type),
+                }
+            )
+
+        st.subheader("Automātiski noteiktie dokumentu tipi")
+        st.dataframe(pd.DataFrame(detected_rows), use_container_width=True)
+
         if st.button("Izveidot projekta kontekstu"):
             client = get_openai_client()
 
@@ -479,15 +600,24 @@ with tab1:
 
                 for i, uploaded_file in enumerate(context_files, start=1):
                     document_name = uploaded_file.name
-                    status.write(f"Apstrādā dokumentu {i}/{len(context_files)}: {document_name}")
+                    document_type = detect_document_type(document_name)
+                    status.write(
+                        f"Apstrādā dokumentu {i}/{len(context_files)}: "
+                        f"{document_name} ({document_type_label(document_type)})"
+                    )
 
                     file_bytes = uploaded_file.read()
-                    text_df, page_count = extract_pdf_text(file_bytes, document_name)
+                    text_df, page_count = extract_pdf_text(
+                        file_bytes,
+                        document_name,
+                        document_type,
+                    )
 
                     all_text_frames.append(text_df)
 
                     st.write(
-                        f"**{document_name}** — izvilkti {len(text_df)} teksta bloki no {page_count} lapām."
+                        f"**{document_name}** — {document_type_label(document_type)} — "
+                        f"izvilkti {len(text_df)} teksta bloki no {page_count} lapām."
                     )
 
                     if not text_df.empty:
@@ -495,6 +625,7 @@ with tab1:
                             facts_df = extract_facts_from_document(
                                 client=client,
                                 document_name=document_name,
+                                document_type=document_type,
                                 text_df=text_df,
                                 max_blocks=min(len(text_df), max_blocks_per_context_document),
                             )
@@ -553,7 +684,7 @@ with tab2:
 
     st.write(
         "Augšupielādē iepriekš izveidoto `project_context.xlsx` un jaunu PDF dokumentu. "
-        "Rīks izvilks faktus no jaunā dokumenta un salīdzinās tos ar projekta kontekstu."
+        "Rīks pēc faila nosaukuma mēģinās noteikt jaunā dokumenta tipu, izvilks faktus un salīdzinās tos ar projekta kontekstu."
     )
 
     uploaded_context = st.file_uploader(
@@ -605,14 +736,26 @@ with tab2:
             with st.expander("Apskatīt projekta konteksta faktus"):
                 st.dataframe(context_facts_df, use_container_width=True)
 
+            detected_new_type = detect_document_type(new_pdf.name)
+            st.info(
+                f"Jaunā PDF automātiski noteiktais tips: "
+                f"**{detected_new_type} — {document_type_label(detected_new_type)}**"
+            )
+
             if st.button("Pārbaudīt jauno PDF pret kontekstu"):
                 client = get_openai_client()
 
                 if client is not None:
                     new_file_bytes = new_pdf.read()
+
+                    actual_new_document_name = (
+                        new_pdf.name if new_document_name == "Jaunais dokuments" else new_document_name
+                    )
+
                     new_text_df, new_page_count = extract_pdf_text(
                         new_file_bytes,
-                        new_document_name,
+                        actual_new_document_name,
+                        detected_new_type,
                     )
 
                     st.write(
@@ -622,7 +765,8 @@ with tab2:
                     with st.spinner("AI izvelk faktus no jaunā dokumenta..."):
                         new_facts_df = extract_facts_from_document(
                             client=client,
-                            document_name=new_document_name,
+                            document_name=actual_new_document_name,
+                            document_type=detected_new_type,
                             text_df=new_text_df,
                             max_blocks=min(len(new_text_df), max_blocks_new_document),
                         )
