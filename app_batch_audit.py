@@ -871,12 +871,45 @@ def merge_issue_coordinates(issues_df, all_blocks_df):
 # Eksports
 # ----------------------------
 
+def clean_excel_illegal_chars(value):
+    if isinstance(value, str):
+        illegal_chars = [
+            "\x00", "\x01", "\x02", "\x03", "\x04", "\x05", "\x06", "\x07",
+            "\x08", "\x0b", "\x0c", "\x0e", "\x0f", "\x10", "\x11", "\x12",
+            "\x13", "\x14", "\x15", "\x16", "\x17", "\x18", "\x19", "\x1a",
+            "\x1b", "\x1c", "\x1d", "\x1e", "\x1f",
+        ]
+
+        cleaned_value = value
+        for char in illegal_chars:
+            cleaned_value = cleaned_value.replace(char, "")
+
+        return cleaned_value
+
+    return value
+
+
+def clean_dataframe_for_excel(df):
+    if df is None or df.empty:
+        return df
+
+    cleaned_df = df.copy()
+
+    for column in cleaned_df.columns:
+        cleaned_df[column] = cleaned_df[column].map(clean_excel_illegal_chars)
+
+    return cleaned_df
+
+
 def make_excel_bytes(issues_df, all_blocks_df):
     output = BytesIO()
 
+    safe_issues_df = clean_dataframe_for_excel(issues_df)
+    safe_blocks_df = clean_dataframe_for_excel(all_blocks_df)
+
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        issues_df.to_excel(writer, sheet_name="audit_issues", index=False)
-        all_blocks_df.to_excel(writer, sheet_name="text_blocks", index=False)
+        safe_issues_df.to_excel(writer, sheet_name="audit_issues", index=False)
+        safe_blocks_df.to_excel(writer, sheet_name="text_blocks", index=False)
 
     output.seek(0)
     return output
