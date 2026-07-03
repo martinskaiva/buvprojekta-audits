@@ -14,16 +14,13 @@ from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
 from openai import OpenAI
 
+st.set_page_config(page_title="BP universālais audita rīks v3", layout="wide")
 
-st.set_page_config(page_title="BP universālais audits", layout="wide")
-
-st.title("BP universālais audita rīks")
-
+st.title("BP universālais audita rīks v3")
 st.write(
-    "Šī aplikācija pārbauda vienu izvēlētu būvprojekta disciplīnu pēc vieniem principiem: "
-    "pret Design Brief prasību atmiņu, katra dokumenta ietvaros, disciplīnas ietvaros un "
-    "pret līdz šim 03_Memory saglabātajām citu disciplīnu faktu atmiņām. "
-    "Rezultātā tiek rādītas tikai tādas kandidātpiezīmes, kuras var piesaistīt konkrētam PDF teksta blokam."
+    "Šī versija papildina universālo auditu ar strukturētu C moduļa salīdzināšanu, "
+    "diagnostikas režīmu, pagaidu faktu indeksu, raw AI kandidātu tabulu un filtra pārskatu. "
+    "PDF anotēšana šajā versijā vēl netiek ģenerēta."
 )
 
 FOLDER_MIME_TYPE = "application/vnd.google-apps.folder"
@@ -36,48 +33,20 @@ GOOGLE_DOC_MIME_TYPE = "application/vnd.google-apps.document"
 # Google Drive
 # =========================================================
 
-
 def get_drive_service():
     service_account_json = st.secrets.get("GOOGLE_SERVICE_ACCOUNT_JSON")
-
     if not service_account_json:
         raise ValueError("Secrets nav atrasts GOOGLE_SERVICE_ACCOUNT_JSON.")
 
     service_account_info = json.loads(service_account_json)
-
     credentials = service_account.Credentials.from_service_account_info(
         service_account_info,
         scopes=["https://www.googleapis.com/auth/drive"],
     )
-
     return build("drive", "v3", credentials=credentials)
 
 
-@st.cache_data(show_spinner=False)
-def _cached_list_folder_items(_dummy: str, folder_id: str, service_account_json: str) -> List[Dict[str, Any]]:
-    service_account_info = json.loads(service_account_json)
-    credentials = service_account.Credentials.from_service_account_info(
-        service_account_info,
-        scopes=["https://www.googleapis.com/auth/drive"],
-    )
-    service = build("drive", "v3", credentials=credentials)
-    query = f"'{folder_id}' in parents and trashed = false"
-    results = (
-        service.files()
-        .list(
-            q=query,
-            fields="files(id, name, mimeType, size, modifiedTime)",
-            pageSize=1000,
-            supportsAllDrives=True,
-            includeItemsFromAllDrives=True,
-        )
-        .execute()
-    )
-    return results.get("files", [])
-
-
 def list_folder_items(service, folder_id: str) -> List[Dict[str, Any]]:
-    # Neizmantojam cache, ja nav secrets string pieejams; tas atvieglo debug.
     query = f"'{folder_id}' in parents and trashed = false"
     results = (
         service.files()
@@ -95,9 +64,8 @@ def list_folder_items(service, folder_id: str) -> List[Dict[str, Any]]:
 
 def list_items_recursive(service, folder_id: str, parent_path: str = "") -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
-    items = list_folder_items(service, folder_id)
 
-    for item in items:
+    for item in list_folder_items(service, folder_id):
         item_name = item.get("name", "")
         item_path = f"{parent_path}/{item_name}" if parent_path else item_name
         is_folder = item.get("mimeType") == FOLDER_MIME_TYPE
@@ -115,31 +83,13 @@ def list_items_recursive(service, folder_id: str, parent_path: str = "") -> List
         rows.append(row)
 
         if is_folder:
-            rows.extend(
-                list_items_recursive(
-                    service=service,
-                    folder_id=item.get("id"),
-                    parent_path=item_path,
-                )
-            )
+            rows.extend(list_items_recursive(service, item.get("id"), item_path))
 
     return rows
 
 
-def download_drive_file_bytes(service, file_id: str, mime_type: Optional[str] = None) -> bytes:
-    if mime_type == GOOGLE_SHEET_MIME_TYPE:
-        request = service.files().export_media(
-            fileId=file_id,
-            mimeType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        )
-    elif mime_type == GOOGLE_DOC_MIME_TYPE:
-        request = service.files().export_media(
-            fileId=file_id,
-            mimeType="text/plain",
-        )
-    else:
-        request = service.files().get_media(fileId=file_id)
-
+def download_drive_file_bytes(service, file_id: str) -> bytes:
+    request = service.files().get_media(fileId=file_id)
     file_buffer = io.BytesIO()
     downloader = MediaIoBaseDownload(file_buffer, request)
 
@@ -151,123 +101,49 @@ def download_drive_file_bytes(service, file_id: str, mime_type: Optional[str] = 
     return file_buffer.read()
 
 
-def download_text_file(service, file_id: str, mime_type: Optional[str] = None) -> str:
-    return download_drive_file_bytes(service, file_id, mime_type=mime_type).decode("utf-8", errors="replace")
+def export_google_file_bytes(service, file_id: str, mime_type: str) -> bytes:
+    request = service.files().export_media(fileId=file_id, mimeType=mime_type)
+    file_buffer = io.BytesIO()
+    downloader = MediaIoBaseDownload(file_buffer, request)
+
+    done = False
+    while not done:
+        _, done = downloader.next_chunk()
+
+    file_buffer.seek(0)
+    return file_buffer.read()
 
 
 # =========================================================
-# Basic helpers
+# Klasifikācija
 # =========================================================
-
-
-def normalize_text(value: Any) -> str:
-    if value is None:
-        return ""
-    try:
-        if pd.isna(value):
-            return ""
-    except Exception:
-        pass
-    return str(value).strip()
-
-
-def parse_list_value(value: Any) -> List[str]:
-    if value is None:
-        return []
-
-    if isinstance(value, list):
-        return [str(item).strip() for item in value if str(item).strip()]
-
-    text = str(value).strip()
-
-    if not text or text.lower() == "nan":
-        return []
-
-    if text.startswith("[") and text.endswith("]"):
-        try:
-            parsed = ast.literal_eval(text)
-            if isinstance(parsed, list):
-                return [str(item).strip() for item in parsed if str(item).strip()]
-        except Exception:
-            pass
-
-    parts = re.split(r"[,;]", text)
-    return [part.strip() for part in parts if part.strip()]
-
-
-def safe_float(value: Any, default: float = 0.0) -> float:
-    try:
-        if value is None:
-            return default
-        if pd.isna(value):
-            return default
-        return float(value)
-    except Exception:
-        return default
-
-
-def safe_int(value: Any, default: int = 0) -> int:
-    try:
-        if value is None:
-            return default
-        if pd.isna(value):
-            return default
-        return int(float(value))
-    except Exception:
-        return default
-
-
-def clean_excel_illegal_chars(value):
-    if isinstance(value, str):
-        return re.sub(r"[\x00-\x08\x0B\x0C\x0E-\x1F]", "", value)
-    return value
-
-
-def clean_dataframe_for_excel(df: pd.DataFrame) -> pd.DataFrame:
-    cleaned = df.copy()
-    for col in cleaned.columns:
-        cleaned[col] = cleaned[col].map(clean_excel_illegal_chars)
-        cleaned[col] = cleaned[col].apply(lambda v: ", ".join(v) if isinstance(v, list) else v)
-    return cleaned
-
-
-# =========================================================
-# Discipline and document discovery
-# =========================================================
-
 
 def get_discipline_code_from_folder_name(folder_name: str) -> str:
     name = str(folder_name).strip()
     if "_" in name:
         return name.split("_", 1)[1].strip()
-    return name.strip()
+    return name
 
 
 def classify_document_type(file_name: str, path: str = "") -> str:
     text = f"{file_name} {path}".lower()
 
-    if any(keyword in text for keyword in [
-        "explanatory", "description", "skaidrojo", "apraksts", "skaidroj", "_td_", "td_", "note"
-    ]):
+    if any(k in text for k in ["explanatory", "description", "skaidrojo", "apraksts", "_td", "td_", "note"]):
         return "explanatory_note"
 
-    if any(keyword in text for keyword in [
-        "specification", "specifik", "apjomi", "boq", "bill of quantities", "_ms_", "ms_"
-    ]):
+    if any(k in text for k in ["specification", "specifik", "apjomi", "boq", "bill of quantities", "_ms", "ms_"]):
         return "specification"
 
-    if any(keyword in text for keyword in [
-        "general data", "vispār", "vispar", "drawing list", "rasējumu saraksts", "general"
-    ]):
+    if any(k in text for k in ["general data", "general_data", "vispār", "vispar", "drawing list", "rasējumu saraksts"]):
         return "general_data"
 
-    if any(keyword in text for keyword in ["calculation", "aprēķ", "aprek", "calcs"]):
+    if any(k in text for k in ["calculation", "aprēķ", "aprek", "calcs"]):
         return "calculation"
 
-    if any(keyword in text for keyword in [
-        "scheme", "layout", "section", "plan", "floor", "site plan", "drawing",
-        "rasēj", "rasej", "plāns", "plans", "griezums", "shēma", "shema", "_ra_", "ra_",
-        "profile"
+    if any(k in text for k in [
+        "scheme", "layout", "section", "plan", "profile", "floor", "site plan",
+        "drawing", "rasēj", "rasej", "plāns", "plans", "griezums", "shēma",
+        "shema", "_ra", "ra_"
     ]):
         return "drawing"
 
@@ -275,33 +151,26 @@ def classify_document_type(file_name: str, path: str = "") -> str:
 
 
 def get_discipline_folders(service, input_folder_id: str) -> pd.DataFrame:
-    items = list_folder_items(service, input_folder_id)
-    folders = [item for item in items if item.get("mimeType") == FOLDER_MIME_TYPE]
-
     rows = []
-    for item in folders:
+
+    for item in list_folder_items(service, input_folder_id):
+        if item.get("mimeType") != FOLDER_MIME_TYPE:
+            continue
+
         folder_name = item.get("name", "")
-        rows.append(
-            {
-                "folder_name": folder_name,
-                "discipline_code": get_discipline_code_from_folder_name(folder_name),
-                "folder_id": item.get("id"),
-                "modifiedTime": item.get("modifiedTime", ""),
-            }
-        )
 
-    if not rows:
-        return pd.DataFrame(columns=["folder_name", "discipline_code", "folder_id", "modifiedTime"])
+        rows.append({
+            "folder_name": folder_name,
+            "discipline_code": get_discipline_code_from_folder_name(folder_name),
+            "folder_id": item.get("id"),
+            "modifiedTime": item.get("modifiedTime", ""),
+        })
 
-    return pd.DataFrame(rows).sort_values("folder_name")
+    return pd.DataFrame(rows).sort_values("folder_name") if rows else pd.DataFrame()
 
 
 def get_pdf_documents_in_discipline(service, discipline_folder_id: str, discipline_folder_name: str) -> pd.DataFrame:
-    rows = list_items_recursive(
-        service=service,
-        folder_id=discipline_folder_id,
-        parent_path=discipline_folder_name,
-    )
+    rows = list_items_recursive(service, discipline_folder_id, discipline_folder_name)
 
     if not rows:
         return pd.DataFrame()
@@ -313,7 +182,7 @@ def get_pdf_documents_in_discipline(service, discipline_folder_id: str, discipli
         return pdf_df
 
     pdf_df["document_type"] = pdf_df.apply(
-        lambda row: classify_document_type(row.get("name", ""), row.get("path", "")),
+        lambda r: classify_document_type(r.get("name", ""), r.get("path", "")),
         axis=1,
     )
 
@@ -321,177 +190,8 @@ def get_pdf_documents_in_discipline(service, discipline_folder_id: str, discipli
 
 
 # =========================================================
-# 03_Memory reading
+# PDF teksta bloki
 # =========================================================
-
-
-def detect_memory_kind(file_name: str, payload: Any) -> str:
-    name = file_name.lower()
-    if isinstance(payload, dict):
-        schema = str(payload.get("memory_schema", "")).lower()
-        if "requirement" in schema or "requirements" in payload:
-            return "design_brief_requirements"
-        if "discipline" in schema or "facts" in payload:
-            return "discipline_facts"
-    if "requirements" in name or "mep_requirements" in name:
-        return "design_brief_requirements"
-    if "facts" in name:
-        return "discipline_facts"
-    return "unknown_json"
-
-
-def extract_records_from_memory_payload(payload: Any, kind: str) -> List[Dict[str, Any]]:
-    if isinstance(payload, dict):
-        if kind == "design_brief_requirements" and isinstance(payload.get("requirements"), list):
-            return payload["requirements"]
-        if kind == "discipline_facts" and isinstance(payload.get("facts"), list):
-            return payload["facts"]
-        for key in ["records", "items", "data"]:
-            if isinstance(payload.get(key), list):
-                return payload[key]
-    if isinstance(payload, list):
-        return payload
-    return []
-
-
-def load_project_memory(service, memory_folder_id: str) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    items = list_folder_items(service, memory_folder_id)
-    json_items = [item for item in items if str(item.get("name", "")).lower().endswith(".json")]
-
-    catalog_rows = []
-    requirements_rows = []
-    facts_rows = []
-
-    for item in json_items:
-        file_name = item.get("name", "")
-        try:
-            raw_text = download_text_file(service, item.get("id"), mime_type=item.get("mimeType"))
-            payload = json.loads(raw_text)
-            kind = detect_memory_kind(file_name, payload)
-            records = extract_records_from_memory_payload(payload, kind)
-
-            catalog_rows.append(
-                {
-                    "name": file_name,
-                    "kind": kind,
-                    "records_count": len(records),
-                    "memory_schema": payload.get("memory_schema") if isinstance(payload, dict) else "",
-                    "mimeType": item.get("mimeType"),
-                    "size": item.get("size", ""),
-                    "modifiedTime": item.get("modifiedTime", ""),
-                    "id": item.get("id"),
-                }
-            )
-
-            if kind == "design_brief_requirements":
-                for record in records:
-                    if isinstance(record, dict):
-                        row = dict(record)
-                        row["memory_source_file"] = file_name
-                        requirements_rows.append(row)
-            elif kind == "discipline_facts":
-                detected_discipline = ""
-                match = re.search(r"c2_3_([a-zA-Z0-9\-]+)_facts", file_name)
-                if match:
-                    detected_discipline = match.group(1).upper()
-                for record in records:
-                    if isinstance(record, dict):
-                        row = dict(record)
-                        row["memory_source_file"] = file_name
-                        if not row.get("memory_discipline"):
-                            row["memory_discipline"] = detected_discipline or row.get("discipline", "")
-                        facts_rows.append(row)
-        except Exception as e:
-            catalog_rows.append(
-                {
-                    "name": file_name,
-                    "kind": "error",
-                    "records_count": 0,
-                    "memory_schema": "",
-                    "error": str(e),
-                    "mimeType": item.get("mimeType"),
-                    "size": item.get("size", ""),
-                    "modifiedTime": item.get("modifiedTime", ""),
-                    "id": item.get("id"),
-                }
-            )
-
-    catalog_df = pd.DataFrame(catalog_rows)
-    requirements_df = pd.DataFrame(requirements_rows)
-    facts_df = pd.DataFrame(facts_rows)
-
-    return catalog_df, requirements_df, facts_df
-
-
-# =========================================================
-# 04_Prompt reading
-# =========================================================
-
-
-def read_prompt_materials(service, prompt_folder_id: str) -> Dict[str, Any]:
-    materials: Dict[str, Any] = {
-        "universal_prompt": "",
-        "error_examples_df": pd.DataFrame(),
-        "error_examples_text": "",
-        "prompt_catalog": pd.DataFrame(),
-    }
-
-    if not prompt_folder_id:
-        return materials
-
-    items = list_folder_items(service, prompt_folder_id)
-    materials["prompt_catalog"] = pd.DataFrame(items)
-
-    # universal prompt txt
-    for item in items:
-        name = str(item.get("name", "")).lower()
-        if name == "universal_bp_audit_prompt.txt" or ("universal" in name and name.endswith(".txt")):
-            try:
-                materials["universal_prompt"] = download_text_file(service, item.get("id"), mime_type=item.get("mimeType"))
-            except Exception:
-                pass
-            break
-
-    # examples xlsx / google sheet
-    for item in items:
-        name = str(item.get("name", "")).lower()
-        mime = item.get("mimeType", "")
-        if name.endswith(".xlsx") or mime == GOOGLE_SHEET_MIME_TYPE or "error_examples" in name:
-            try:
-                bytes_data = download_drive_file_bytes(service, item.get("id"), mime_type=mime)
-                df = pd.read_excel(io.BytesIO(bytes_data))
-                materials["error_examples_df"] = df
-                materials["error_examples_text"] = error_examples_to_text(df, max_rows=40)
-                break
-            except Exception:
-                continue
-
-    return materials
-
-
-def error_examples_to_text(df: pd.DataFrame, max_rows: int = 40) -> str:
-    if df is None or df.empty:
-        return ""
-
-    use_df = df.head(max_rows).copy()
-    lines = []
-
-    for idx, row in use_df.iterrows():
-        parts = []
-        for col in use_df.columns:
-            value = normalize_text(row.get(col))
-            if value:
-                parts.append(f"{col}: {value}")
-        if parts:
-            lines.append(f"Piemērs {idx + 1}: " + " | ".join(parts))
-
-    return "\n".join(lines)
-
-
-# =========================================================
-# PDF text block index
-# =========================================================
-
 
 def extract_pdf_page_blocks(pdf_bytes: bytes, max_pages: int) -> Tuple[pd.DataFrame, int]:
     rows: List[Dict[str, Any]] = []
@@ -514,792 +214,866 @@ def extract_pdf_page_blocks(pdf_bytes: bytes, max_pages: int) -> Tuple[pd.DataFr
                 if not clean_text:
                     continue
 
-                rows.append(
-                    {
-                        "page": page_index + 1,
-                        "block_id": int(block_index),
-                        "x0": round(float(x0), 2),
-                        "y0": round(float(y0), 2),
-                        "x1": round(float(x1), 2),
-                        "y1": round(float(y1), 2),
-                        "text": clean_text,
-                    }
-                )
+                rows.append({
+                    "page": page_index + 1,
+                    "block_id": block_index,
+                    "x0": round(float(x0), 2),
+                    "y0": round(float(y0), 2),
+                    "x1": round(float(x1), 2),
+                    "y1": round(float(y1), 2),
+                    "text": clean_text,
+                })
 
     return pd.DataFrame(rows), total_pages
 
 
-def extract_selected_pdf_blocks(service, selected_docs_df: pd.DataFrame, max_pages: int) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    all_blocks = []
-    file_summary = []
+def build_text_from_blocks(blocks_df: pd.DataFrame, max_blocks: int = 220) -> str:
+    if blocks_df.empty:
+        return ""
 
-    for _, doc_row in selected_docs_df.iterrows():
-        file_name = doc_row["name"]
-        file_id = doc_row["id"]
-        mime_type = doc_row["mimeType"]
-        document_type = doc_row.get("document_type", "other_pdf")
-        drive_path = doc_row.get("path", "")
+    selected = blocks_df.head(max_blocks)
+    lines = []
 
-        pdf_bytes = download_drive_file_bytes(service, file_id, mime_type=mime_type)
-        blocks_df, total_pages = extract_pdf_page_blocks(pdf_bytes, max_pages=max_pages)
-
-        if not blocks_df.empty:
-            blocks_df["source_file"] = file_name
-            blocks_df["drive_file_id"] = file_id
-            blocks_df["drive_path"] = drive_path
-            blocks_df["document_type"] = document_type
-            all_blocks.append(blocks_df)
-
-        file_summary.append(
-            {
-                "source_file": file_name,
-                "drive_file_id": file_id,
-                "drive_path": drive_path,
-                "document_type": document_type,
-                "total_pages": total_pages,
-                "processed_pages": min(total_pages, max_pages),
-                "text_blocks": len(blocks_df),
-            }
+    for _, row in selected.iterrows():
+        lines.append(
+            f"[source_file={row.get('source_file')} "
+            f"document_type={row.get('document_type')} "
+            f"page={row.get('page')} "
+            f"block_id={row.get('block_id')}] {row.get('text')}"
         )
 
-    if all_blocks:
-        combined = pd.concat(all_blocks, ignore_index=True)
-    else:
-        combined = pd.DataFrame()
+    return "\n".join(lines)
 
-    return combined, pd.DataFrame(file_summary)
+
+def expand_blocks_with_context(
+    all_blocks_df: pd.DataFrame,
+    anchor_blocks_df: pd.DataFrame,
+    context_window: int = 2,
+) -> pd.DataFrame:
+    if all_blocks_df.empty or anchor_blocks_df.empty:
+        return anchor_blocks_df.copy()
+
+    pieces = []
+
+    for _, anchor in anchor_blocks_df.iterrows():
+        try:
+            source_file = str(anchor.get("source_file"))
+            page = int(anchor.get("page"))
+            block_id = int(anchor.get("block_id"))
+        except Exception:
+            continue
+
+        match = all_blocks_df[
+            (all_blocks_df["source_file"].astype(str) == source_file)
+            & (all_blocks_df["page"].astype(int) == page)
+            & (all_blocks_df["block_id"].astype(int).between(block_id - context_window, block_id + context_window))
+        ].copy()
+
+        if not match.empty:
+            pieces.append(match)
+
+    if not pieces:
+        return anchor_blocks_df.copy()
+
+    expanded = pd.concat(pieces, ignore_index=True)
+    expanded = expanded.drop_duplicates(subset=["source_file", "page", "block_id"]).copy()
+    expanded = expanded.sort_values(["source_file", "page", "block_id"])
+
+    return expanded
+
+
+def build_context_text(
+    all_blocks_df: pd.DataFrame,
+    anchor_blocks_df: pd.DataFrame,
+    max_blocks: int = 260,
+    context_window: int = 2,
+) -> str:
+    expanded = expand_blocks_with_context(
+        all_blocks_df,
+        anchor_blocks_df,
+        context_window=context_window,
+    )
+    return build_text_from_blocks(expanded, max_blocks=max_blocks)
+
+
+def get_blocks_by_type(blocks_df: pd.DataFrame, document_types: List[str]) -> pd.DataFrame:
+    if blocks_df.empty or "document_type" not in blocks_df.columns:
+        return pd.DataFrame()
+
+    return blocks_df[blocks_df["document_type"].isin(document_types)].copy()
+
+
+def get_orientation_blocks(blocks_df: pd.DataFrame) -> pd.DataFrame:
+    note_blocks = get_blocks_by_type(blocks_df, ["explanatory_note"])
+
+    if not note_blocks.empty:
+        return note_blocks
+
+    general_blocks = get_blocks_by_type(blocks_df, ["general_data"])
+
+    if not general_blocks.empty:
+        return general_blocks
+
+    return blocks_df.head(260).copy()
 
 
 def make_block_batches(blocks_df: pd.DataFrame, max_blocks_per_batch: int) -> List[pd.DataFrame]:
     if blocks_df.empty:
         return []
+
     batches = []
+
     for start in range(0, len(blocks_df), max_blocks_per_batch):
-        batches.append(blocks_df.iloc[start:start + max_blocks_per_batch].copy())
+        batch = blocks_df.iloc[start:start + max_blocks_per_batch].copy()
+
+        if not batch.empty:
+            batches.append(batch)
+
     return batches
 
 
-def blocks_to_prompt_text(blocks_df: pd.DataFrame, max_chars: int = 26000) -> str:
-    lines = []
-    total = 0
-    for _, row in blocks_df.iterrows():
-        line = (
-            f"[source_file={row.get('source_file')} document_type={row.get('document_type')} "
-            f"page={row.get('page')} block_id={row.get('block_id')}] {row.get('text')}"
-        )
-        if total + len(line) > max_chars:
-            break
-        lines.append(line)
-        total += len(line)
-    return "\n".join(lines)
+# =========================================================
+# Memory un Prompt lasīšana
+# =========================================================
+
+def parse_list_value(value: Any) -> List[str]:
+    if value is None:
+        return []
+
+    if isinstance(value, list):
+        return [str(v).strip() for v in value if str(v).strip()]
+
+    text = str(value).strip()
+
+    if not text or text.lower() == "nan":
+        return []
+
+    if text.startswith("[") and text.endswith("]"):
+        try:
+            parsed = ast.literal_eval(text)
+            if isinstance(parsed, list):
+                return [str(v).strip() for v in parsed if str(v).strip()]
+        except Exception:
+            pass
+
+    return [p.strip() for p in re.split(r"[,;]", text) if p.strip()]
 
 
-def make_docs_overview(blocks_df: pd.DataFrame, max_blocks_per_doc: int = 25) -> str:
-    if blocks_df.empty:
-        return ""
-    lines = []
-    for source_file, group in blocks_df.groupby("source_file"):
-        doc_type = normalize_text(group["document_type"].iloc[0]) if "document_type" in group.columns else ""
-        lines.append(f"--- {source_file} ({doc_type}) ---")
-        sample = group.head(max_blocks_per_doc)
-        for _, row in sample.iterrows():
-            lines.append(f"[page={row['page']} block_id={row['block_id']}] {row['text']}")
-    return "\n".join(lines[:500])
+def load_memory_json_files(service, memory_folder_id: str) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    items = list_folder_items(service, memory_folder_id)
+    catalog_rows = []
+    requirements_records = []
+    facts_records = []
+
+    for item in items:
+        name = str(item.get("name", ""))
+
+        if not name.lower().endswith(".json"):
+            continue
+
+        try:
+            payload = json.loads(
+                download_drive_file_bytes(service, item.get("id")).decode("utf-8", errors="replace")
+            )
+
+            kind = "unknown_json"
+            records = []
+            detected_discipline = ""
+            schema = ""
+
+            if isinstance(payload, dict):
+                schema = str(payload.get("memory_schema", ""))
+
+                if isinstance(payload.get("requirements"), list):
+                    kind = "design_brief_requirements"
+                    records = payload.get("requirements", [])
+
+                elif isinstance(payload.get("facts"), list):
+                    kind = "discipline_facts"
+                    records = payload.get("facts", [])
+
+                elif isinstance(payload.get("records"), list):
+                    records = payload.get("records", [])
+
+            elif isinstance(payload, list):
+                records = payload
+
+            if kind == "unknown_json" and records:
+                sample = records[0]
+
+                if "requirement" in sample or ("memory_type" in sample and "requirement" in str(sample.get("memory_type"))):
+                    kind = "design_brief_requirements"
+
+                elif "fact_type" in sample or "fact_id" in sample:
+                    kind = "discipline_facts"
+
+            if records:
+                for rec in records:
+                    if not isinstance(rec, dict):
+                        continue
+
+                    rec = dict(rec)
+                    rec["memory_source_file"] = name
+
+                    if kind == "design_brief_requirements":
+                        requirements_records.append(rec)
+
+                    elif kind == "discipline_facts":
+                        facts_records.append(rec)
+                        detected_discipline = detected_discipline or str(
+                            rec.get("discipline") or rec.get("memory_discipline") or ""
+                        )
+
+            catalog_rows.append({
+                "name": name,
+                "kind": kind,
+                "memory_schema": schema,
+                "records_count": len(records),
+                "detected_discipline": detected_discipline,
+                "mimeType": item.get("mimeType"),
+                "size": item.get("size", ""),
+                "modifiedTime": item.get("modifiedTime", ""),
+            })
+
+        except Exception as e:
+            catalog_rows.append({
+                "name": name,
+                "kind": "error",
+                "error": str(e),
+            })
+
+    req_df = pd.DataFrame(requirements_records)
+    facts_df = pd.DataFrame(facts_records)
+
+    if not req_df.empty:
+        if "discipline_list" not in req_df.columns and "discipline" in req_df.columns:
+            req_df["discipline_list"] = req_df["discipline"].apply(parse_list_value)
+
+        if "applies_to_sections_list" not in req_df.columns and "applies_to_sections" in req_df.columns:
+            req_df["applies_to_sections_list"] = req_df["applies_to_sections"].apply(parse_list_value)
+
+    return pd.DataFrame(catalog_rows), req_df, facts_df
+
+
+def load_prompt_assets(service, prompt_folder_id: str) -> Tuple[pd.DataFrame, str, str]:
+    items = list_folder_items(service, prompt_folder_id)
+    catalog = []
+    universal_prompt = ""
+    error_examples_text = ""
+
+    for item in items:
+        name = str(item.get("name", ""))
+        mime = str(item.get("mimeType", ""))
+        row = {
+            "name": name,
+            "mimeType": mime,
+            "size": item.get("size", ""),
+            "modifiedTime": item.get("modifiedTime", ""),
+        }
+
+        try:
+            lower = name.lower()
+
+            if lower == "universal_bp_audit_prompt.txt" or lower.endswith(".txt"):
+                text = download_drive_file_bytes(service, item.get("id")).decode("utf-8", errors="replace")
+
+                if "universal" in lower or not universal_prompt:
+                    universal_prompt = text
+
+                row["loaded"] = True
+
+            elif lower.endswith(".xlsx") or mime == GOOGLE_SHEET_MIME_TYPE:
+                if mime == GOOGLE_SHEET_MIME_TYPE:
+                    data = export_google_file_bytes(
+                        service,
+                        item.get("id"),
+                        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    )
+                else:
+                    data = download_drive_file_bytes(service, item.get("id"))
+
+                df = pd.read_excel(io.BytesIO(data))
+                preview = df.head(120).fillna("").astype(str)
+                error_examples_text += f"\n\n### {name}\n" + preview.to_csv(index=False)[:20000]
+                row["rows_loaded"] = len(df)
+
+            elif lower.endswith(".pdf"):
+                row["loaded"] = "pdf_registered"
+
+        except Exception as e:
+            row["error"] = str(e)
+
+        catalog.append(row)
+
+    return pd.DataFrame(catalog), universal_prompt, error_examples_text
 
 
 # =========================================================
-# Memory subset selection
+# OpenAI helpers
 # =========================================================
-
-
-def row_matches_discipline(row: pd.Series, discipline_code: str) -> bool:
-    discipline_code_upper = discipline_code.upper()
-    candidates = []
-    for col in ["discipline", "applies_to_sections", "discipline_list", "applies_to_sections_list"]:
-        if col in row.index:
-            candidates.extend(parse_list_value(row.get(col)))
-    return any(str(item).upper() == discipline_code_upper for item in candidates)
-
-
-def select_requirements_for_discipline(requirements_df: pd.DataFrame, discipline_code: str, max_items: int) -> pd.DataFrame:
-    if requirements_df.empty:
-        return requirements_df
-
-    df = requirements_df.copy()
-    mask = df.apply(lambda row: row_matches_discipline(row, discipline_code), axis=1)
-    selected = df[mask].copy()
-
-    if selected.empty:
-        selected = df.copy()
-
-    if "priority" in selected.columns:
-        selected["_priority"] = pd.to_numeric(selected["priority"], errors="coerce").fillna(0)
-        selected = selected.sort_values("_priority", ascending=False).drop(columns=["_priority"], errors="ignore")
-
-    return selected.head(max_items)
-
-
-def requirements_to_prompt_text(requirements_df: pd.DataFrame, max_chars: int = 18000) -> str:
-    if requirements_df.empty:
-        return ""
-
-    lines = []
-    total = 0
-    for _, row in requirements_df.iterrows():
-        memory_id = normalize_text(row.get("memory_id")) or normalize_text(row.get("requirement_id"))
-        system = normalize_text(row.get("engineering_system"))
-        sections = normalize_text(row.get("applies_to_sections")) or ", ".join(parse_list_value(row.get("applies_to_sections_list")))
-        req = normalize_text(row.get("requirement"))
-        source = normalize_text(row.get("source_file"))
-        line = f"[{memory_id}] system={system}; sections={sections}; source={source}; requirement={req}"
-        if total + len(line) > max_chars:
-            break
-        lines.append(line)
-        total += len(line)
-    return "\n".join(lines)
-
-
-def select_facts_for_interdisciplinary(facts_df: pd.DataFrame, current_discipline: str, max_items: int) -> pd.DataFrame:
-    if facts_df.empty:
-        return facts_df
-
-    df = facts_df.copy()
-    current = current_discipline.upper()
-
-    def fact_discipline(row):
-        for col in ["memory_discipline", "discipline"]:
-            value = normalize_text(row.get(col)).upper()
-            if value:
-                return value
-        return ""
-
-    df["_fact_disc"] = df.apply(fact_discipline, axis=1)
-    selected = df[df["_fact_disc"] != current].copy()
-
-    if selected.empty:
-        return selected.drop(columns=["_fact_disc"], errors="ignore")
-
-    if "confidence" in selected.columns:
-        selected["_confidence"] = pd.to_numeric(selected["confidence"], errors="coerce").fillna(0)
-        selected = selected.sort_values("_confidence", ascending=False)
-
-    return selected.head(max_items).drop(columns=["_fact_disc", "_confidence"], errors="ignore")
-
-
-def facts_to_prompt_text(facts_df: pd.DataFrame, max_chars: int = 18000) -> str:
-    if facts_df.empty:
-        return ""
-
-    lines = []
-    total = 0
-    for _, row in facts_df.iterrows():
-        fact_id = normalize_text(row.get("memory_id")) or normalize_text(row.get("fact_id"))
-        discipline = normalize_text(row.get("memory_discipline")) or normalize_text(row.get("discipline"))
-        fact_type = normalize_text(row.get("fact_type"))
-        element = normalize_text(row.get("element"))
-        param_name = normalize_text(row.get("parameter_name"))
-        param_value = normalize_text(row.get("parameter_value"))
-        unit = normalize_text(row.get("unit"))
-        source_file = normalize_text(row.get("source_file"))
-        page = normalize_text(row.get("page"))
-        block_id = normalize_text(row.get("block_id"))
-        source_text = normalize_text(row.get("source_text"))
-        line = (
-            f"[{fact_id}] discipline={discipline}; fact_type={fact_type}; element={element}; "
-            f"parameter={param_name} {param_value} {unit}; source={source_file} p.{page} block {block_id}; text={source_text}"
-        )
-        if total + len(line) > max_chars:
-            break
-        lines.append(line)
-        total += len(line)
-    return "\n".join(lines)
-
-
-# =========================================================
-# OpenAI and JSON parsing
-# =========================================================
-
 
 def get_openai_client() -> OpenAI:
     api_key = st.secrets.get("OPENAI_API_KEY")
+
     if not api_key:
         raise ValueError("Secrets nav atrasts OPENAI_API_KEY.")
+
     return OpenAI(api_key=api_key)
 
 
-def parse_json_array(raw_text: str) -> List[Dict[str, Any]]:
-    text = (raw_text or "").strip()
+def strip_code_fences(text: str) -> str:
+    text = text.strip()
+
     if text.startswith("```"):
         text = re.sub(r"^```(?:json)?", "", text, flags=re.IGNORECASE).strip()
         text = re.sub(r"```$", "", text).strip()
+
+    return text
+
+
+def parse_json_array(raw_text: str) -> List[Dict[str, Any]]:
+    text = strip_code_fences(raw_text)
     start = text.find("[")
     end = text.rfind("]")
+
     if start == -1 or end == -1 or end <= start:
-        raise ValueError("AI neatgrieza JSON masīvu.")
-    data = json.loads(text[start:end + 1])
-    if not isinstance(data, list):
-        raise ValueError("AI atbilde nav JSON masīvs.")
-    return data
+        return []
+
+    try:
+        data = json.loads(text[start:end + 1])
+        return data if isinstance(data, list) else []
+
+    except Exception:
+        return []
 
 
-def call_ai_json_array(client: OpenAI, model: str, prompt: str) -> List[Dict[str, Any]]:
+def call_ai_json_array(
+    client: OpenAI,
+    model: str,
+    system: str,
+    prompt: str,
+    temperature: float = 0.0,
+) -> Tuple[List[Dict[str, Any]], str]:
     response = client.chat.completions.create(
         model=model,
-        temperature=0.0,
+        temperature=temperature,
         messages=[
-            {
-                "role": "system",
-                "content": (
-                    "Tu esi ļoti piesardzīgs būvprojekta dokumentācijas auditors. "
-                    "Atbildi tikai ar derīgu JSON masīvu. Nekādu Markdown, nekādu paskaidrojumu ārpus JSON. "
-                    "Ja nav drošu, anotējamu piezīmju, atgriez []."
-                ),
-            },
+            {"role": "system", "content": system},
             {"role": "user", "content": prompt},
         ],
     )
+
     raw = response.choices[0].message.content or ""
-    return parse_json_array(raw)
+
+    return parse_json_array(raw), raw
+
+
+# =========================================================
+# Prompts
+# =========================================================
+
+def mode_rules(audit_depth: str, confidence_threshold: float) -> str:
+    if audit_depth == "Conservative":
+        return f"""
+Režīms: Conservative.
+Atgriez tikai ļoti drošas, anotējamas piezīmes.
+Minimālā mērķa pārliecība: {confidence_threshold}.
+Ja šaubies, neatgriez piezīmi.
+"""
+
+    if audit_depth == "Balanced":
+        return f"""
+Režīms: Balanced.
+Atgriez drošas un diezgan ticamas kandidātpiezīmes, bet tikai ar konkrētu source_file/page/block_id.
+Minimālā mērķa pārliecība: {confidence_threshold}.
+Neiekļauj vispārīgus "pārbaudīt" komentārus.
+"""
+
+    return f"""
+Režīms: Diagnostic.
+Atgriez plašāku kandidātu sarakstu diagnostikai, arī ja confidence ir zemāks.
+Tomēr katrai rindai joprojām jābūt piesaistītai konkrētam source_file/page/block_id.
+Šajā režīmā include_in_pdf drīkst būt false, bet kandidātu rādi tabulā.
+"""
 
 
 def issue_schema_instruction() -> str:
     return """
-ATBILDES FORMĀTS:
-Atbildi tikai JSON masīvā. Ja nav drošu anotējamu piezīmju, atgriez [].
-
-Katram objektam jābūt:
-- audit_mode: viens no ["design_brief_conflict", "single_document_consistency", "discipline_consistency", "interdisciplinary_consistency"]
-- issue_type: īss tips, piemēram direct_conflict, wrong_parameter, partial_solution_visible, diameter_conflict, material_conflict, quantity_conflict, system_code_conflict, translation_conflict, cross_discipline_conflict
+Atbildi tikai JSON masīvā. Katram objektam jābūt laukiem:
+- issue_id
+- audit_mode
+- issue_type
 - priority: 1-10
-- confidence: 0.0-1.0
-- source_file: tieši auditējamā BP faila nosaukums no [source_file=...]
+- confidence: 0-1
+- include_in_pdf: true/false
+- source_file: auditējamā BP faila nosaukums
 - page: auditējamā BP faila lapa
-- block_id: auditējamā BP faila block_id
-- source_text: īss auditējamais BP teksts, ko var apvilkt PDF
+- block_id: auditējamā BP teksta bloka ID
+- source_text: tieši tas BP teksta fragments, ko varētu apvilkt PDF
 - comment: īsa piezīme latviski
 - suggestion: īss ieteikums latviski
-- related_memory_id: Design Brief memory ID, ja attiecas, citādi ""
-- related_requirement: Design Brief prasība, ja attiecas, citādi ""
-- related_fact_id: disciplīnas memory fact ID, ja attiecas, citādi ""
-- related_fact: īss saistītais fakts, ja attiecas, citādi ""
-- related_files: saraksts ar citiem failiem vai tukšs saraksts
-- include_in_pdf: true vai false
+- related_memory_id: ja attiecas uz Design Brief prasību
+- related_requirement: ja attiecas uz Design Brief prasību
+- related_fact_id: ja attiecas uz faktu atmiņu
+- related_fact: ja attiecas uz faktu atmiņu
+- related_files: saraksts vai īss teksts ar saistītiem failiem
 
-Stingrs noteikums: include_in_pdf drīkst būt true tikai tad, ja source_file, page, block_id un source_text ir konkrēti un atrodami auditējamajā BP tekstā.
+Nekad neatgriez piezīmi bez source_file, page un block_id.
+Ja piezīmi nevar piesaistīt konkrētam BP teksta blokam, neatgriez to kā PDF piezīmi.
 """
 
 
-# =========================================================
-# Audit prompts
-# =========================================================
-
-
-def build_design_brief_conflict_prompt(
+def build_fact_prompt(
     project_code: str,
     discipline_code: str,
-    requirements_text: str,
-    blocks_text: str,
+    text_blocks: str,
+    source_hint: str,
     error_examples_text: str,
 ) -> str:
     return f"""
-Tu pārbaudi būvprojekta disciplīnu pret Design Brief / prasību atmiņu.
-
-Projekts: {project_code}
-Auditējamā disciplīna: {discipline_code}
-
-MĒRĶIS:
-Atrodi tikai tādus auditējamās BP disciplīnas teksta blokus, kuros pašā tekstā redzama acīmredzama pretruna, nepareizs parametrs vai daļējs risinājums pret Design Brief prasībām.
-
-NEDRĪKST:
-- neveido prasību statusa sarakstu;
-- neziņo par prasībām, kuras vienkārši neatradi;
-- neraksti "nav atrasts" bez konkrēta teksta enkura;
-- neraksti vispārīgu "pārbaudīt";
-- neiekļauj piezīmi, ja nav konkrēta BP teksta bloka, ko var apvilkt PDF.
-
-DRĪKST IEKĻAUT TIKAI:
-- direct_conflict: BP teksts tieši konfliktē ar Design Brief prasību;
-- wrong_parameter: BP tekstā ir skaits, diametrs, jauda, tips vai marka, kas neatbilst prasībai;
-- partial_solution_visible: BP teksts apraksta tikai daļu no prasītā risinājuma;
-- scope_gap_with_anchor: BP tekstā ir skaidrs enkurs, pie kura redzama būtiska prasības nepilnība.
-
-KĻŪDU PIEMĒRU KALIBRĀCIJA NO C2-2:
-{error_examples_text[:7000]}
-
-DESIGN BRIEF / MEP PRASĪBU ATMIŅA:
-{requirements_text}
-
-AUDITĒJAMĀ BP TEKSTA BLOKI:
-{blocks_text}
-
-{issue_schema_instruction()}
-"""
-
-
-def build_single_document_consistency_prompt(
-    project_code: str,
-    discipline_code: str,
-    source_file: str,
-    document_type: str,
-    blocks_text: str,
-    error_examples_text: str,
-    universal_prompt: str,
-) -> str:
-    return f"""
-Tu pārbaudi vienu būvprojekta PDF dokumentu pats pret sevi.
-
+Tu veido pagaidu faktu indeksu būvprojekta audita vajadzībām.
 Projekts: {project_code}
 Disciplīna: {discipline_code}
-Fails: {source_file}
-Dokumenta tips: {document_type}
+Avots: {source_hint}
 
-MĒRĶIS:
-Atrodi tikai tādas iekšējās nesakritības šī viena dokumenta ietvaros, kuras var piesaistīt konkrētam teksta blokam.
+Uzdevums: no teksta blokiem izvelc tehniskus faktus, kas vēlāk palīdz atrast nesakritības starp dokumentiem.
+Neveido kļūdu piezīmes. Nevērtē pareizību. Tikai strukturēti fakti.
 
-Meklē pēc C2-2 kļūdu piemēru loģikas:
-- diametru, materiālu, daudzumu, marku, sistēmu apzīmējumu pretrunas;
-- LV/ENG blakus tekstu nesakritības, bet neuzskati to par kļūdu, ja tulkojums ir dots pareizi;
-- drukas kļūdas, kas maina tehnisko nozīmi;
-- vienā dokumentā atšķirīgi objekta/sadaļas/rasējuma nosaukumi;
-- aprēķinu vai tabulu neatbilstības, ja tās ir redzamas tekstā;
-- specifikācijas pozīcijas, kuras ir iekšēji neskaidras vai pretrunīgas.
+Īpaši izvelc:
+- diametrus, materiālus, markas, tipus, klases, daudzumus, jaudas, sistēmu kodus;
+- specifikācijas pozīcijas un apjomus;
+- rasējumu numurus, dokumentu identifikāciju;
+- iekārtas, telpas, pieslēgumus, robežas starp sadaļām.
 
-NEDRĪKST:
-- neinterpretē rasējuma grafiskos atkārtotos kodus U1/K1/K2/K3 kā vienu teksta teikumu;
-- neraksti piezīmi, ja nav konkrēta teksta bloka;
-- neraksti vispārīgas "pārbaudīt" piezīmes;
-- labāk atgriezt [] nekā apšaubāmu piezīmi.
-
-UNIVERSĀLAIS AUDITA PROMPTS / PRINCIPI:
-{universal_prompt[:5000]}
-
-C2-2 KĻŪDU PIEMĒRI:
-{error_examples_text[:9000]}
-
-DOKUMENTA TEKSTA BLOKI:
-{blocks_text}
-
-{issue_schema_instruction()}
-Visām piezīmēm audit_mode = "single_document_consistency".
-"""
-
-
-def build_discipline_consistency_prompt(
-    project_code: str,
-    discipline_code: str,
-    docs_overview: str,
-    current_blocks_text: str,
-    error_examples_text: str,
-) -> str:
-    return f"""
-Tu pārbaudi izvēlētās būvprojekta disciplīnas iekšējo savstarpējo konsekvenci.
-
-Projekts: {project_code}
-Disciplīna: {discipline_code}
-
-MĒRĶIS:
-Atrodi tikai skaidras nesakritības starp šīs pašas disciplīnas dokumentiem: skaidrojošo aprakstu, rasējumiem, specifikāciju, vispārīgajiem datiem, aprēķiniem un citiem PDF.
-
-UNIVERSĀLA PĀRBAUDES SECĪBA:
-- skaidrojošais apraksts ir pirmais orientieris, ja tāds ir;
-- rasējumi jāsalīdzina ar skaidrojošo aprakstu;
-- specifikācija jāsalīdzina ar rasējumos un aprakstā norādītajiem materiāliem, markām, daudzumiem, diametriem, sistēmām;
-- vispārīgie dati un aprēķini jāizmanto kā papildu konteksts.
-
-NEDRĪKST:
-- neraksti "nav atrasts" bez konkrēta teksta enkura;
-- neapvelc neko, ja nav konkrēta BP teksta bloka;
-- neizdomā grafiku vai simbolu nozīmi, ja tā nav tekstā;
-- neraksti zemas vērtības pārbaudes piezīmes.
-
-C2-2 KĻŪDU PIEMĒRI:
-{error_examples_text[:9000]}
-
-DISCIPLĪNAS DOKUMENTU ĪSS KONTEKSTS:
-{docs_overview[:16000]}
-
-PAŠREIZ AUDITĒJAMIE TEKSTA BLOKI:
-{current_blocks_text}
-
-{issue_schema_instruction()}
-Visām piezīmēm audit_mode = "discipline_consistency".
-"""
-
-
-def build_interdisciplinary_consistency_prompt(
-    project_code: str,
-    discipline_code: str,
-    other_facts_text: str,
-    current_blocks_text: str,
-    error_examples_text: str,
-) -> str:
-    return f"""
-Tu pārbaudi auditējamo būvprojekta disciplīnu pret līdz šim 03_Memory saglabātajām citu disciplīnu faktu atmiņām.
-
-Projekts: {project_code}
-Auditējamā disciplīna: {discipline_code}
-
-MĒRĶIS:
-Atrodi tikai tādas skaidras starpdisciplīnu nesakritības, kur auditējamās disciplīnas teksta bloks konfliktē ar iepriekš auditētās disciplīnas faktu.
-
-PIEMĒRI:
-- auditējamā sadaļa saka K2 D110, bet iepriekšējā memory faktā K2 ir OD160;
-- auditējamā sadaļa saka materiāls PVC, bet iepriekšējā memory faktā tas pats elements ir PP;
-- auditējamā sadaļa norāda citu iekārtas skaitu, marku, pieslēgumu, telpu vai sistēmas robežu;
-- auditējamā sadaļa apraksta daļēju risinājumu, kas konfliktē ar iepriekšējās disciplīnas faktu.
-
-NEDRĪKST:
-- neizmanto pašreizējās disciplīnas faktus kā citu disciplīnu memory;
-- neraksti piezīmi bez konkrēta auditējamās sadaļas teksta bloka;
-- neraksti "nav atrasts";
-- neraksti vispārīgu starpdisciplīnu brīdinājumu.
-
-C2-2 KĻŪDU PIEMĒRI:
+C2-2 kļūdu piemēru loģika, kas rāda, kādi fakti vēlāk var būt svarīgi:
 {error_examples_text[:6000]}
 
-CITU DISCIPLĪNU FAKTU ATMIŅA:
-{other_facts_text}
+Atbildi tikai JSON masīvā. Katram objektam:
+- fact_id
+- fact_type: system_reference / pipe_diameter / material / quantity / equipment / connection / interface / room_or_space / drawing_reference / specification_item / power_or_flow / document_identity / other_fact
+- element
+- parameter_name
+- parameter_value
+- unit
+- source_file
+- page
+- block_id
+- source_text
+- confidence
 
-AUDITĒJAMĀS DISCIPLĪNAS TEKSTA BLOKI:
-{current_blocks_text}
+Teksta bloki:
+{text_blocks}
+"""
 
+
+def build_design_brief_prompt(
+    requirements_text: str,
+    text_blocks: str,
+    audit_depth: str,
+    confidence_threshold: float,
+) -> str:
+    return f"""
+Tu pārbaudi BP dokumenta tekstu pret Design Brief prasību atmiņu.
+Mērķis NAV izveidot prasību statusa sarakstu.
+Mērķis ir atrast tikai tos auditējamā BP dokumenta teksta blokus, kuros redzama skaidra vai ticama pretruna pret Design Brief prasību.
+
+NEZIŅO par prasībām, kas vienkārši nav atrastas.
+NEZIŅO "vajag pārbaudīt" bez konkrēta teksta bloka.
+Atgriez tikai tādus kandidātus, ko teorētiski varētu apvilkt PDF.
+
+Atļautie issue_type:
+- design_brief_direct_conflict
+- design_brief_wrong_parameter
+- design_brief_partial_solution_visible
+- design_brief_scope_gap_with_anchor
+
+{mode_rules(audit_depth, confidence_threshold)}
 {issue_schema_instruction()}
-Visām piezīmēm audit_mode = "interdisciplinary_consistency".
+
+Design Brief prasību atmiņas fragments:
+{requirements_text}
+
+Auditējamie BP teksta bloki:
+{text_blocks}
+"""
+
+
+def build_single_doc_prompt(
+    document_name: str,
+    document_type: str,
+    text_blocks: str,
+    facts_text: str,
+    error_examples_text: str,
+    audit_depth: str,
+    confidence_threshold: float,
+) -> str:
+    return f"""
+Tu veic viena BP dokumenta iekšējo konsekvences pārbaudi.
+Dokuments: {document_name}
+Dokumenta tips: {document_type}
+
+Meklē tikai kļūdas un nesakritības šī paša dokumenta ietvaros.
+Izmanto C2-2 kļūdu piemēru loģiku kā kalibrāciju, nevis meklē identisku tekstu.
+
+Meklē:
+- diametru, materiālu, marku, sistēmu kodu, daudzumu pretrunas vienā dokumentā;
+- LV/ENG vai paralēlu tekstu nesakritības;
+- tabulu/rindu/pozīciju savstarpējas pretrunas;
+- dokumenta nosaukuma, rasējuma numura, revīzijas, sadaļas identifikācijas nesakritības;
+- specifikācijas apjomu vai materiālu neatbilstības, kas redzamas šajā dokumentā.
+
+Nedod vispārīgas piezīmes. Katram kandidātam jābūt piesaistītam konkrētam teksta blokam.
+
+{mode_rules(audit_depth, confidence_threshold)}
+{issue_schema_instruction()}
+
+C2-2 kļūdu piemēri:
+{error_examples_text[:10000]}
+
+Pagaidu fakti no šī dokumenta:
+{facts_text[:14000]}
+
+Dokumenta teksta bloki:
+{text_blocks}
+"""
+
+
+def build_structured_discipline_pair_prompt(
+    discipline_code: str,
+    comparison_step: str,
+    reference_label: str,
+    reference_text: str,
+    target_label: str,
+    target_text: str,
+    facts_text: str,
+    error_examples_text: str,
+    audit_depth: str,
+    confidence_threshold: float,
+) -> str:
+    return f"""
+Tu veic universālu būvprojekta disciplīnas iekšējās konsekvences pārbaudi.
+Disciplīna: {discipline_code}
+Salīdzināšanas solis: {comparison_step}
+
+Šis nav jauns specifisks tests konkrētai disciplīnai. Šis ir universāls princips:
+1. Skaidrojošais apraksts / vispārīgie dati ir orientieris tam, ko sadaļa apgalvo.
+2. Rasējumi parāda, kā apgalvojumi realizēti grafiski un tekstuālos parametros.
+3. Specifikācija rāda materiālus, markas, daudzumus un pozīcijas.
+4. Piezīmi drīkst dot tikai par konkrētu tekstuālu bloku, ko varētu apvilkt PDF.
+
+Tavs uzdevums šajā solī:
+- salīdzini reference materiālu pret target materiālu;
+- meklē skaidras vai diezgan ticamas pretrunas starp tiem;
+- neatgriez vispārīgas piezīmes, ka “jāpārbauda”;
+- neatgriez “nav atrasts” piezīmes bez konkrēta teksta enkura;
+- ja target tekstā ir bloks, kas ir pretrunā reference materiālam, kā source_file/page/block_id izvēlies target bloku;
+- ja reference tekstā ir bloks, kas ir tieši pretrunā target materiālam, source_file/page/block_id drīkst būt reference bloks;
+- ja bloks satur tikai vienu īsu parametru, izmanto apkārtējo kontekstu, kas dots tekstā.
+
+Īpaši meklē šādus universālus konfliktus:
+- diametra konflikts: DN/D/OD/Ø vērtība nesakrīt;
+- materiāla konflikts: PP/PVC/PE/tērauds/marka/tips nesakrīt;
+- skaita vai daudzuma konflikts: gab., m, m2, m3 vai pozīciju skaits nesakrīt;
+- sistēmas koda konflikts: K1/K2/K3/U1 vai līdzīgs kods lietots pretrunīgi;
+- specifikācijas pozīcija neatbilst rasējuma tekstam vai aprakstam;
+- iekārtas tips/marka/parametrs atšķiras;
+- dokumenta identitāte, rasējuma numurs, nosaukums vai revīzija ir pretrunīga, ja tas var radīt audita piezīmi.
+
+C2-2 kļūdu piemēri ir kalibrācija kļūdu loģikai, nevis teksts, kas jāmeklē burtiski:
+{error_examples_text[:9000]}
+
+{mode_rules(audit_depth, confidence_threshold)}
+{issue_schema_instruction()}
+
+Pagaidu faktu indekss no auditējamās disciplīnas:
+{facts_text[:18000]}
+
+REFERENCE — {reference_label}:
+{reference_text[:24000]}
+
+TARGET — {target_label}:
+{target_text[:24000]}
+"""
+
+
+def build_interdisciplinary_prompt(
+    discipline_code: str,
+    prior_facts_text: str,
+    current_facts_text: str,
+    text_blocks: str,
+    audit_depth: str,
+    confidence_threshold: float,
+) -> str:
+    return f"""
+Tu veic starpdisciplīnu konsekvences pārbaudi.
+Auditējamā disciplīna: {discipline_code}
+
+Salīdzini auditējamās disciplīnas tekstu/faktus pret 03_Memory jau saglabātajiem citu disciplīnu faktiem.
+Piezīmi drīkst piesaistīt tikai auditējamās disciplīnas teksta blokam, nevis iepriekšējās disciplīnas memory faktam.
+
+Meklē tikai skaidras pretrunas:
+- diametrs/jauda/skaits/materiāls nesakrīt;
+- sistēmas kods vai pieslēguma robeža nesakrīt;
+- telpa/iekārta/pieslēgums vienā disciplīnā aprakstīts pretēji citai;
+- scope/boundary conflict starp disciplīnām.
+
+Nedod "jāpārbauda ar citu sadaļu" vispārīgu piezīmi. Vajag konkrētu auditējamās disciplīnas source_file/page/block_id.
+
+{mode_rules(audit_depth, confidence_threshold)}
+{issue_schema_instruction()}
+
+Citu līdz šim auditēto disciplīnu fakti no 03_Memory:
+{prior_facts_text[:18000]}
+
+Auditējamās disciplīnas pagaidu fakti:
+{current_facts_text[:12000]}
+
+Auditējamās disciplīnas teksta bloki:
+{text_blocks[:22000]}
 """
 
 
 # =========================================================
-# Issue post-processing
+# Datu sagatavošana AI promptiem
 # =========================================================
 
+def df_to_compact_text(df: pd.DataFrame, max_rows: int, cols: Optional[List[str]] = None) -> str:
+    if df is None or df.empty:
+        return ""
 
-def build_valid_block_keys(blocks_df: pd.DataFrame) -> set:
-    keys = set()
-    if blocks_df.empty:
-        return keys
-    for _, row in blocks_df.iterrows():
-        keys.add((normalize_text(row.get("source_file")), safe_int(row.get("page")), safe_int(row.get("block_id"))))
-    return keys
+    use_df = df.copy()
+
+    if cols:
+        use_cols = [c for c in cols if c in use_df.columns]
+        if use_cols:
+            use_df = use_df[use_cols]
+
+    return use_df.head(max_rows).fillna("").astype(str).to_csv(index=False)
 
 
-def normalize_issue(issue: Dict[str, Any], project_code: str, discipline_code: str, source_tag: str) -> Dict[str, Any]:
-    row = dict(issue)
-    row["project_code"] = project_code
-    row["discipline"] = discipline_code
-    row["source_tag"] = source_tag
+def select_relevant_requirements(req_df: pd.DataFrame, discipline_code: str, max_rows: int) -> pd.DataFrame:
+    if req_df.empty:
+        return req_df
 
-    row["source_file"] = normalize_text(row.get("source_file"))
-    row["page"] = safe_int(row.get("page"), default=0)
-    row["block_id"] = safe_int(row.get("block_id"), default=-1)
-    row["source_text"] = normalize_text(row.get("source_text"))
-    row["comment"] = normalize_text(row.get("comment"))
-    row["suggestion"] = normalize_text(row.get("suggestion"))
-    row["audit_mode"] = normalize_text(row.get("audit_mode"))
-    row["issue_type"] = normalize_text(row.get("issue_type"))
-    row["priority"] = safe_int(row.get("priority"), default=0)
-    row["confidence"] = safe_float(row.get("confidence"), default=0.0)
-    row["include_in_pdf"] = bool(row.get("include_in_pdf", False))
-    row["related_files"] = parse_list_value(row.get("related_files"))
-    row["related_memory_id"] = normalize_text(row.get("related_memory_id"))
-    row["related_requirement"] = normalize_text(row.get("related_requirement"))
-    row["related_fact_id"] = normalize_text(row.get("related_fact_id"))
-    row["related_fact"] = normalize_text(row.get("related_fact"))
+    disc = discipline_code.upper()
 
-    return row
+    def relevant(row):
+        values = []
+
+        for col in ["discipline_list", "applies_to_sections_list", "discipline", "applies_to_sections"]:
+            if col in row:
+                values.extend(parse_list_value(row.get(col)))
+
+        values_upper = [v.upper() for v in values]
+
+        return disc in values_upper or not values_upper
+
+    filtered = req_df[req_df.apply(relevant, axis=1)].copy()
+
+    if filtered.empty:
+        filtered = req_df.copy()
+
+    if "priority" in filtered.columns:
+        filtered["priority_num"] = pd.to_numeric(filtered["priority"], errors="coerce").fillna(0)
+        filtered = filtered.sort_values("priority_num", ascending=False)
+
+    return filtered.head(max_rows)
+
+
+def select_prior_facts(facts_df: pd.DataFrame, current_discipline: str, max_rows: int) -> pd.DataFrame:
+    if facts_df.empty:
+        return facts_df
+
+    disc = current_discipline.upper()
+    work = facts_df.copy()
+
+    if "discipline" in work.columns:
+        work = work[work["discipline"].astype(str).str.upper() != disc]
+
+    elif "memory_discipline" in work.columns:
+        work = work[work["memory_discipline"].astype(str).str.upper() != disc]
+
+    return work.head(max_rows)
+
+
+# =========================================================
+# Issues post-processing
+# =========================================================
+
+def normalize_issue(issue: Dict[str, Any], default_mode: str, source_lookup: pd.DataFrame) -> Dict[str, Any]:
+    item = dict(issue)
+
+    item["audit_mode"] = item.get("audit_mode") or default_mode
+    item["issue_type"] = item.get("issue_type") or "unknown"
+    item["source_file"] = str(item.get("source_file") or "").strip()
+    item["source_text"] = str(item.get("source_text") or "").strip()
+    item["comment"] = str(item.get("comment") or "").strip()
+    item["suggestion"] = str(item.get("suggestion") or "").strip()
+
+    try:
+        item["page"] = int(float(item.get("page")))
+    except Exception:
+        item["page"] = None
+
+    try:
+        item["block_id"] = int(float(item.get("block_id")))
+    except Exception:
+        item["block_id"] = None
+
+    try:
+        item["confidence"] = float(item.get("confidence"))
+    except Exception:
+        item["confidence"] = 0.0
+
+    try:
+        item["priority"] = int(float(item.get("priority")))
+    except Exception:
+        item["priority"] = 0
+
+    if "include_in_pdf" not in item:
+        item["include_in_pdf"] = False
+
+    if isinstance(item["include_in_pdf"], str):
+        item["include_in_pdf"] = item["include_in_pdf"].strip().lower() in ["true", "1", "yes", "jā", "ja"]
+
+    item["has_anchor"] = False
+
+    if item["source_file"] and item["page"] is not None and item["block_id"] is not None and not source_lookup.empty:
+        match = source_lookup[
+            (source_lookup["source_file"].astype(str) == item["source_file"])
+            & (source_lookup["page"].astype(int) == int(item["page"]))
+            & (source_lookup["block_id"].astype(int) == int(item["block_id"]))
+        ]
+
+        if not match.empty:
+            item["has_anchor"] = True
+            item["x0"] = match.iloc[0].get("x0")
+            item["y0"] = match.iloc[0].get("y0")
+            item["x1"] = match.iloc[0].get("x1")
+            item["y1"] = match.iloc[0].get("y1")
+
+            if not item["source_text"]:
+                item["source_text"] = match.iloc[0].get("text", "")
+
+    return item
 
 
 def filter_issues(
-    issues: List[Dict[str, Any]],
-    blocks_df: pd.DataFrame,
-    min_confidence: float,
-    project_code: str,
-    discipline_code: str,
-    source_tag: str,
-) -> pd.DataFrame:
-    valid_keys = build_valid_block_keys(blocks_df)
-    normalized = [normalize_issue(item, project_code, discipline_code, source_tag) for item in issues if isinstance(item, dict)]
+    raw_df: pd.DataFrame,
+    confidence_threshold: float,
+    audit_depth: str,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    if raw_df.empty:
+        return raw_df, raw_df
 
-    filtered = []
-    banned_issue_types = {
+    work = raw_df.copy()
+
+    disallowed_types = [
         "not_found",
-        "missing_without_anchor",
         "general_uncertainty",
         "please_check",
-        "unclear_without_anchor",
-    }
-
-    for row in normalized:
-        key = (row["source_file"], row["page"], row["block_id"])
-        if key not in valid_keys:
-            continue
-        if row["confidence"] < min_confidence:
-            continue
-        if row["issue_type"] in banned_issue_types:
-            continue
-        if not row["source_text"] or not row["comment"]:
-            continue
-        if not row["include_in_pdf"]:
-            continue
-        filtered.append(row)
-
-    if not filtered:
-        return pd.DataFrame()
-
-    df = pd.DataFrame(filtered)
-    df = df.drop_duplicates(subset=["audit_mode", "issue_type", "source_file", "page", "block_id", "comment"])
-    df = df.reset_index(drop=True)
-    df["issue_id"] = [f"{project_code}-{discipline_code}-ISSUE-{i+1:04d}" for i in range(len(df))]
-    df["created_at_utc"] = datetime.now(timezone.utc).isoformat()
-
-    preferred = [
-        "issue_id",
-        "audit_mode",
-        "issue_type",
-        "priority",
-        "confidence",
-        "source_file",
-        "page",
-        "block_id",
-        "source_text",
-        "comment",
-        "suggestion",
-        "related_memory_id",
-        "related_requirement",
-        "related_fact_id",
-        "related_fact",
-        "related_files",
-        "project_code",
-        "discipline",
-        "source_tag",
-        "include_in_pdf",
-        "created_at_utc",
+        "missing_without_anchor",
+        "unanchored_possible_omission",
     ]
-    existing = [col for col in preferred if col in df.columns]
-    other = [col for col in df.columns if col not in existing]
-    return df[existing + other]
+
+    if audit_depth == "Diagnostic":
+        kept = work[work["has_anchor"] == True].copy()
+        removed = work[work["has_anchor"] != True].copy()
+
+        kept["passes_pdf_filter"] = (
+            (kept["confidence"] >= confidence_threshold)
+            & (kept["include_in_pdf"] == True)
+            & (~kept["issue_type"].isin(disallowed_types))
+        )
+
+        return kept, removed
+
+    mask = (
+        (work["has_anchor"] == True)
+        & (work["confidence"] >= confidence_threshold)
+        & (work["include_in_pdf"] == True)
+        & (~work["issue_type"].isin(disallowed_types))
+    )
+
+    kept = work[mask].copy()
+    removed = work[~mask].copy()
+
+    return kept, removed
 
 
-def make_excel_bytes(issues_df: pd.DataFrame, blocks_df: pd.DataFrame, file_summary_df: pd.DataFrame) -> bytes:
+def make_excel_bytes(
+    df: pd.DataFrame,
+    raw_df: pd.DataFrame,
+    removed_df: pd.DataFrame,
+    facts_df: pd.DataFrame,
+) -> bytes:
     output = io.BytesIO()
+
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        clean_dataframe_for_excel(issues_df).to_excel(writer, sheet_name="issues", index=False)
-        clean_dataframe_for_excel(file_summary_df).to_excel(writer, sheet_name="file_summary", index=False)
-        if not issues_df.empty and "audit_mode" in issues_df.columns:
-            issues_df.groupby("audit_mode").size().reset_index(name="count").to_excel(writer, sheet_name="summary_audit_mode", index=False)
-        if not issues_df.empty and "issue_type" in issues_df.columns:
-            issues_df.groupby("issue_type").size().reset_index(name="count").to_excel(writer, sheet_name="summary_issue_type", index=False)
-        clean_dataframe_for_excel(blocks_df.head(5000)).to_excel(writer, sheet_name="text_blocks_sample", index=False)
+        df.to_excel(writer, sheet_name="issues_filtered", index=False)
+        raw_df.to_excel(writer, sheet_name="issues_raw", index=False)
+        removed_df.to_excel(writer, sheet_name="issues_removed", index=False)
+        facts_df.to_excel(writer, sheet_name="temp_facts", index=False)
+
     output.seek(0)
     return output.getvalue()
 
 
-def make_json_bytes(issues_df: pd.DataFrame) -> bytes:
-    records = []
-    for _, row in issues_df.iterrows():
-        item = {}
-        for col, value in row.items():
-            if isinstance(value, list):
-                item[col] = value
-            elif pd.isna(value):
-                item[col] = None
-            else:
-                item[col] = value
-        records.append(item)
-
+def make_json_bytes(
+    df: pd.DataFrame,
+    raw_df: pd.DataFrame,
+    removed_df: pd.DataFrame,
+    facts_df: pd.DataFrame,
+    project_code: str,
+    discipline_code: str,
+) -> bytes:
     payload = {
-        "schema": "bp_audit_universal_issues_v1",
+        "schema": "bp_audit_universal_v3",
+        "project_code": project_code,
+        "discipline_code": discipline_code,
         "created_at_utc": datetime.now(timezone.utc).isoformat(),
-        "count": len(records),
-        "issues": records,
+        "filtered_count": len(df),
+        "raw_count": len(raw_df),
+        "removed_count": len(removed_df),
+        "temp_facts_count": len(facts_df),
+        "issues_filtered": df.where(pd.notna(df), None).to_dict(orient="records"),
+        "issues_raw": raw_df.where(pd.notna(raw_df), None).to_dict(orient="records"),
+        "issues_removed": removed_df.where(pd.notna(removed_df), None).to_dict(orient="records"),
+        "temp_facts": facts_df.where(pd.notna(facts_df), None).to_dict(orient="records"),
     }
+
     return json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
 
 
 # =========================================================
-# Audit runners
+# Session state init
 # =========================================================
 
-
-def run_design_brief_audit(
-    client: OpenAI,
-    model: str,
-    project_code: str,
-    discipline_code: str,
-    blocks_df: pd.DataFrame,
-    requirements_df: pd.DataFrame,
-    error_examples_text: str,
-    max_requirements: int,
-    max_blocks_per_batch: int,
-    min_confidence: float,
-    delay_seconds: float,
-) -> pd.DataFrame:
-    selected_requirements = select_requirements_for_discipline(requirements_df, discipline_code, max_requirements)
-    requirements_text = requirements_to_prompt_text(selected_requirements)
-    if not requirements_text:
-        return pd.DataFrame()
-
-    batches = make_block_batches(blocks_df, max_blocks_per_batch)
-    all_issues: List[Dict[str, Any]] = []
-
-    progress = st.progress(0)
-    status = st.empty()
-
-    for idx, batch_df in enumerate(batches, start=1):
-        status.write(f"Design Brief audits: batch {idx}/{len(batches)}")
-        prompt = build_design_brief_conflict_prompt(
-            project_code=project_code,
-            discipline_code=discipline_code,
-            requirements_text=requirements_text,
-            blocks_text=blocks_to_prompt_text(batch_df),
-            error_examples_text=error_examples_text,
-        )
-        try:
-            issues = call_ai_json_array(client, model, prompt)
-            all_issues.extend(issues)
-        except Exception as e:
-            st.warning(f"Design Brief batch {idx} kļūda: {e}")
-        progress.progress(idx / len(batches))
-        if delay_seconds > 0:
-            time.sleep(delay_seconds)
-
-    return filter_issues(all_issues, blocks_df, min_confidence, project_code, discipline_code, "design_brief")
-
-
-def run_single_document_audit(
-    client: OpenAI,
-    model: str,
-    project_code: str,
-    discipline_code: str,
-    blocks_df: pd.DataFrame,
-    error_examples_text: str,
-    universal_prompt: str,
-    max_blocks_per_request: int,
-    min_confidence: float,
-    delay_seconds: float,
-) -> pd.DataFrame:
-    all_issues: List[Dict[str, Any]] = []
-    groups = list(blocks_df.groupby("source_file"))
-
-    progress = st.progress(0)
-    status = st.empty()
-    step = 0
-    total_steps = sum(max(1, (len(group) + max_blocks_per_request - 1) // max_blocks_per_request) for _, group in groups)
-
-    for source_file, group_df in groups:
-        document_type = normalize_text(group_df["document_type"].iloc[0]) if "document_type" in group_df.columns else "other_pdf"
-        batches = make_block_batches(group_df, max_blocks_per_request)
-        for batch_df in batches:
-            step += 1
-            status.write(f"Viena dokumenta audits: {source_file} ({step}/{total_steps})")
-            prompt = build_single_document_consistency_prompt(
-                project_code=project_code,
-                discipline_code=discipline_code,
-                source_file=source_file,
-                document_type=document_type,
-                blocks_text=blocks_to_prompt_text(batch_df),
-                error_examples_text=error_examples_text,
-                universal_prompt=universal_prompt,
-            )
-            try:
-                issues = call_ai_json_array(client, model, prompt)
-                all_issues.extend(issues)
-            except Exception as e:
-                st.warning(f"Viena dokumenta audits kļūda failam {source_file}: {e}")
-            progress.progress(step / total_steps)
-            if delay_seconds > 0:
-                time.sleep(delay_seconds)
-
-    return filter_issues(all_issues, blocks_df, min_confidence, project_code, discipline_code, "single_document")
-
-
-def run_discipline_consistency_audit(
-    client: OpenAI,
-    model: str,
-    project_code: str,
-    discipline_code: str,
-    blocks_df: pd.DataFrame,
-    error_examples_text: str,
-    max_blocks_per_batch: int,
-    min_confidence: float,
-    delay_seconds: float,
-) -> pd.DataFrame:
-    docs_overview = make_docs_overview(blocks_df, max_blocks_per_doc=30)
-    batches = make_block_batches(blocks_df, max_blocks_per_batch)
-    all_issues: List[Dict[str, Any]] = []
-
-    progress = st.progress(0)
-    status = st.empty()
-
-    for idx, batch_df in enumerate(batches, start=1):
-        status.write(f"Disciplīnas savstarpējais audits: batch {idx}/{len(batches)}")
-        prompt = build_discipline_consistency_prompt(
-            project_code=project_code,
-            discipline_code=discipline_code,
-            docs_overview=docs_overview,
-            current_blocks_text=blocks_to_prompt_text(batch_df),
-            error_examples_text=error_examples_text,
-        )
-        try:
-            issues = call_ai_json_array(client, model, prompt)
-            all_issues.extend(issues)
-        except Exception as e:
-            st.warning(f"Disciplīnas savstarpējais audits batch {idx} kļūda: {e}")
-        progress.progress(idx / len(batches))
-        if delay_seconds > 0:
-            time.sleep(delay_seconds)
-
-    return filter_issues(all_issues, blocks_df, min_confidence, project_code, discipline_code, "discipline_consistency")
-
-
-def run_interdisciplinary_audit(
-    client: OpenAI,
-    model: str,
-    project_code: str,
-    discipline_code: str,
-    blocks_df: pd.DataFrame,
-    facts_df: pd.DataFrame,
-    error_examples_text: str,
-    max_facts: int,
-    max_blocks_per_batch: int,
-    min_confidence: float,
-    delay_seconds: float,
-) -> pd.DataFrame:
-    selected_facts = select_facts_for_interdisciplinary(facts_df, discipline_code, max_facts)
-    facts_text = facts_to_prompt_text(selected_facts)
-    if not facts_text:
-        return pd.DataFrame()
-
-    batches = make_block_batches(blocks_df, max_blocks_per_batch)
-    all_issues: List[Dict[str, Any]] = []
-
-    progress = st.progress(0)
-    status = st.empty()
-
-    for idx, batch_df in enumerate(batches, start=1):
-        status.write(f"Starpdisciplīnu audits: batch {idx}/{len(batches)}")
-        prompt = build_interdisciplinary_consistency_prompt(
-            project_code=project_code,
-            discipline_code=discipline_code,
-            other_facts_text=facts_text,
-            current_blocks_text=blocks_to_prompt_text(batch_df),
-            error_examples_text=error_examples_text,
-        )
-        try:
-            issues = call_ai_json_array(client, model, prompt)
-            all_issues.extend(issues)
-        except Exception as e:
-            st.warning(f"Starpdisciplīnu audits batch {idx} kļūda: {e}")
-        progress.progress(idx / len(batches))
-        if delay_seconds > 0:
-            time.sleep(delay_seconds)
-
-    return filter_issues(all_issues, blocks_df, min_confidence, project_code, discipline_code, "interdisciplinary")
+for key, default in {
+    "disciplines_df": pd.DataFrame(),
+    "memory_catalog_df": pd.DataFrame(),
+    "requirements_df": pd.DataFrame(),
+    "memory_facts_df": pd.DataFrame(),
+    "prompt_catalog_df": pd.DataFrame(),
+    "universal_prompt": "",
+    "error_examples_text": "",
+    "discipline_pdfs_df": pd.DataFrame(),
+    "selected_docs_df": pd.DataFrame(),
+    "blocks_df": pd.DataFrame(),
+    "file_summary_df": pd.DataFrame(),
+    "temp_facts_df": pd.DataFrame(),
+    "issues_raw_df": pd.DataFrame(),
+    "issues_filtered_df": pd.DataFrame(),
+    "issues_removed_df": pd.DataFrame(),
+    "raw_ai_log_df": pd.DataFrame(),
+}.items():
+    if key not in st.session_state:
+        st.session_state[key] = default
 
 
 # =========================================================
-# Streamlit UI
+# UI: konfigurācija
 # =========================================================
-
 
 input_folder_id = st.secrets.get("GOOGLE_DRIVE_INPUT_FOLDER_ID")
 memory_folder_id = st.secrets.get("GOOGLE_DRIVE_MEMORY_FOLDER_ID")
@@ -1313,107 +1087,132 @@ st.write("Prompt folder ID:", prompt_folder_id)
 project_code = st.text_input("Projekta kods", value="C2-3")
 model = st.selectbox("AI modelis", options=["gpt-4.1-mini", "gpt-4.1"], index=0)
 
-col_a, col_b = st.columns(2)
-with col_a:
-    max_pages_per_pdf = st.number_input("Maksimālais lapu skaits no viena PDF", min_value=1, max_value=300, value=100, step=5)
-    max_blocks_per_ai_request = st.number_input("Teksta bloku skaits vienā AI pieprasījumā", min_value=30, max_value=800, value=220, step=10)
-    max_design_brief_requirements = st.number_input("Maksimālais Design Brief prasību skaits promptā", min_value=20, max_value=500, value=160, step=20)
-with col_b:
-    max_interdisciplinary_facts = st.number_input("Maksimālais citu disciplīnu faktu skaits promptā", min_value=20, max_value=600, value=180, step=20)
-    min_confidence = st.slider("Minimālā pārliecība anotējamām piezīmēm", min_value=0.50, max_value=0.95, value=0.75, step=0.05)
-    delay_seconds = st.number_input("Pauze starp AI pieprasījumiem sekundēs", min_value=0.0, max_value=5.0, value=0.5, step=0.5)
+col_cfg1, col_cfg2 = st.columns(2)
+
+with col_cfg1:
+    max_pages_per_pdf = st.number_input(
+        "Maksimālais lapu skaits no viena PDF",
+        min_value=1,
+        max_value=300,
+        value=100,
+        step=5,
+    )
+
+    max_blocks_per_ai = st.number_input(
+        "Teksta bloku skaits vienā AI pieprasījumā",
+        min_value=50,
+        max_value=800,
+        value=220,
+        step=10,
+    )
+
+    max_design_requirements = st.number_input(
+        "Maksimālais Design Brief prasību skaits promptā",
+        min_value=20,
+        max_value=500,
+        value=180,
+        step=10,
+    )
+
+with col_cfg2:
+    max_memory_facts = st.number_input(
+        "Maksimālais citu disciplīnu faktu skaits promptā",
+        min_value=20,
+        max_value=500,
+        value=180,
+        step=10,
+    )
+
+    confidence_threshold = st.slider(
+        "Minimālā pārliecība anotējamām piezīmēm",
+        min_value=0.0,
+        max_value=1.0,
+        value=0.60,
+        step=0.05,
+    )
+
+    delay_between_ai_calls = st.number_input(
+        "Pauze starp AI pieprasījumiem sekundēs",
+        min_value=0.0,
+        max_value=5.0,
+        value=0.5,
+        step=0.5,
+    )
+
+audit_depth = st.radio(
+    "Audita dziļums",
+    options=["Conservative", "Balanced", "Diagnostic"],
+    index=2,
+    horizontal=True,
+)
 
 st.markdown("### Audita moduļi")
+
 run_module_a = st.checkbox("A. Pret Design Brief prasību atmiņu", value=True)
 run_module_b = st.checkbox("B. Katra dokumenta iekšējā konsekvence", value=True)
 run_module_c = st.checkbox("C. Disciplīnas savstarpējā konsekvence", value=True)
-run_module_d = st.checkbox("D. Starpdisciplīnu konsekvence pret līdzšinējo 03_Memory", value=True)
+run_module_d = st.checkbox("D. Starpdisciplīnu konsekvence pret līdzšinējo 03_Memory", value=False)
 
 st.info(
-    "Šis ir universālais tabulas tests. Tas vēl neģenerē anotētus PDF. "
-    "Rezultātā jāpaliek tikai tām piezīmēm, kurām ir konkrēts source_file + page + block_id."
+    "v3 režīmā C modulis salīdzina: apraksts ↔ rasējumi, apraksts ↔ specifikācija, "
+    "rasējumi ↔ specifikācija; rīks rāda arī raw AI kandidātus un izfiltrētās rindas. "
+    "PDF anotēšana vēl nav ieslēgta."
 )
-
-if "disciplines_df" not in st.session_state:
-    st.session_state.disciplines_df = pd.DataFrame()
-if "memory_catalog_df" not in st.session_state:
-    st.session_state.memory_catalog_df = pd.DataFrame()
-if "requirements_df" not in st.session_state:
-    st.session_state.requirements_df = pd.DataFrame()
-if "facts_df" not in st.session_state:
-    st.session_state.facts_df = pd.DataFrame()
-if "prompt_materials" not in st.session_state:
-    st.session_state.prompt_materials = {}
-if "discipline_pdf_df" not in st.session_state:
-    st.session_state.discipline_pdf_df = pd.DataFrame()
-if "blocks_df" not in st.session_state:
-    st.session_state.blocks_df = pd.DataFrame()
-if "file_summary_df" not in st.session_state:
-    st.session_state.file_summary_df = pd.DataFrame()
-if "issues_df" not in st.session_state:
-    st.session_state.issues_df = pd.DataFrame()
-
 
 if st.button("1) Nolasīt 01_Input, 03_Memory un 04_Prompt"):
     try:
-        if not input_folder_id:
-            st.error("Nav GOOGLE_DRIVE_INPUT_FOLDER_ID.")
-            st.stop()
-        if not memory_folder_id:
-            st.error("Nav GOOGLE_DRIVE_MEMORY_FOLDER_ID.")
-            st.stop()
+        drive_service = get_drive_service()
 
-        service = get_drive_service()
-        disciplines_df = get_discipline_folders(service, input_folder_id)
-        memory_catalog_df, requirements_df, facts_df = load_project_memory(service, memory_folder_id)
-        prompt_materials = read_prompt_materials(service, prompt_folder_id)
+        st.session_state.disciplines_df = get_discipline_folders(drive_service, input_folder_id)
 
-        st.session_state.disciplines_df = disciplines_df
-        st.session_state.memory_catalog_df = memory_catalog_df
-        st.session_state.requirements_df = requirements_df
-        st.session_state.facts_df = facts_df
-        st.session_state.prompt_materials = prompt_materials
+        mem_catalog, req_df, facts_df = load_memory_json_files(drive_service, memory_folder_id)
+        prompt_catalog, universal_prompt, error_examples_text = load_prompt_assets(drive_service, prompt_folder_id)
+
+        st.session_state.memory_catalog_df = mem_catalog
+        st.session_state.requirements_df = req_df
+        st.session_state.memory_facts_df = facts_df
+        st.session_state.prompt_catalog_df = prompt_catalog
+        st.session_state.universal_prompt = universal_prompt
+        st.session_state.error_examples_text = error_examples_text
 
         st.success(
-            f"Nolasīts: disciplīnas {len(disciplines_df)}, "
-            f"Design Brief prasības {len(requirements_df)}, "
-            f"disciplīnu fakti {len(facts_df)}, "
-            f"kļūdu piemēri {len(prompt_materials.get('error_examples_df', pd.DataFrame()))}."
+            f"Nolasīts: disciplīnas {len(st.session_state.disciplines_df)}, "
+            f"Design Brief prasības {len(req_df)}, disciplīnu fakti {len(facts_df)}, "
+            f"kļūdu piemēru teksta garums {len(error_examples_text)}."
         )
+
     except Exception as e:
-        st.error("Neizdevās nolasīt Drive / Memory / Prompt datus.")
+        st.error("Neizdevās nolasīt sākuma datus.")
         st.exception(e)
 
+if not st.session_state.memory_catalog_df.empty:
+    with st.expander("03_Memory katalogs"):
+        st.dataframe(st.session_state.memory_catalog_df, use_container_width=True)
+
+if not st.session_state.prompt_catalog_df.empty:
+    with st.expander("04_Prompt katalogs"):
+        st.dataframe(st.session_state.prompt_catalog_df, use_container_width=True)
+
+
+# =========================================================
+# UI: disciplīnas izvēle
+# =========================================================
 
 disciplines_df = st.session_state.disciplines_df
-memory_catalog_df = st.session_state.memory_catalog_df
-requirements_df = st.session_state.requirements_df
-facts_df = st.session_state.facts_df
-prompt_materials = st.session_state.prompt_materials
-
-if not memory_catalog_df.empty:
-    with st.expander("03_Memory katalogs"):
-        st.dataframe(memory_catalog_df, use_container_width=True)
-
-if not prompt_materials:
-    prompt_materials = {}
-
-if not prompt_materials.get("prompt_catalog", pd.DataFrame()).empty:
-    with st.expander("04_Prompt katalogs"):
-        st.dataframe(prompt_materials.get("prompt_catalog"), use_container_width=True)
 
 if not disciplines_df.empty:
     st.markdown("## 2. Izvēlies auditējamo disciplīnu")
     st.dataframe(disciplines_df, use_container_width=True)
 
     folder_options = disciplines_df["folder_name"].tolist()
-    default_idx = 0
-    for i, name in enumerate(folder_options):
-        if str(name).startswith("09_UKT"):
-            default_idx = i
-            break
+    default_index = folder_options.index("09_UKT") if "09_UKT" in folder_options else 0
 
-    selected_folder_name = st.selectbox("Disciplīnas mape", options=folder_options, index=default_idx)
+    selected_folder_name = st.selectbox(
+        "Disciplīnas mape",
+        options=folder_options,
+        index=default_index,
+    )
+
     selected_row = disciplines_df[disciplines_df["folder_name"] == selected_folder_name].iloc[0]
     selected_discipline_code = selected_row["discipline_code"]
     selected_folder_id = selected_row["folder_id"]
@@ -1422,76 +1221,115 @@ if not disciplines_df.empty:
 
     if st.button("2) Atrast disciplīnas PDF failus"):
         try:
-            service = get_drive_service()
-            pdf_df = get_pdf_documents_in_discipline(service, selected_folder_id, selected_folder_name)
-            st.session_state.discipline_pdf_df = pdf_df
-            if pdf_df.empty:
-                st.warning("Izvēlētajā disciplīnā nav atrasti PDF faili.")
+            drive_service = get_drive_service()
+            pdfs_df = get_pdf_documents_in_discipline(
+                drive_service,
+                selected_folder_id,
+                selected_folder_name,
+            )
+
+            st.session_state.discipline_pdfs_df = pdfs_df
+
+            if pdfs_df.empty:
+                st.warning("Disciplīnā nav atrasti PDF faili.")
             else:
-                st.success(f"Atrasti {len(pdf_df)} PDF faili.")
+                st.success(f"Atrasti {len(pdfs_df)} PDF faili.")
+
         except Exception as e:
-            st.error("Neizdevās atrast disciplīnas PDF failus.")
+            st.error("Neizdevās atrast PDF failus.")
             st.exception(e)
 
 
-discipline_pdf_df = st.session_state.discipline_pdf_df
+# =========================================================
+# UI: PDF izvēle un teksta bloki
+# =========================================================
 
-if not discipline_pdf_df.empty:
+pdfs_df = st.session_state.discipline_pdfs_df
+
+if not pdfs_df.empty:
     st.markdown("## 3. Disciplīnas PDF faili")
     st.dataframe(
-        discipline_pdf_df[["name", "path", "document_type", "size", "modifiedTime"]],
+        pdfs_df[["name", "path", "document_type", "size", "modifiedTime"]],
         use_container_width=True,
     )
 
-    pdf_options = discipline_pdf_df["path"].tolist()
+    file_options = pdfs_df["path"].tolist()
 
-    # Noklusējumā izvēlamies skaidrojošo aprakstu, specifikāciju, general_data un līdz 2 rasējumiem.
+    preferred_types = ["explanatory_note", "specification", "general_data", "drawing"]
     default_paths = []
-    for doc_type in ["explanatory_note", "specification", "general_data"]:
-        matches = discipline_pdf_df[discipline_pdf_df["document_type"] == doc_type]["path"].tolist()
-        default_paths.extend(matches[:1])
-    drawing_matches = discipline_pdf_df[discipline_pdf_df["document_type"] == "drawing"]["path"].tolist()
-    default_paths.extend(drawing_matches[:2])
-    default_paths = [path for path in default_paths if path in pdf_options]
 
-    selected_pdf_paths = st.multiselect(
+    for dtype in preferred_types:
+        matches = pdfs_df[pdfs_df["document_type"] == dtype]["path"].tolist()
+        default_paths.extend(matches[:2 if dtype == "drawing" else 1])
+
+    default_paths = list(dict.fromkeys(default_paths))[:6]
+
+    selected_paths = st.multiselect(
         "Izvēlies PDF failus auditam",
-        options=pdf_options,
+        options=file_options,
         default=default_paths,
     )
 
-    selected_docs_df = discipline_pdf_df[discipline_pdf_df["path"].isin(selected_pdf_paths)].copy()
+    selected_docs_df = pdfs_df[pdfs_df["path"].isin(selected_paths)].copy()
+    st.session_state.selected_docs_df = selected_docs_df
 
     st.markdown("### Auditam izvēlētie faili")
-    st.dataframe(selected_docs_df[["name", "path", "document_type", "size"]], use_container_width=True)
+    st.dataframe(
+        selected_docs_df[["name", "path", "document_type", "size"]],
+        use_container_width=True,
+    )
 
     if st.button("3) Izvilkt PDF teksta blokus"):
         try:
-            if selected_docs_df.empty:
-                st.warning("Nav izvēlēts neviens PDF fails.")
-                st.stop()
-            service = get_drive_service()
-            with st.spinner("Izvelku PDF teksta blokus..."):
-                blocks_df, file_summary_df = extract_selected_pdf_blocks(
-                    service=service,
-                    selected_docs_df=selected_docs_df,
-                    max_pages=int(max_pages_per_pdf),
-                )
-            st.session_state.blocks_df = blocks_df
-            st.session_state.file_summary_df = file_summary_df
-            st.success(f"Izvilkti {len(blocks_df)} teksta bloki no {len(file_summary_df)} failiem.")
+            drive_service = get_drive_service()
+
+            all_blocks = []
+            file_summaries = []
+
+            for _, doc_row in selected_docs_df.iterrows():
+                file_name = doc_row["name"]
+                file_id = doc_row["id"]
+
+                pdf_bytes = download_drive_file_bytes(drive_service, file_id)
+                blocks_df, total_pages = extract_pdf_page_blocks(pdf_bytes, int(max_pages_per_pdf))
+
+                if not blocks_df.empty:
+                    blocks_df["source_file"] = file_name
+                    blocks_df["drive_file_id"] = file_id
+                    blocks_df["drive_path"] = doc_row["path"]
+                    blocks_df["document_type"] = doc_row["document_type"]
+                    blocks_df["discipline"] = get_discipline_code_from_folder_name(selected_folder_name)
+                    all_blocks.append(blocks_df)
+
+                file_summaries.append({
+                    "source_file": file_name,
+                    "drive_file_id": file_id,
+                    "drive_path": doc_row["path"],
+                    "document_type": doc_row["document_type"],
+                    "total_pages": total_pages,
+                    "processed_pages": min(total_pages, int(max_pages_per_pdf)),
+                    "text_blocks": len(blocks_df),
+                })
+
+            combined_blocks = pd.concat(all_blocks, ignore_index=True) if all_blocks else pd.DataFrame()
+
+            st.session_state.blocks_df = combined_blocks
+            st.session_state.file_summary_df = pd.DataFrame(file_summaries)
+
+            st.success(f"Izvilkti {len(combined_blocks)} teksta bloki no {len(file_summaries)} PDF failiem.")
+
         except Exception as e:
             st.error("Neizdevās izvilkt PDF teksta blokus.")
             st.exception(e)
 
 
 blocks_df = st.session_state.blocks_df
-file_summary_df = st.session_state.file_summary_df
 
 if not blocks_df.empty:
     st.markdown("## 4. PDF teksta bloku indekss")
+
     st.markdown("### Failu kopsavilkums")
-    st.dataframe(file_summary_df, use_container_width=True)
+    st.dataframe(st.session_state.file_summary_df, use_container_width=True)
 
     st.markdown("### Teksta bloku priekšskatījums")
     st.dataframe(
@@ -1499,179 +1337,590 @@ if not blocks_df.empty:
         use_container_width=True,
     )
 
-    if st.button("4) Palaist universālo auditu"):
+    if st.button("4) Palaist universālo auditu v3"):
         try:
-            if disciplines_df.empty:
-                st.error("Vispirms nolasiet disciplīnas.")
-                st.stop()
-
-            selected_folder_name = st.session_state.get("_selected_folder_name_for_audit", None)
-            # Streamlit widgets netiek tieši saglabāti ar šo nosaukumu, tāpēc paņemam no pēdējā redzamā selectbox vērtības, ja pieejams caur locals.
-            # Praktiski izmantojam selected_discipline_code, ja tas eksistē šī rerun scope.
-            try:
-                discipline_code_for_audit = selected_discipline_code
-            except Exception:
-                discipline_code_for_audit = normalize_text(blocks_df.get("discipline", "")) or "UNKNOWN"
-
             client = get_openai_client()
+            discipline_code = blocks_df["discipline"].iloc[0]
+            error_examples_text = st.session_state.error_examples_text or st.session_state.universal_prompt or ""
+            source_lookup = blocks_df[["source_file", "page", "block_id", "text", "x0", "y0", "x1", "y1"]].copy()
 
-            all_issue_dfs = []
-            error_examples_text = prompt_materials.get("error_examples_text", "") if isinstance(prompt_materials, dict) else ""
-            universal_prompt = prompt_materials.get("universal_prompt", "") if isinstance(prompt_materials, dict) else ""
+            all_raw_issues: List[Dict[str, Any]] = []
+            all_temp_facts: List[Dict[str, Any]] = []
+            raw_ai_log: List[Dict[str, Any]] = []
 
             st.markdown("## 5. Audita izpilde")
 
+            # -------------------------------------------------
+            # 0. Pagaidu faktu indekss
+            # -------------------------------------------------
+
+            st.markdown("### 0. Pagaidu faktu indekss")
+
+            fact_batches = make_block_batches(blocks_df, int(max_blocks_per_ai))
+            fact_progress = st.progress(0)
+
+            for i, batch_df in enumerate(fact_batches, start=1):
+                st.write(f"Faktu indekss: batch {i}/{len(fact_batches)}")
+
+                text_blocks = build_text_from_blocks(batch_df, int(max_blocks_per_ai))
+                prompt = build_fact_prompt(
+                    project_code,
+                    discipline_code,
+                    text_blocks,
+                    f"batch {i}",
+                    error_examples_text,
+                )
+
+                facts, raw = call_ai_json_array(
+                    client,
+                    model,
+                    "Tu atbildi tikai derīgā JSON masīvā. Bez paskaidrojumiem.",
+                    prompt,
+                    temperature=0.0,
+                )
+
+                for j, fact in enumerate(facts, start=1):
+                    fact = dict(fact)
+                    fact["temp_fact_id"] = fact.get("fact_id") or f"TEMP-{i:03d}-{j:03d}"
+                    fact["project_code"] = project_code
+                    fact["discipline"] = discipline_code
+                    fact["batch_index"] = i
+                    all_temp_facts.append(fact)
+
+                raw_ai_log.append({
+                    "module": "facts",
+                    "batch": i,
+                    "raw_length": len(raw),
+                    "parsed_count": len(facts),
+                })
+
+                fact_progress.progress(i / len(fact_batches))
+
+                if delay_between_ai_calls:
+                    time.sleep(float(delay_between_ai_calls))
+
+            temp_facts_df = pd.DataFrame(all_temp_facts)
+            st.session_state.temp_facts_df = temp_facts_df
+
+            st.success(f"Pagaidu faktu indeksā iegūti {len(temp_facts_df)} fakti.")
+
+            temp_facts_text = df_to_compact_text(
+                temp_facts_df,
+                max_rows=350,
+                cols=[
+                    "temp_fact_id",
+                    "fact_type",
+                    "element",
+                    "parameter_name",
+                    "parameter_value",
+                    "unit",
+                    "source_file",
+                    "page",
+                    "block_id",
+                    "source_text",
+                    "confidence",
+                ],
+            )
+
+            # -------------------------------------------------
+            # A. Design Brief conflict
+            # -------------------------------------------------
+
             if run_module_a:
                 st.markdown("### A. Design Brief conflict")
-                df_a = run_design_brief_audit(
-                    client=client,
-                    model=model,
-                    project_code=project_code,
-                    discipline_code=discipline_code_for_audit,
-                    blocks_df=blocks_df,
-                    requirements_df=requirements_df,
-                    error_examples_text=error_examples_text,
-                    max_requirements=int(max_design_brief_requirements),
-                    max_blocks_per_batch=int(max_blocks_per_ai_request),
-                    min_confidence=float(min_confidence),
-                    delay_seconds=float(delay_seconds),
+
+                relevant_req = select_relevant_requirements(
+                    st.session_state.requirements_df,
+                    discipline_code,
+                    int(max_design_requirements),
                 )
-                st.write(f"A modulis: {len(df_a)} piezīmes.")
-                if not df_a.empty:
-                    all_issue_dfs.append(df_a)
+
+                req_text = df_to_compact_text(
+                    relevant_req,
+                    max_rows=int(max_design_requirements),
+                    cols=[
+                        "memory_id",
+                        "engineering_system",
+                        "discipline",
+                        "applies_to_sections",
+                        "requirement",
+                        "condition",
+                        "source_file",
+                        "page",
+                        "priority",
+                    ],
+                )
+
+                batches = make_block_batches(blocks_df, int(max_blocks_per_ai))
+                progress = st.progress(0)
+
+                for i, batch_df in enumerate(batches, start=1):
+                    st.write(f"Design Brief audits: batch {i}/{len(batches)}")
+
+                    text_blocks = build_text_from_blocks(batch_df, int(max_blocks_per_ai))
+                    prompt = build_design_brief_prompt(
+                        req_text,
+                        text_blocks,
+                        audit_depth,
+                        confidence_threshold,
+                    )
+
+                    issues, raw = call_ai_json_array(
+                        client,
+                        model,
+                        "Tu atbildi tikai JSON masīvā.",
+                        prompt,
+                        0.0,
+                    )
+
+                    for issue in issues:
+                        all_raw_issues.append(
+                            normalize_issue(issue, "design_brief_conflict", source_lookup)
+                        )
+
+                    raw_ai_log.append({
+                        "module": "A",
+                        "batch": i,
+                        "raw_length": len(raw),
+                        "parsed_count": len(issues),
+                    })
+
+                    progress.progress(i / len(batches))
+
+                    if delay_between_ai_calls:
+                        time.sleep(float(delay_between_ai_calls))
+
+            # -------------------------------------------------
+            # B. Single document consistency
+            # -------------------------------------------------
 
             if run_module_b:
                 st.markdown("### B. Single document consistency")
-                df_b = run_single_document_audit(
-                    client=client,
-                    model=model,
-                    project_code=project_code,
-                    discipline_code=discipline_code_for_audit,
-                    blocks_df=blocks_df,
-                    error_examples_text=error_examples_text,
-                    universal_prompt=universal_prompt,
-                    max_blocks_per_request=int(max_blocks_per_ai_request),
-                    min_confidence=float(min_confidence),
-                    delay_seconds=float(delay_seconds),
-                )
-                st.write(f"B modulis: {len(df_b)} piezīmes.")
-                if not df_b.empty:
-                    all_issue_dfs.append(df_b)
+
+                for doc_index, (source_file, doc_blocks) in enumerate(blocks_df.groupby("source_file"), start=1):
+                    document_type = str(doc_blocks["document_type"].iloc[0])
+
+                    st.write(
+                        f"Viena dokumenta audits: {source_file} "
+                        f"({doc_index}/{blocks_df['source_file'].nunique()})"
+                    )
+
+                    if not temp_facts_df.empty and "source_file" in temp_facts_df.columns:
+                        doc_facts = temp_facts_df[
+                            temp_facts_df["source_file"].astype(str) == str(source_file)
+                        ].copy()
+                    else:
+                        doc_facts = pd.DataFrame()
+
+                    facts_text = df_to_compact_text(
+                        doc_facts,
+                        220,
+                        [
+                            "temp_fact_id",
+                            "fact_type",
+                            "element",
+                            "parameter_name",
+                            "parameter_value",
+                            "unit",
+                            "page",
+                            "block_id",
+                            "source_text",
+                            "confidence",
+                        ],
+                    )
+
+                    batches = make_block_batches(doc_blocks, int(max_blocks_per_ai))
+
+                    for i, batch_df in enumerate(batches, start=1):
+                        text_blocks = build_text_from_blocks(batch_df, int(max_blocks_per_ai))
+
+                        prompt = build_single_doc_prompt(
+                            source_file,
+                            document_type,
+                            text_blocks,
+                            facts_text,
+                            error_examples_text,
+                            audit_depth,
+                            confidence_threshold,
+                        )
+
+                        issues, raw = call_ai_json_array(
+                            client,
+                            model,
+                            "Tu atbildi tikai JSON masīvā.",
+                            prompt,
+                            0.0,
+                        )
+
+                        for issue in issues:
+                            all_raw_issues.append(
+                                normalize_issue(issue, "single_document_consistency", source_lookup)
+                            )
+
+                        raw_ai_log.append({
+                            "module": "B",
+                            "source_file": source_file,
+                            "batch": i,
+                            "raw_length": len(raw),
+                            "parsed_count": len(issues),
+                        })
+
+                        if delay_between_ai_calls:
+                            time.sleep(float(delay_between_ai_calls))
+
+            # -------------------------------------------------
+            # C. Discipline consistency — strukturēta salīdzināšana
+            # -------------------------------------------------
 
             if run_module_c:
-                st.markdown("### C. Discipline consistency")
-                df_c = run_discipline_consistency_audit(
-                    client=client,
-                    model=model,
-                    project_code=project_code,
-                    discipline_code=discipline_code_for_audit,
-                    blocks_df=blocks_df,
-                    error_examples_text=error_examples_text,
-                    max_blocks_per_batch=int(max_blocks_per_ai_request),
-                    min_confidence=float(min_confidence),
-                    delay_seconds=float(delay_seconds),
-                )
-                st.write(f"C modulis: {len(df_c)} piezīmes.")
-                if not df_c.empty:
-                    all_issue_dfs.append(df_c)
+                st.markdown("### C. Discipline consistency — strukturēti soļi")
+
+                orientation_blocks = get_orientation_blocks(blocks_df)
+                drawing_blocks = get_blocks_by_type(blocks_df, ["drawing"])
+                specification_blocks = get_blocks_by_type(blocks_df, ["specification"])
+                general_blocks = get_blocks_by_type(blocks_df, ["general_data"])
+
+                c_steps = []
+
+                if not orientation_blocks.empty and not drawing_blocks.empty:
+                    c_steps.append({
+                        "step_id": "C1",
+                        "label": "explanatory_or_general_vs_drawings",
+                        "reference_label": "skaidrojošais apraksts / vispārīgie dati",
+                        "reference_blocks": orientation_blocks,
+                        "target_label": "rasējumi",
+                        "target_blocks": drawing_blocks,
+                    })
+
+                if not orientation_blocks.empty and not specification_blocks.empty:
+                    c_steps.append({
+                        "step_id": "C2",
+                        "label": "explanatory_or_general_vs_specification",
+                        "reference_label": "skaidrojošais apraksts / vispārīgie dati",
+                        "reference_blocks": orientation_blocks,
+                        "target_label": "specifikācija",
+                        "target_blocks": specification_blocks,
+                    })
+
+                if not drawing_blocks.empty and not specification_blocks.empty:
+                    c_steps.append({
+                        "step_id": "C3a",
+                        "label": "drawings_vs_specification",
+                        "reference_label": "rasējumi",
+                        "reference_blocks": drawing_blocks,
+                        "target_label": "specifikācija",
+                        "target_blocks": specification_blocks,
+                    })
+
+                    c_steps.append({
+                        "step_id": "C3b",
+                        "label": "specification_vs_drawings",
+                        "reference_label": "specifikācija",
+                        "reference_blocks": specification_blocks,
+                        "target_label": "rasējumi",
+                        "target_blocks": drawing_blocks,
+                    })
+
+                if not general_blocks.empty and not general_blocks.equals(orientation_blocks):
+                    other_blocks = blocks_df[blocks_df["document_type"] != "general_data"].copy()
+
+                    if not other_blocks.empty:
+                        c_steps.append({
+                            "step_id": "C4",
+                            "label": "general_data_vs_other_documents",
+                            "reference_label": "vispārīgie dati",
+                            "reference_blocks": general_blocks,
+                            "target_label": "pārējie disciplīnas dokumenti",
+                            "target_blocks": other_blocks,
+                        })
+
+                if not c_steps:
+                    st.info("C modulim nav pietiekamu dokumentu tipu strukturētai salīdzināšanai.")
+
+                else:
+                    total_c_batches = sum(
+                        len(make_block_batches(step["target_blocks"], int(max_blocks_per_ai)))
+                        for step in c_steps
+                    )
+
+                    done_c_batches = 0
+                    progress = st.progress(0)
+
+                    for step in c_steps:
+                        step_id = step["step_id"]
+                        label = step["label"]
+
+                        st.write(f"{step_id}: {label}")
+
+                        reference_text = build_context_text(
+                            blocks_df,
+                            step["reference_blocks"].head(int(max_blocks_per_ai)),
+                            max_blocks=int(max_blocks_per_ai),
+                            context_window=2,
+                        )
+
+                        target_batches = make_block_batches(
+                            step["target_blocks"],
+                            int(max_blocks_per_ai),
+                        )
+
+                        for i, target_batch_df in enumerate(target_batches, start=1):
+                            target_text = build_context_text(
+                                blocks_df,
+                                target_batch_df,
+                                max_blocks=int(max_blocks_per_ai),
+                                context_window=2,
+                            )
+
+                            prompt = build_structured_discipline_pair_prompt(
+                                discipline_code=discipline_code,
+                                comparison_step=f"{step_id} {label} batch {i}/{len(target_batches)}",
+                                reference_label=step["reference_label"],
+                                reference_text=reference_text,
+                                target_label=step["target_label"],
+                                target_text=target_text,
+                                facts_text=temp_facts_text,
+                                error_examples_text=error_examples_text,
+                                audit_depth=audit_depth,
+                                confidence_threshold=confidence_threshold,
+                            )
+
+                            issues, raw = call_ai_json_array(
+                                client,
+                                model,
+                                "Tu atbildi tikai JSON masīvā.",
+                                prompt,
+                                0.0,
+                            )
+
+                            for issue in issues:
+                                normalized = normalize_issue(
+                                    issue,
+                                    "discipline_consistency",
+                                    source_lookup,
+                                )
+                                normalized["comparison_step"] = step_id
+                                normalized["comparison_label"] = label
+                                all_raw_issues.append(normalized)
+
+                            raw_ai_log.append({
+                                "module": "C",
+                                "step": step_id,
+                                "label": label,
+                                "batch": i,
+                                "raw_length": len(raw),
+                                "parsed_count": len(issues),
+                            })
+
+                            done_c_batches += 1
+                            progress.progress(done_c_batches / max(total_c_batches, 1))
+
+                            if delay_between_ai_calls:
+                                time.sleep(float(delay_between_ai_calls))
+
+            # -------------------------------------------------
+            # D. Interdisciplinary consistency
+            # -------------------------------------------------
 
             if run_module_d:
-                st.markdown("### D. Interdisciplinary consistency")
-                df_d = run_interdisciplinary_audit(
-                    client=client,
-                    model=model,
-                    project_code=project_code,
-                    discipline_code=discipline_code_for_audit,
-                    blocks_df=blocks_df,
-                    facts_df=facts_df,
-                    error_examples_text=error_examples_text,
-                    max_facts=int(max_interdisciplinary_facts),
-                    max_blocks_per_batch=int(max_blocks_per_ai_request),
-                    min_confidence=float(min_confidence),
-                    delay_seconds=float(delay_seconds),
-                )
-                st.write(f"D modulis: {len(df_d)} piezīmes.")
-                if not df_d.empty:
-                    all_issue_dfs.append(df_d)
+                st.markdown("### D. Starpdisciplīnu konsekvence")
 
-            if all_issue_dfs:
-                issues_df = pd.concat(all_issue_dfs, ignore_index=True)
-                issues_df = issues_df.drop_duplicates(subset=["audit_mode", "issue_type", "source_file", "page", "block_id", "comment"])
-                issues_df = issues_df.reset_index(drop=True)
-                issues_df["issue_id"] = [f"{project_code}-{discipline_code_for_audit}-ISSUE-{i+1:04d}" for i in range(len(issues_df))]
-                st.session_state.issues_df = issues_df
-                st.success(f"Kopā atlasītas {len(issues_df)} anotējamas kandidātpiezīmes.")
-            else:
-                st.session_state.issues_df = pd.DataFrame()
-                st.info("Netika atrastas anotējamas kandidātpiezīmes pēc izvēlētajiem filtriem.")
+                prior_facts = select_prior_facts(
+                    st.session_state.memory_facts_df,
+                    discipline_code,
+                    int(max_memory_facts),
+                )
+
+                if prior_facts.empty:
+                    st.info("03_Memory nav citu disciplīnu faktu, pret ko salīdzināt.")
+
+                else:
+                    prior_text = df_to_compact_text(
+                        prior_facts,
+                        int(max_memory_facts),
+                        [
+                            "memory_id",
+                            "fact_id",
+                            "discipline",
+                            "fact_type",
+                            "element",
+                            "parameter_name",
+                            "parameter_value",
+                            "unit",
+                            "source_file",
+                            "page",
+                            "block_id",
+                            "source_text",
+                        ],
+                    )
+
+                    batches = make_block_batches(blocks_df, int(max_blocks_per_ai))
+                    progress = st.progress(0)
+
+                    for i, batch_df in enumerate(batches, start=1):
+                        st.write(f"Starpdisciplīnu audits: batch {i}/{len(batches)}")
+
+                        text_blocks = build_text_from_blocks(batch_df, int(max_blocks_per_ai))
+
+                        prompt = build_interdisciplinary_prompt(
+                            discipline_code,
+                            prior_text,
+                            temp_facts_text,
+                            text_blocks,
+                            audit_depth,
+                            confidence_threshold,
+                        )
+
+                        issues, raw = call_ai_json_array(
+                            client,
+                            model,
+                            "Tu atbildi tikai JSON masīvā.",
+                            prompt,
+                            0.0,
+                        )
+
+                        for issue in issues:
+                            all_raw_issues.append(
+                                normalize_issue(issue, "interdisciplinary_consistency", source_lookup)
+                            )
+
+                        raw_ai_log.append({
+                            "module": "D",
+                            "batch": i,
+                            "raw_length": len(raw),
+                            "parsed_count": len(issues),
+                        })
+
+                        progress.progress(i / len(batches))
+
+                        if delay_between_ai_calls:
+                            time.sleep(float(delay_between_ai_calls))
+
+            raw_df = pd.DataFrame(all_raw_issues)
+
+            if not raw_df.empty:
+                if "issue_id" not in raw_df.columns:
+                    raw_df["issue_id"] = ""
+
+                raw_df["issue_id"] = [
+                    v if str(v).strip() else f"{project_code}-{discipline_code}-ISSUE-{i + 1:04d}"
+                    for i, v in enumerate(raw_df["issue_id"].tolist())
+                ]
+
+            filtered_df, removed_df = filter_issues(
+                raw_df,
+                float(confidence_threshold),
+                audit_depth,
+            )
+
+            st.session_state.issues_raw_df = raw_df
+            st.session_state.issues_filtered_df = filtered_df
+            st.session_state.issues_removed_df = removed_df
+            st.session_state.raw_ai_log_df = pd.DataFrame(raw_ai_log)
+
+            st.success(
+                f"AI raw kandidāti: {len(raw_df)}; "
+                f"pēc filtra redzamie: {len(filtered_df)}; "
+                f"izfiltrēti: {len(removed_df)}."
+            )
 
         except Exception as e:
             st.error("Kļūda universālā audita izpildē.")
             st.exception(e)
 
 
-issues_df = st.session_state.issues_df
+# =========================================================
+# Rezultāti
+# =========================================================
 
-if not issues_df.empty:
-    st.markdown("## 6. Issues tabula")
+raw_df = st.session_state.issues_raw_df
+filtered_df = st.session_state.issues_filtered_df
+removed_df = st.session_state.issues_removed_df
+temp_facts_df = st.session_state.temp_facts_df
 
-    st.markdown("### Kopsavilkums pēc audita moduļa")
-    st.dataframe(
-        issues_df.groupby("audit_mode").size().reset_index(name="count").sort_values("count", ascending=False),
-        use_container_width=True,
+if not temp_facts_df.empty or not raw_df.empty:
+    st.markdown("## 6. Diagnostika un rezultāti")
+
+    if "raw_ai_log_df" in st.session_state and not st.session_state.raw_ai_log_df.empty:
+        st.markdown("### AI pieprasījumu diagnostika")
+        st.dataframe(st.session_state.raw_ai_log_df, use_container_width=True)
+
+    if not temp_facts_df.empty:
+        st.markdown("### Pagaidu faktu indekss")
+
+        if "fact_type" in temp_facts_df.columns:
+            fact_summary = (
+                temp_facts_df
+                .groupby("fact_type")
+                .size()
+                .reset_index(name="count")
+                .sort_values("count", ascending=False)
+            )
+            st.dataframe(fact_summary, use_container_width=True)
+
+        st.dataframe(temp_facts_df.head(300), use_container_width=True)
+
+    st.markdown("### Issues kopsavilkums")
+
+    col1, col2, col3 = st.columns(3)
+
+    col1.metric("Raw kandidāti", len(raw_df))
+    col2.metric("Redzamie pēc filtra", len(filtered_df))
+    col3.metric("Izfiltrēti", len(removed_df))
+
+    if not filtered_df.empty:
+        st.markdown("### Redzamās kandidātpiezīmes")
+
+        if "audit_mode" in filtered_df.columns:
+            st.dataframe(
+                filtered_df.groupby("audit_mode").size().reset_index(name="count"),
+                use_container_width=True,
+            )
+
+        if "issue_type" in filtered_df.columns:
+            st.dataframe(
+                filtered_df.groupby("issue_type").size().reset_index(name="count"),
+                use_container_width=True,
+            )
+
+        st.dataframe(filtered_df, use_container_width=True)
+
+    else:
+        st.info("Pēc izvēlētā filtra nav redzamu kandidātpiezīmju.")
+
+    if not raw_df.empty:
+        with st.expander("Raw AI kandidāti pirms gala filtra"):
+            st.dataframe(raw_df, use_container_width=True)
+
+    if not removed_df.empty:
+        with st.expander("Izfiltrētie kandidāti un iemeslu pārbaude"):
+            st.dataframe(removed_df, use_container_width=True)
+
+    excel_bytes = make_excel_bytes(filtered_df, raw_df, removed_df, temp_facts_df)
+
+    json_bytes = make_json_bytes(
+        filtered_df,
+        raw_df,
+        removed_df,
+        temp_facts_df,
+        project_code,
+        blocks_df["discipline"].iloc[0] if not blocks_df.empty else "",
     )
 
-    st.markdown("### Kopsavilkums pēc issue_type")
-    st.dataframe(
-        issues_df.groupby("issue_type").size().reset_index(name="count").sort_values("count", ascending=False),
-        use_container_width=True,
-    )
+    c1, c2 = st.columns(2)
 
-    st.markdown("### Piezīmju tabula")
-    preferred_cols = [
-        "issue_id",
-        "audit_mode",
-        "issue_type",
-        "priority",
-        "confidence",
-        "source_file",
-        "page",
-        "block_id",
-        "source_text",
-        "comment",
-        "suggestion",
-        "related_memory_id",
-        "related_requirement",
-        "related_fact_id",
-        "related_fact",
-        "related_files",
-        "include_in_pdf",
-    ]
-    existing = [col for col in preferred_cols if col in issues_df.columns]
-    other = [col for col in issues_df.columns if col not in existing]
-    st.dataframe(issues_df[existing + other], use_container_width=True)
-
-    excel_bytes = make_excel_bytes(issues_df, blocks_df, file_summary_df)
-    json_bytes = make_json_bytes(issues_df)
-
-    col1, col2 = st.columns(2)
-    with col1:
+    with c1:
         st.download_button(
-            "Lejupielādēt issues Excel",
+            "Lejupielādēt universal audit Excel",
             data=excel_bytes,
-            file_name=f"{project_code.lower().replace('-', '_')}_universal_audit_issues.xlsx",
+            file_name=f"{project_code.lower().replace('-', '_')}_universal_audit_v3.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
-    with col2:
+
+    with c2:
         st.download_button(
-            "Lejupielādēt issues JSON",
+            "Lejupielādēt universal audit JSON",
             data=json_bytes,
-            file_name=f"{project_code.lower().replace('-', '_')}_universal_audit_issues.json",
+            file_name=f"{project_code.lower().replace('-', '_')}_universal_audit_v3.json",
             mime="application/json",
         )
-
-    st.markdown("## 7. Nākamais solis")
-    st.info(
-        "Ja šī issues tabula ir kvalitatīva, nākamajā versijā pievienosim anotēto PDF ģenerēšanu: "
-        "rīks izmantos source_file + page + block_id + koordinātas no teksta bloku indeksa un apvilks attiecīgo tekstu ar sarkanu rāmi."
-    )
