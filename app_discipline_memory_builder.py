@@ -117,13 +117,6 @@ def download_drive_file_bytes(service, file_id: str) -> bytes:
 # =========================================================
 
 def get_discipline_code_from_folder_name(folder_name: str) -> str:
-    """
-    Piemēri:
-    09_UKT -> UKT
-    18_UK -> UK
-    21_EL -> EL
-    23_ESS-VAS -> ESS-VAS
-    """
     name = str(folder_name).strip()
 
     if "_" in name:
@@ -136,12 +129,12 @@ def classify_document_type(file_name: str, path: str = "") -> str:
     text = f"{file_name} {path}".lower()
 
     if any(keyword in text for keyword in [
-        "explanatory", "description", "skaidrojo", "apraksts", "sa_", "_sa", "td_"
+        "explanatory", "description", "skaidrojo", "apraksts", " sa", "_sa", "td_"
     ]):
         return "explanatory_note"
 
     if any(keyword in text for keyword in [
-        "specification", "specifik", "apjomi", "boq", "bill of quantities", "ms_", "_ms"
+        "specification", "specifik", "apjomi", "boq", "bill of quantities", " ms", "_ms"
     ]):
         return "specification"
 
@@ -157,7 +150,7 @@ def classify_document_type(file_name: str, path: str = "") -> str:
 
     if any(keyword in text for keyword in [
         "scheme", "layout", "section", "plan", "floor", "site plan", "drawing",
-        "rasēj", "rasej", "plāns", "plans", "griezums", "shēma", "shema", "ra_", "_ra"
+        "rasēj", "rasej", "plāns", "plans", "griezums", "shēma", "shema", " ra", "_ra"
     ]):
         return "drawing"
 
@@ -186,6 +179,9 @@ def get_discipline_folders(service, input_folder_id: str) -> pd.DataFrame:
                 "modifiedTime": item.get("modifiedTime", ""),
             }
         )
+
+    if not rows:
+        return pd.DataFrame()
 
     return pd.DataFrame(rows).sort_values("folder_name")
 
@@ -354,7 +350,7 @@ Interpretācija:
 8 = tikai būtiski galvenie fakti;
 10 = tikai kritiski galvenie fakti.
 
-Tavā gadījumā prioritāte ir vēlākai salīdzināšanai starp BP sadaļām.
+Prioritāte ir vēlākai salīdzināšanai starp BP sadaļām.
 Labāk iekļaut vairāk strukturētu faktu nekā palaist garām būtisku parametru.
 
 IZVELC ŠĀDU TIPU FAKTUS, JA TIE REDZAMI TEKSTĀ:
@@ -476,4 +472,705 @@ Katram objektam jābūt šādiem laukiem:
   "equipment",
   "connection",
   "interface",
-  "room_or
+  "room_or_access",
+  "fire_safety",
+  "power_or_flow",
+  "calculation_value",
+  "document_identity",
+  "specification_item",
+  "other_fact"
+]
+- system_code: piemēram "U1", "K1", "K2", "K3", "EL", "AVK"; ja nav, tukša virkne
+- element: īss elementa nosaukums, piemēram "ūdensvada pievads", "pretvārsts", "aka", "siltummezgls"
+- parameter_name: piemēram "diameter", "material", "quantity", "power", "pressure_class"; ja nav, tukša virkne
+- parameter_value: konkrētā vērtība, piemēram "OD110", "3", "PN10", "90"; ja nav, tukša virkne
+- unit: piemēram "gab.", "m", "kW", "l/s"; ja nav, tukša virkne
+- applies_to: īss skaidrojums, uz ko fakts attiecas
+- source_file
+- page
+- block_id
+- source_text: īss avota teksta fragments
+- confidence: skaitlis no 0 līdz 1
+
+DOKUMENTA FRAGMENTS:
+{source_text}
+"""
+
+
+def parse_json_array(raw_text: str) -> List[Dict[str, Any]]:
+    text = raw_text.strip()
+
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?", "", text, flags=re.IGNORECASE).strip()
+        text = re.sub(r"```$", "", text).strip()
+
+    start = text.find("[")
+    end = text.rfind("]")
+
+    if start == -1 or end == -1 or end <= start:
+        raise ValueError("AI neatgrieza JSON masīvu.")
+
+    json_text = text[start:end + 1]
+    data = json.loads(json_text)
+
+    if not isinstance(data, list):
+        raise ValueError("AI atbilde nav JSON masīvs.")
+
+    return data
+
+
+def extract_facts_with_ai(
+    client: OpenAI,
+    project_code: str,
+    discipline_code: str,
+    document_type: str,
+    source_file: str,
+    batch_start_page: int,
+    batch_end_page: int,
+    source_text: str,
+    model: str,
+    extraction_breadth: int,
+) -> List[Dict[str, Any]]:
+    prompt = build_fact_extraction_prompt(
+        project_code=project_code,
+        discipline_code=discipline_code,
+        document_type=document_type,
+        source_file=source_file,
+        batch_start_page=batch_start_page,
+        batch_end_page=batch_end_page,
+        source_text=source_text,
+        extraction_breadth=extraction_breadth,
+    )
+
+    response = client.chat.completions.create(
+        model=model,
+        temperature=0.0,
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "Tu atbildi tikai derīgā JSON masīvā. "
+                    "Nekādu paskaidrojumu ārpus JSON. "
+                    "Tu neveido kļūdu sarakstu, tikai strukturētus faktus."
+                ),
+            },
+            {
+                "role": "user",
+                "content": prompt,
+            },
+        ],
+    )
+
+    raw = response.choices[0].message.content or ""
+    return parse_json_array(raw)
+
+
+# =========================================================
+# Excel / JSON sagatavošana
+# =========================================================
+
+def clean_excel_illegal_chars(value):
+    if isinstance(value, str):
+        return re.sub(r"[\x00-\x08\x0B\x0C\x0E-\x1F]", "", value)
+    return value
+
+
+def clean_dataframe_for_excel(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return df
+
+    cleaned = df.copy()
+
+    for col in cleaned.columns:
+        cleaned[col] = cleaned[col].map(clean_excel_illegal_chars)
+
+    return cleaned
+
+
+def postprocess_facts_df(df: pd.DataFrame, project_code: str, discipline_code: str) -> pd.DataFrame:
+    if df.empty:
+        return df
+
+    result = df.copy()
+
+    required_cols = [
+        "fact_id",
+        "project_code",
+        "discipline",
+        "document_type",
+        "fact_type",
+        "system_code",
+        "element",
+        "parameter_name",
+        "parameter_value",
+        "unit",
+        "applies_to",
+        "source_file",
+        "page",
+        "block_id",
+        "source_text",
+        "confidence",
+        "drive_path",
+        "drive_file_id",
+        "batch_index",
+        "batch_start_page",
+        "batch_end_page",
+    ]
+
+    for col in required_cols:
+        if col not in result.columns:
+            result[col] = ""
+
+    result["project_code"] = result["project_code"].fillna(project_code).replace("", project_code)
+    result["discipline"] = result["discipline"].fillna(discipline_code).replace("", discipline_code)
+
+    if "page" in result.columns:
+        result["page"] = pd.to_numeric(result["page"], errors="coerce").fillna(0).astype(int)
+
+    if "block_id" in result.columns:
+        result["block_id"] = pd.to_numeric(result["block_id"], errors="coerce").fillna(-1).astype(int)
+
+    if "confidence" in result.columns:
+        result["confidence"] = pd.to_numeric(result["confidence"], errors="coerce").fillna(0.0)
+
+    text_cols = [
+        "fact_id", "project_code", "discipline", "document_type", "fact_type",
+        "system_code", "element", "parameter_name", "parameter_value", "unit",
+        "applies_to", "source_file", "source_text", "drive_path"
+    ]
+
+    for col in text_cols:
+        if col in result.columns:
+            result[col] = result[col].astype(str).str.strip()
+
+    result = result[result["source_text"].astype(str).str.strip() != ""].copy()
+
+    result = result.reset_index(drop=True)
+    result["memory_id"] = [
+        f"{project_code}-{discipline_code}-FACT-{i + 1:04d}"
+        for i in range(len(result))
+    ]
+    result["memory_type"] = "discipline_fact"
+    result["created_at_utc"] = datetime.now(timezone.utc).isoformat()
+
+    preferred_cols = [
+        "memory_id",
+        "memory_type",
+        "project_code",
+        "discipline",
+        "fact_id",
+        "document_type",
+        "fact_type",
+        "system_code",
+        "element",
+        "parameter_name",
+        "parameter_value",
+        "unit",
+        "applies_to",
+        "source_file",
+        "page",
+        "block_id",
+        "source_text",
+        "confidence",
+        "drive_path",
+        "drive_file_id",
+        "batch_index",
+        "batch_start_page",
+        "batch_end_page",
+        "created_at_utc",
+    ]
+
+    existing_cols = [col for col in preferred_cols if col in result.columns]
+    other_cols = [col for col in result.columns if col not in existing_cols]
+
+    return result[existing_cols + other_cols]
+
+
+def make_excel_bytes(df: pd.DataFrame, discipline_code: str) -> bytes:
+    output = io.BytesIO()
+    safe_df = clean_dataframe_for_excel(df)
+
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        safe_df.to_excel(writer, sheet_name="discipline_facts", index=False)
+
+        if "fact_type" in safe_df.columns:
+            summary_type = (
+                safe_df.groupby("fact_type")
+                .size()
+                .reset_index(name="count")
+                .sort_values("count", ascending=False)
+            )
+            summary_type.to_excel(writer, sheet_name="summary_by_fact_type", index=False)
+
+        if "source_file" in safe_df.columns:
+            summary_file = (
+                safe_df.groupby("source_file")
+                .size()
+                .reset_index(name="count")
+                .sort_values("count", ascending=False)
+            )
+            summary_file.to_excel(writer, sheet_name="summary_by_file", index=False)
+
+        if "system_code" in safe_df.columns:
+            summary_system = (
+                safe_df.groupby("system_code")
+                .size()
+                .reset_index(name="count")
+                .sort_values("count", ascending=False)
+            )
+            summary_system.to_excel(writer, sheet_name="summary_by_system", index=False)
+
+    output.seek(0)
+    return output.getvalue()
+
+
+def make_json_bytes(df: pd.DataFrame, project_code: str, discipline_code: str) -> bytes:
+    records = df.where(pd.notna(df), None).to_dict(orient="records")
+
+    payload = {
+        "memory_schema": "bp_audit_discipline_facts_v1",
+        "project_code": project_code,
+        "discipline": discipline_code,
+        "memory_type": "discipline_fact",
+        "created_at_utc": datetime.now(timezone.utc).isoformat(),
+        "count": len(records),
+        "facts": records,
+    }
+
+    return json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
+
+
+# =========================================================
+# Streamlit UI
+# =========================================================
+
+input_folder_id = st.secrets.get("GOOGLE_DRIVE_INPUT_FOLDER_ID")
+
+st.markdown("## 1. Konfigurācija")
+st.write("Input folder ID:", input_folder_id)
+
+project_code = st.text_input("Projekta kods", value="C2-3")
+
+model = st.selectbox(
+    "AI modelis",
+    options=["gpt-4.1-mini", "gpt-4.1"],
+    index=0,
+)
+
+max_pages_per_pdf = st.number_input(
+    "Maksimālais lapu skaits no viena PDF",
+    min_value=1,
+    max_value=300,
+    value=80,
+    step=5,
+)
+
+pages_per_batch = st.number_input(
+    "Lapas vienā AI pieprasījumā",
+    min_value=1,
+    max_value=10,
+    value=2,
+    step=1,
+)
+
+max_blocks_per_batch = st.number_input(
+    "Maksimālais teksta bloku skaits vienā AI pieprasījumā",
+    min_value=20,
+    max_value=1500,
+    value=350,
+    step=25,
+)
+
+extraction_breadth = st.slider(
+    "Faktu izvilkšanas plašums",
+    min_value=1,
+    max_value=10,
+    value=3,
+    step=1,
+    help="1 = ļoti plaši; 3 = plaši; 6 = tikai skaidri fakti; 10 = tikai kritiski galvenie fakti.",
+)
+
+delay_between_ai_calls = st.number_input(
+    "Pauze starp AI pieprasījumiem sekundēs",
+    min_value=0.0,
+    max_value=5.0,
+    value=0.5,
+    step=0.5,
+)
+
+st.info(
+    "Pirmajam testam izvēlies vienu disciplīnu, piemēram `09_UKT`, un sākumā tikai dažus galvenos PDF. "
+    "Kad redzēsim, ka faktu kvalitāte ir laba, varēs analizēt visu disciplīnu."
+)
+
+if "discipline_folders_df" not in st.session_state:
+    st.session_state.discipline_folders_df = pd.DataFrame()
+
+if "discipline_docs_df" not in st.session_state:
+    st.session_state.discipline_docs_df = pd.DataFrame()
+
+if "discipline_facts_df" not in st.session_state:
+    st.session_state.discipline_facts_df = pd.DataFrame()
+
+if st.button("1) Atrast disciplīnu mapes"):
+    try:
+        if not input_folder_id:
+            st.error("Secrets nav atrasts GOOGLE_DRIVE_INPUT_FOLDER_ID.")
+            st.stop()
+
+        drive_service = get_drive_service()
+        folders_df = get_discipline_folders(drive_service, input_folder_id)
+
+        if folders_df.empty:
+            st.warning("C2-3_TD mapē nav atrastas disciplīnu mapes.")
+        else:
+            st.session_state.discipline_folders_df = folders_df
+            st.success(f"Atrastas {len(folders_df)} disciplīnu mapes.")
+
+    except Exception as e:
+        st.error("Neizdevās atrast disciplīnu mapes.")
+        st.exception(e)
+
+folders_df = st.session_state.discipline_folders_df
+
+if not folders_df.empty:
+    st.markdown("## 2. Disciplīnu mapes")
+    st.dataframe(folders_df, use_container_width=True)
+
+    folder_options = folders_df["folder_name"].tolist()
+
+    default_index = 0
+    for idx, name in enumerate(folder_options):
+        if name.startswith("09_UKT"):
+            default_index = idx
+            break
+
+    selected_folder_name = st.selectbox(
+        "Izvēlies disciplīnu",
+        options=folder_options,
+        index=default_index,
+    )
+
+    selected_folder_row = folders_df[folders_df["folder_name"] == selected_folder_name].iloc[0]
+    selected_discipline_code = selected_folder_row["discipline_code"]
+    selected_folder_id = selected_folder_row["folder_id"]
+
+    st.write("Izvēlētā disciplīna:", selected_discipline_code)
+
+    if st.button("2) Atrast PDF failus izvēlētajā disciplīnā"):
+        try:
+            drive_service = get_drive_service()
+            docs_df = get_pdf_documents_in_discipline(
+                service=drive_service,
+                discipline_folder_id=selected_folder_id,
+                discipline_folder_name=selected_folder_name,
+            )
+
+            if docs_df.empty:
+                st.warning("Izvēlētajā disciplīnā nav atrasti PDF faili.")
+            else:
+                docs_df["discipline"] = selected_discipline_code
+                docs_df["discipline_folder"] = selected_folder_name
+                st.session_state.discipline_docs_df = docs_df
+                st.success(f"Atrasti {len(docs_df)} PDF faili.")
+
+        except Exception as e:
+            st.error("Neizdevās atrast PDF failus disciplīnā.")
+            st.exception(e)
+
+docs_df = st.session_state.discipline_docs_df
+
+if not docs_df.empty:
+    st.markdown("## 3. Atrastie PDF faili")
+
+    st.dataframe(
+        docs_df[["name", "path", "document_type", "size", "modifiedTime"]],
+        use_container_width=True,
+    )
+
+    file_options = docs_df["path"].tolist()
+
+    suggested_defaults = []
+    for path in file_options:
+        lower = path.lower()
+        if any(key in lower for key in ["spec", "apjomi", "description", "explanatory", "skaidrojo", "general"]):
+            suggested_defaults.append(path)
+
+    if not suggested_defaults:
+        suggested_defaults = file_options[: min(3, len(file_options))]
+
+    selected_paths = st.multiselect(
+        "Izvēlies PDF failus faktu izvilkšanai",
+        options=file_options,
+        default=suggested_defaults[: min(5, len(suggested_defaults))],
+    )
+
+    selected_docs_df = docs_df[docs_df["path"].isin(selected_paths)].copy()
+
+    st.markdown("### Analīzei izvēlētie faili")
+    st.dataframe(
+        selected_docs_df[["name", "path", "document_type", "size"]],
+        use_container_width=True,
+    )
+
+    st.warning(
+        "Šis solis var palaist vairākus AI pieprasījumus. Pirmajā testā neizvēlies pārāk daudz lielu rasējumu."
+    )
+
+    if st.button("3) Izvilkt disciplīnas faktus ar AI"):
+        try:
+            if selected_docs_df.empty:
+                st.warning("Nav izvēlēts neviens PDF fails.")
+                st.stop()
+
+            drive_service = get_drive_service()
+            client = get_openai_client()
+
+            all_facts: List[Dict[str, Any]] = []
+            planned_batches_by_doc = []
+            total_steps = 0
+
+            status = st.empty()
+            progress = st.progress(0)
+
+            st.markdown("## 4. PDF teksta sagatavošana")
+
+            for _, doc_row in selected_docs_df.iterrows():
+                file_name = doc_row["name"]
+                file_id = doc_row["id"]
+                document_type = doc_row["document_type"]
+
+                status.write(f"Lejupielādēju un sadalu lapās: {file_name}")
+
+                pdf_bytes = download_drive_file_bytes(drive_service, file_id)
+                blocks_df, total_pages = extract_pdf_page_blocks(
+                    pdf_bytes=pdf_bytes,
+                    max_pages=int(max_pages_per_pdf),
+                )
+
+                batches = make_page_batches(
+                    blocks_df=blocks_df,
+                    pages_per_batch=int(pages_per_batch),
+                    max_blocks_per_batch=int(max_blocks_per_batch),
+                )
+
+                planned_batches_by_doc.append(
+                    {
+                        "doc_row": doc_row,
+                        "total_pages": total_pages,
+                        "processed_pages": min(total_pages, int(max_pages_per_pdf)),
+                        "blocks_df": blocks_df,
+                        "batches": batches,
+                        "document_type": document_type,
+                    }
+                )
+
+                total_steps += len(batches)
+
+                st.write(
+                    f"{file_name}: PDF lapas kopā {total_pages}, analizējamās lapas "
+                    f"{min(total_pages, int(max_pages_per_pdf))}, teksta bloki {len(blocks_df)}, "
+                    f"AI pieprasījumi {len(batches)}."
+                )
+
+            if total_steps == 0:
+                st.warning("Nav sagatavots neviens AI analīzes fragments.")
+                st.stop()
+
+            st.markdown("## 5. AI faktu izvilkšana pa lapu grupām")
+
+            completed_steps = 0
+            batch_global_index = 0
+
+            discipline_code = str(selected_docs_df["discipline"].iloc[0])
+
+            for plan in planned_batches_by_doc:
+                doc_row = plan["doc_row"]
+                batches = plan["batches"]
+                document_type = plan["document_type"]
+
+                file_name = doc_row["name"]
+                file_id = doc_row["id"]
+                drive_path = doc_row["path"]
+
+                for _, batch in enumerate(batches, start=1):
+                    batch_global_index += 1
+
+                    status.write(
+                        f"AI analizē: {file_name}, lapas "
+                        f"{batch['start_page']}–{batch['end_page']} "
+                        f"({completed_steps + 1}/{total_steps})"
+                    )
+
+                    try:
+                        facts = extract_facts_with_ai(
+                            client=client,
+                            project_code=project_code,
+                            discipline_code=discipline_code,
+                            document_type=document_type,
+                            source_file=file_name,
+                            batch_start_page=batch["start_page"],
+                            batch_end_page=batch["end_page"],
+                            source_text=batch["text"],
+                            model=model,
+                            extraction_breadth=int(extraction_breadth),
+                        )
+
+                        enriched = []
+                        for item_index, fact in enumerate(facts, start=1):
+                            fact = dict(fact)
+                            fact["project_code"] = fact.get("project_code") or project_code
+                            fact["discipline"] = fact.get("discipline") or discipline_code
+                            fact["document_type"] = fact.get("document_type") or document_type
+                            fact["source_file"] = fact.get("source_file") or file_name
+                            fact["drive_file_id"] = file_id
+                            fact["drive_path"] = drive_path
+                            fact["batch_index"] = batch_global_index
+                            fact["batch_start_page"] = batch["start_page"]
+                            fact["batch_end_page"] = batch["end_page"]
+
+                            if not fact.get("fact_id"):
+                                fact["fact_id"] = f"FACT-B{batch_global_index:03d}-{item_index:03d}"
+
+                            enriched.append(fact)
+
+                        all_facts.extend(enriched)
+
+                        st.write(
+                            f"✅ {file_name}, lapas {batch['start_page']}–{batch['end_page']}: "
+                            f"{len(enriched)} fakti."
+                        )
+
+                    except Exception as batch_error:
+                        st.error(
+                            f"Kļūda AI analīzē: {file_name}, lapas "
+                            f"{batch['start_page']}–{batch['end_page']}"
+                        )
+                        st.exception(batch_error)
+
+                    completed_steps += 1
+                    progress.progress(completed_steps / total_steps)
+
+                    if float(delay_between_ai_calls) > 0:
+                        time.sleep(float(delay_between_ai_calls))
+
+            if not all_facts:
+                st.info("AI neatrada strukturētus faktus izvēlētajos failos.")
+                st.session_state.discipline_facts_df = pd.DataFrame()
+            else:
+                facts_df = pd.DataFrame(all_facts)
+                facts_df = postprocess_facts_df(
+                    facts_df,
+                    project_code=project_code,
+                    discipline_code=discipline_code,
+                )
+
+                st.session_state.discipline_facts_df = facts_df
+
+                st.success(
+                    f"Pabeigts. Izvilkti {len(facts_df)} strukturēti fakti."
+                )
+
+        except Exception as e:
+            st.error("Kļūda disciplīnas faktu izvilkšanā.")
+            st.exception(e)
+
+facts_df = st.session_state.discipline_facts_df
+
+if not facts_df.empty:
+    st.markdown("## 6. Izvilktie disciplīnas fakti")
+
+    st.markdown("### Kopsavilkums pēc fact_type")
+    if "fact_type" in facts_df.columns:
+        summary_type = (
+            facts_df.groupby("fact_type")
+            .size()
+            .reset_index(name="count")
+            .sort_values("count", ascending=False)
+        )
+        st.dataframe(summary_type, use_container_width=True)
+
+    st.markdown("### Kopsavilkums pēc source_file")
+    if "source_file" in facts_df.columns:
+        summary_file = (
+            facts_df.groupby("source_file")
+            .size()
+            .reset_index(name="count")
+            .sort_values("count", ascending=False)
+        )
+        st.dataframe(summary_file, use_container_width=True)
+
+    st.markdown("### Kopsavilkums pēc system_code")
+    if "system_code" in facts_df.columns:
+        summary_system = (
+            facts_df.groupby("system_code")
+            .size()
+            .reset_index(name="count")
+            .sort_values("count", ascending=False)
+        )
+        st.dataframe(summary_system, use_container_width=True)
+
+    st.markdown("### Rediģējama faktu tabula")
+
+    preferred_cols = [
+        "memory_id",
+        "fact_type",
+        "system_code",
+        "element",
+        "parameter_name",
+        "parameter_value",
+        "unit",
+        "applies_to",
+        "source_file",
+        "page",
+        "block_id",
+        "source_text",
+        "confidence",
+        "document_type",
+        "discipline",
+        "drive_path",
+    ]
+
+    existing_cols = [col for col in preferred_cols if col in facts_df.columns]
+    other_cols = [col for col in facts_df.columns if col not in existing_cols]
+
+    edited_df = st.data_editor(
+        facts_df[existing_cols + other_cols],
+        use_container_width=True,
+        num_rows="dynamic",
+        key="discipline_facts_editor",
+    )
+
+    st.session_state.discipline_facts_df = edited_df
+
+    discipline_code_for_file = str(edited_df["discipline"].iloc[0]) if "discipline" in edited_df.columns else "DISC"
+    safe_project = project_code.lower().replace("-", "_").replace(" ", "_")
+    safe_discipline = discipline_code_for_file.lower().replace("-", "_").replace(" ", "_")
+
+    excel_name = f"{safe_project}_{safe_discipline}_facts.xlsx"
+    json_name = f"{safe_project}_{safe_discipline}_facts.json"
+
+    excel_bytes = make_excel_bytes(edited_df, discipline_code_for_file)
+    json_bytes = make_json_bytes(edited_df, project_code, discipline_code_for_file)
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+        st.download_button(
+            label="Lejupielādēt disciplīnas faktu Excel",
+            data=excel_bytes,
+            file_name=excel_name,
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+
+    with col2:
+        st.download_button(
+            label="Lejupielādēt disciplīnas faktu JSON",
+            data=json_bytes,
+            file_name=json_name,
+            mime="application/json",
+        )
+
+    st.info(
+        f"Lejupielādē `{excel_name}` un `{json_name}`, pēc tam manuāli ievieto tos Google Drive `03_Memory` mapē."
+    )
