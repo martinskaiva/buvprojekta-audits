@@ -14,13 +14,13 @@ from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
 from openai import OpenAI
 
-st.set_page_config(page_title="BP universālais audita rīks v3.1", layout="wide")
+st.set_page_config(page_title="BP universālais audita rīks v3.2", layout="wide")
 
-st.title("BP universālais audita rīks v3.1")
+st.title("BP universālais audita rīks v3.2")
 st.write(
     "Universāls būvprojekta audita tests: Design Brief, viena dokumenta konsekvence, "
     "disciplīnas iekšējā konsekvence un starpdisciplīnu konsekvence. "
-    "v3.1: audit_mode tiek noteikts pēc moduļa, Balanced/Conservative filtrē tehniski vērtīgākas piezīmes. "
+    "v3.2: audit_mode tiek noteikts pēc moduļa; Balanced filtrs atpazīst arī tehniski līdzīgus issue_type un neprasa include_in_pdf=true. "
     "PDF anotēšana vēl nav ieslēgta."
 )
 
@@ -716,27 +716,114 @@ def normalize_issue(issue: Dict[str, Any], default_mode: str, source_lookup: pd.
 def filter_issues(raw_df: pd.DataFrame, confidence_threshold: float, audit_depth: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
     if raw_df.empty:
         return raw_df, raw_df
+
     work = raw_df.copy()
+    work["issue_type_norm"] = work["issue_type"].fillna("").astype(str).str.lower().str.strip()
+
     disallowed = [
-        "not_found", "general_uncertainty", "please_check", "missing_without_anchor", "unanchored_possible_omission",
+        "not_found",
+        "general_uncertainty",
+        "please_check",
+        "missing_without_anchor",
+        "unanchored_possible_omission",
     ]
+
+    low_value_for_pdf = [
+        "project_code_inconsistency",
+        "document_identity_conflict",
+        "document_identity_mismatch",
+        "document_identity_inconsistency",
+        "date_conflict",
+        "date_inconsistency",
+        "parallel_text_inconsistency",
+    ]
+
     technical_issue_types = [
-        "diameter_conflict", "diameter_inconsistency", "pipe_diameter_inconsistency", "pipe_diameter_conflict",
-        "material_conflict", "material_inconsistency", "pipe_material_inconsistency", "pipe_material_conflict",
-        "quantity_conflict", "quantity_inconsistency", "quantity_mismatch", "specification_position_conflict",
-        "system_code_conflict", "drawing_reference_conflict", "design_brief_direct_conflict", "design_brief_wrong_parameter",
-        "design_brief_partial_solution_visible", "design_brief_scope_gap_with_anchor", "equipment_conflict",
-        "equipment_parameter_conflict", "connection_conflict", "interface_conflict", "power_or_flow_conflict",
+        "diameter_conflict",
+        "diameter_inconsistency",
+        "pipe_diameter_inconsistency",
+        "pipe_diameter_conflict",
+        "pipe_material_inconsistency",
+        "pipe_material_conflict",
+        "material_conflict",
+        "material_inconsistency",
+        "quantity_conflict",
+        "quantity_inconsistency",
+        "quantity_mismatch",
+        "specification_position_conflict",
+        "system_code_conflict",
+        "drawing_reference_conflict",
+        "design_brief_direct_conflict",
+        "design_brief_wrong_parameter",
+        "design_brief_partial_solution_visible",
+        "design_brief_scope_gap_with_anchor",
+        "equipment_conflict",
+        "equipment_parameter_conflict",
+        "connection_conflict",
+        "interface_conflict",
+        "power_or_flow_conflict",
     ]
-    base_mask = (work["has_anchor"] == True) & (~work["issue_type"].isin(disallowed))
+
+    technical_keywords = [
+        "diameter",
+        "material",
+        "quantity",
+        "specification",
+        "system_code",
+        "drawing_reference",
+        "design_brief",
+        "equipment",
+        "connection",
+        "interface",
+        "power",
+        "flow",
+        "pipe",
+        "mark",
+        "type",
+        "class",
+        "parameter",
+    ]
+
+    conflict_words = ["conflict", "mismatch", "inconsistency", "discrepancy", "contradiction"]
+
+    base_mask = (
+        (work["has_anchor"] == True)
+        & (~work["issue_type_norm"].isin(disallowed))
+    )
+
+    explicit_technical = work["issue_type_norm"].isin(technical_issue_types)
+    keyword_technical = work["issue_type_norm"].apply(
+        lambda value: any(keyword in value for keyword in technical_keywords)
+        and any(word in value for word in conflict_words)
+    )
+    technical_like = explicit_technical | keyword_technical
+
     if audit_depth == "Diagnostic":
         kept = work[base_mask].copy()
         removed = work[~base_mask].copy()
         return kept, removed
+
     if audit_depth == "Balanced":
-        mask = base_mask & (work["confidence"] >= confidence_threshold) & (work["include_in_pdf"] == True) & (work["issue_type"].isin(technical_issue_types))
+        # v3.2: Balanced is meant for human review, not final PDF.
+        # It requires anchor + confidence + technical-like issue type,
+        # but it does not require include_in_pdf=True because AI often sets it inconsistently.
+        mask = (
+            base_mask
+            & (work["confidence"] >= confidence_threshold)
+            & technical_like
+            & (~work["issue_type_norm"].isin(low_value_for_pdf))
+        )
         return work[mask].copy(), work[~mask].copy()
-    mask = base_mask & (work["confidence"] >= max(confidence_threshold, 0.75)) & (work["include_in_pdf"] == True) & (work["issue_type"].isin(technical_issue_types)) & (work["priority"] >= 7)
+
+    # Conservative is closer to PDF annotation quality.
+    # It is stricter and still avoids low-value identity/date comments.
+    mask = (
+        base_mask
+        & (work["confidence"] >= max(confidence_threshold, 0.75))
+        & technical_like
+        & (~work["issue_type_norm"].isin(low_value_for_pdf))
+        & (work["priority"] >= 7)
+    )
     return work[mask].copy(), work[~mask].copy()
 
 
@@ -753,7 +840,7 @@ def make_excel_bytes(df: pd.DataFrame, raw_df: pd.DataFrame, removed_df: pd.Data
 
 def make_json_bytes(df: pd.DataFrame, raw_df: pd.DataFrame, removed_df: pd.DataFrame, facts_df: pd.DataFrame, project_code: str, discipline_code: str) -> bytes:
     payload = {
-        "schema": "bp_audit_universal_v3_1",
+        "schema": "bp_audit_universal_v3_2",
         "project_code": project_code,
         "discipline_code": discipline_code,
         "created_at_utc": datetime.now(timezone.utc).isoformat(),
@@ -816,7 +903,7 @@ run_module_b = st.checkbox("B. Katra dokumenta iekšējā konsekvence", value=Tr
 run_module_c = st.checkbox("C. Disciplīnas savstarpējā konsekvence", value=True)
 run_module_d = st.checkbox("D. Starpdisciplīnu konsekvence pret līdzšinējo 03_Memory", value=False)
 
-st.info("v3.1: audit_mode tiek noteikts pēc moduļa, Balanced/Conservative filtrē tehniski vērtīgākas piezīmes. PDF anotēšana vēl nav ieslēgta.")
+st.info("v3.2: audit_mode tiek noteikts pēc moduļa; Balanced filtrs atpazīst arī tehniski līdzīgus issue_type un neprasa include_in_pdf=true. PDF anotēšana vēl nav ieslēgta.")
 
 if st.button("1) Nolasīt 01_Input, 03_Memory un 04_Prompt"):
     try:
@@ -924,7 +1011,7 @@ if not blocks_df.empty:
     st.markdown("### Teksta bloku priekšskatījums")
     st.dataframe(blocks_df[["source_file", "document_type", "page", "block_id", "text", "x0", "y0", "x1", "y1"]].head(100), use_container_width=True)
 
-    if st.button("4) Palaist universālo auditu v3.1"):
+    if st.button("4) Palaist universālo auditu v3.2"):
         try:
             client = get_openai_client()
             discipline_code = blocks_df["discipline"].iloc[0]
@@ -1104,6 +1191,6 @@ if not temp_facts_df.empty or not raw_df.empty:
     json_bytes = make_json_bytes(filtered_df, raw_df, removed_df, temp_facts_df, project_code, blocks_df["discipline"].iloc[0] if not blocks_df.empty else "")
     d1, d2 = st.columns(2)
     with d1:
-        st.download_button("Lejupielādēt universal audit Excel", data=excel_bytes, file_name=f"{project_code.lower().replace('-', '_')}_universal_audit_v3_1.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        st.download_button("Lejupielādēt universal audit Excel", data=excel_bytes, file_name=f"{project_code.lower().replace('-', '_')}_universal_audit_v3_2.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
     with d2:
-        st.download_button("Lejupielādēt universal audit JSON", data=json_bytes, file_name=f"{project_code.lower().replace('-', '_')}_universal_audit_v3_1.json", mime="application/json")
+        st.download_button("Lejupielādēt universal audit JSON", data=json_bytes, file_name=f"{project_code.lower().replace('-', '_')}_universal_audit_v3_2.json", mime="application/json")
