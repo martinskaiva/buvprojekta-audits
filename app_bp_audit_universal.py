@@ -14,13 +14,13 @@ from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
 from openai import OpenAI
 
-st.set_page_config(page_title="BP universālais audita rīks v3.3.1", layout="wide")
+st.set_page_config(page_title="BP universālais audita rīks v3.3.2", layout="wide")
 
-st.title("BP universālais audita rīks v3.3.1")
+st.title("BP universālais audita rīks v3.3.2")
 st.write(
     "Universāls būvprojekta audita tests: Design Brief, viena dokumenta konsekvence, "
     "disciplīnas iekšējā konsekvence un starpdisciplīnu konsekvence. "
-    "v3.3.1: audit_mode tiek noteikts pēc moduļa; Balanced filtrs atpazīst arī tehniski līdzīgus issue_type un neprasa include_in_pdf=true. "
+    "v3.3.2: audit_mode tiek noteikts pēc moduļa; Balanced filtrs atpazīst arī tehniski līdzīgus issue_type un neprasa include_in_pdf=true. "
     "PDF anotēšana vēl nav ieslēgta."
 )
 
@@ -938,7 +938,7 @@ def filter_issues(raw_df: pd.DataFrame, confidence_threshold: float, audit_depth
         return kept, removed
 
     if audit_depth == "Balanced":
-        # v3.3.1: Balanced is meant for human review, not final PDF.
+        # v3.3.2: Balanced is meant for human review, not final PDF.
         # It requires anchor + confidence + technical-like issue type,
         # but it does not require include_in_pdf=True because AI often sets it inconsistently.
         mask = (
@@ -1039,7 +1039,7 @@ run_module_b = st.checkbox("B. Katra dokumenta iekšējā konsekvence", value=Tr
 run_module_c = st.checkbox("C. Disciplīnas savstarpējā konsekvence", value=True)
 run_module_d = st.checkbox("D. Starpdisciplīnu konsekvence pret līdzšinējo 03_Memory", value=False)
 
-st.info("v3.3.1: audit_mode tiek noteikts pēc moduļa; Balanced filtrs atpazīst arī tehniski līdzīgus issue_type un neprasa include_in_pdf=true. v3.3 lasa audit_examples zelta paraugus no 03_Memory/audit_examples un izmanto tos kā audita scenāriju bibliotēku. PDF anotēšana vēl nav ieslēgta.")
+st.info("v3.3.2: audit_mode tiek noteikts pēc moduļa; Balanced filtrs atpazīst arī tehniski līdzīgus issue_type un neprasa include_in_pdf=true. v3.3 lasa audit_examples zelta paraugus no 03_Memory/audit_examples un izmanto tos kā audita scenāriju bibliotēku. PDF anotēšana vēl nav ieslēgta.")
 
 if st.button("1) Nolasīt 01_Input, 03_Memory un 04_Prompt"):
     try:
@@ -1094,7 +1094,10 @@ if not st.session_state.disciplines_df.empty:
             service = get_drive_service()
             pdfs_df = get_pdf_documents_in_discipline(service, selected_folder_id, selected_folder_name)
             st.session_state.discipline_pdfs_df = pdfs_df
-            st.success(f"Atrasti {len(pdfs_df)} PDF faili.") if not pdfs_df.empty else st.warning("Disciplīnā nav atrasti PDF faili.")
+            if pdfs_df.empty:
+                st.warning("Disciplīnā nav atrasti PDF faili.")
+            else:
+                st.success(f"Atrasti {len(pdfs_df)} PDF faili.")
         except Exception as e:
             st.error("Neizdevās atrast PDF failus.")
             st.exception(e)
@@ -1176,7 +1179,7 @@ if not blocks_df.empty:
 
             st.markdown("## 5. Audita izpilde")
             if not st.session_state.audit_examples_df.empty:
-                st.caption(f"v3.3.1: audita scenāriju bibliotēkā ielādēti {len(st.session_state.audit_examples_df)} accepted audit examples.")
+                st.caption(f"v3.3.2: audita scenāriju bibliotēkā ielādēti {len(st.session_state.audit_examples_df)} accepted audit examples.")
             st.markdown("### 0. Pagaidu faktu indekss")
             fact_batches = make_block_batches(blocks_df, int(max_blocks_per_ai))
             fact_progress = st.progress(0)
