@@ -14,13 +14,13 @@ from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
 from openai import OpenAI
 
-st.set_page_config(page_title="BP universālais audita rīks v3.2", layout="wide")
+st.set_page_config(page_title="BP universālais audita rīks v3.3", layout="wide")
 
-st.title("BP universālais audita rīks v3.2")
+st.title("BP universālais audita rīks v3.3")
 st.write(
     "Universāls būvprojekta audita tests: Design Brief, viena dokumenta konsekvence, "
     "disciplīnas iekšējā konsekvence un starpdisciplīnu konsekvence. "
-    "v3.2: audit_mode tiek noteikts pēc moduļa; Balanced filtrs atpazīst arī tehniski līdzīgus issue_type un neprasa include_in_pdf=true. "
+    "v3.3: audit_mode tiek noteikts pēc moduļa; Balanced filtrs atpazīst arī tehniski līdzīgus issue_type un neprasa include_in_pdf=true. "
     "PDF anotēšana vēl nav ieslēgta."
 )
 
@@ -347,6 +347,85 @@ def load_memory_json_files(service, memory_folder_id: str) -> Tuple[pd.DataFrame
     return pd.DataFrame(catalog), req_df, facts_df
 
 
+
+def load_audit_examples_json_files(service, memory_folder_id: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Load accepted audit example JSON files from 03_Memory and subfolders, especially audit_examples/."""
+    catalog: List[Dict[str, Any]] = []
+    examples: List[Dict[str, Any]] = []
+
+    for item in list_items_recursive(service, memory_folder_id, ""):
+        name = str(item.get("name", ""))
+        path = str(item.get("path", name))
+        mime = str(item.get("mimeType", ""))
+
+        if item.get("is_folder"):
+            continue
+        if not name.lower().endswith(".json"):
+            continue
+
+        lower_path = path.lower()
+        lower_name = name.lower()
+        looks_like_examples = (
+            "audit_examples" in lower_path
+            or "accepted_audit_examples" in lower_name
+            or "audit_example" in lower_name
+        )
+        if not looks_like_examples:
+            continue
+
+        try:
+            payload = json.loads(download_drive_file_bytes(service, item.get("id")).decode("utf-8", errors="replace"))
+            schema = ""
+            project_code_value = ""
+            source_discipline = ""
+            records: List[Dict[str, Any]] = []
+
+            if isinstance(payload, dict):
+                schema = str(payload.get("memory_schema", payload.get("schema", "")))
+                project_code_value = str(payload.get("project_code", ""))
+                source_discipline = str(payload.get("source_discipline", payload.get("discipline", "")))
+                for key in ["examples", "audit_examples", "records"]:
+                    if isinstance(payload.get(key), list):
+                        records = payload.get(key)
+                        break
+            elif isinstance(payload, list):
+                records = payload
+
+            for rec in records:
+                if not isinstance(rec, dict):
+                    continue
+                row = dict(rec)
+                row["audit_examples_source_file"] = name
+                row["audit_examples_source_path"] = path
+                if not row.get("project_code"):
+                    row["project_code"] = project_code_value
+                if not row.get("source_discipline"):
+                    row["source_discipline"] = source_discipline
+                examples.append(row)
+
+            catalog.append({
+                "name": name,
+                "path": path,
+                "kind": "accepted_audit_examples",
+                "memory_schema": schema,
+                "project_code": project_code_value,
+                "source_discipline": source_discipline,
+                "records_count": len(records),
+                "size": item.get("size", ""),
+                "modifiedTime": item.get("modifiedTime", ""),
+                "mimeType": mime,
+            })
+        except Exception as e:
+            catalog.append({"name": name, "path": path, "kind": "accepted_audit_examples_error", "error": str(e)})
+
+    examples_df = pd.DataFrame(examples)
+    if not examples_df.empty and "use_as_training_example" in examples_df.columns:
+        examples_df = examples_df[
+            examples_df["use_as_training_example"].astype(str).str.lower().isin(["true", "1", "yes", "jā", "ja"])
+        ].copy()
+
+    return pd.DataFrame(catalog), examples_df
+
 def load_prompt_assets(service, prompt_folder_id: str) -> Tuple[pd.DataFrame, str, str]:
     catalog = []
     universal_prompt = ""
@@ -471,6 +550,10 @@ Atbildi tikai JSON masīvā. Katram objektam jābūt laukiem:
 - related_fact_id
 - related_fact
 - related_files
+- audit_scenario: scenārijs no zelta parauga loģikas, ja piemērojams
+- comparison_basis: pret ko tieši salīdzināts
+- conflicting_evidence: konkrētā pretējā puse / trūkstošā izsekojamība
+- why_it_matters: kāpēc tas ir būtiski
 
 Svarīgi:
 - audit_mode vari aizpildīt, bet sistēma to pārrakstīs pēc moduļa.
@@ -576,6 +659,12 @@ Universāls princips:
 Meklē tehniskus konfliktus: diametrs, materiāls, skaits, sistēmas kods, specifikācijas pozīcija pret rasējumu/aprakstu, iekārtas tips/marka/parametrs, pieslēguma robeža.
 Nedod zemas vērtības piezīmes par datumu, projekta kodu vai dokumenta identitāti, ja tās nav tieši būtiskas tehniskai neatbilstībai.
 
+Zelta parauga piemēru princips:
+- Ja zelta piemēros redzi scenāriju “risinājums ir aprakstā/rasējumā, bet nav specifikācijā”, meklē šādu izsekojamības trūkumu arī jaunajos dokumentos.
+- Ja redzi scenāriju “rasējuma nosaukums/saraksts min sistēmas, kas pašā rasējumā nav izsekojamas”, meklē līdzīgu problēmu.
+- Ja nav konkrētas comparison_basis vai conflicting_evidence, piezīmi neatgriez Balanced/Conservative režīmā.
+- Laba piezīme nav “pārbaudīt”; laba piezīme pasaka, kas konkrēti nav izsekojams vai kas ar ko nesakrīt.
+
 {mode_rules(audit_depth, confidence_threshold)}
 {issue_schema_instruction()}
 
@@ -631,6 +720,51 @@ def df_to_compact_text(df: pd.DataFrame, max_rows: int, cols: Optional[List[str]
             use_df = use_df[use_cols]
     return use_df.head(max_rows).fillna("").astype(str).to_csv(index=False)
 
+
+
+
+def build_audit_examples_library_text(audit_examples_df: pd.DataFrame, current_discipline: str, max_rows: int = 80) -> str:
+    """Create compact text for accepted audit examples. Prefer examples from other disciplines first."""
+    if audit_examples_df is None or audit_examples_df.empty:
+        return ""
+
+    df = audit_examples_df.copy()
+    current = str(current_discipline).upper().strip()
+
+    if "use_as_training_example" in df.columns:
+        df = df[df["use_as_training_example"].astype(str).str.lower().isin(["true", "1", "yes", "jā", "ja"])].copy()
+    if df.empty:
+        return ""
+
+    if "source_discipline" in df.columns:
+        df["_is_current_discipline"] = df["source_discipline"].astype(str).str.upper().str.strip().eq(current)
+        df = df.sort_values(["_is_current_discipline"], ascending=True)
+
+    useful_cols = [
+        "example_id", "source_discipline", "source_document_role", "audit_category", "audit_scenario",
+        "issue_type", "problem", "why_it_matters", "good_comment_style", "comparison_basis",
+        "comparison_references", "notes_for_tool",
+    ]
+    cols = [c for c in useful_cols if c in df.columns]
+    if not cols:
+        return ""
+
+    csv_text = df[cols].head(max_rows).fillna("").astype(str).to_csv(index=False)
+    return f"""
+ZELTA PARAUGA AUDITA PIEMĒRI
+Šie nav projekta fakti un nav Design Brief prasības. Tie ir cilvēka akceptēti audita piezīmju piemēri.
+No tiem jāmācās audita scenāriju loģika, komentāra stils un tas, kas ir derīga piezīme.
+Nedrīkst akli kopēt konkrētās atbildes uz citu disciplīnu. Jāmeklē līdzīga tipa kļūdas jaunajos dokumentos.
+
+{csv_text}
+"""
+
+
+def enrich_calibration_text(error_examples_text: str, audit_examples_df: pd.DataFrame, current_discipline: str) -> str:
+    audit_examples_text = build_audit_examples_library_text(audit_examples_df, current_discipline, max_rows=80)
+    if audit_examples_text:
+        return error_examples_text + "\n\n" + audit_examples_text
+    return error_examples_text
 
 def select_relevant_requirements(req_df: pd.DataFrame, discipline_code: str, max_rows: int) -> pd.DataFrame:
     if req_df.empty:
@@ -804,7 +938,7 @@ def filter_issues(raw_df: pd.DataFrame, confidence_threshold: float, audit_depth
         return kept, removed
 
     if audit_depth == "Balanced":
-        # v3.2: Balanced is meant for human review, not final PDF.
+        # v3.3: Balanced is meant for human review, not final PDF.
         # It requires anchor + confidence + technical-like issue type,
         # but it does not require include_in_pdf=True because AI often sets it inconsistently.
         mask = (
@@ -840,7 +974,7 @@ def make_excel_bytes(df: pd.DataFrame, raw_df: pd.DataFrame, removed_df: pd.Data
 
 def make_json_bytes(df: pd.DataFrame, raw_df: pd.DataFrame, removed_df: pd.DataFrame, facts_df: pd.DataFrame, project_code: str, discipline_code: str) -> bytes:
     payload = {
-        "schema": "bp_audit_universal_v3_2",
+        "schema": "bp_audit_universal_v3_3",
         "project_code": project_code,
         "discipline_code": discipline_code,
         "created_at_utc": datetime.now(timezone.utc).isoformat(),
@@ -903,21 +1037,24 @@ run_module_b = st.checkbox("B. Katra dokumenta iekšējā konsekvence", value=Tr
 run_module_c = st.checkbox("C. Disciplīnas savstarpējā konsekvence", value=True)
 run_module_d = st.checkbox("D. Starpdisciplīnu konsekvence pret līdzšinējo 03_Memory", value=False)
 
-st.info("v3.2: audit_mode tiek noteikts pēc moduļa; Balanced filtrs atpazīst arī tehniski līdzīgus issue_type un neprasa include_in_pdf=true. PDF anotēšana vēl nav ieslēgta.")
+st.info("v3.3: audit_mode tiek noteikts pēc moduļa; Balanced filtrs atpazīst arī tehniski līdzīgus issue_type un neprasa include_in_pdf=true. v3.3 lasa audit_examples zelta paraugus no 03_Memory/audit_examples un izmanto tos kā audita scenāriju bibliotēku. PDF anotēšana vēl nav ieslēgta.")
 
 if st.button("1) Nolasīt 01_Input, 03_Memory un 04_Prompt"):
     try:
         service = get_drive_service()
         st.session_state.disciplines_df = get_discipline_folders(service, input_folder_id)
         mem_catalog, req_df, facts_df = load_memory_json_files(service, memory_folder_id)
+        audit_examples_catalog, audit_examples_df = load_audit_examples_json_files(service, memory_folder_id)
         prompt_catalog, universal_prompt, error_examples_text = load_prompt_assets(service, prompt_folder_id)
         st.session_state.memory_catalog_df = mem_catalog
         st.session_state.requirements_df = req_df
         st.session_state.memory_facts_df = facts_df
+        st.session_state.audit_examples_catalog_df = audit_examples_catalog
+        st.session_state.audit_examples_df = audit_examples_df
         st.session_state.prompt_catalog_df = prompt_catalog
         st.session_state.universal_prompt = universal_prompt
         st.session_state.error_examples_text = error_examples_text
-        st.success(f"Nolasīts: disciplīnas {len(st.session_state.disciplines_df)}, Design Brief prasības {len(req_df)}, disciplīnu fakti {len(facts_df)}, kļūdu piemēru teksta garums {len(error_examples_text)}.")
+        st.success(f"Nolasīts: disciplīnas {len(st.session_state.disciplines_df)}, Design Brief prasības {len(req_df)}, disciplīnu fakti {len(facts_df)}, accepted audit examples {len(audit_examples_df)}, kļūdu piemēru teksta garums {len(error_examples_text)}.")
     except Exception as e:
         st.error("Neizdevās nolasīt sākuma datus.")
         st.exception(e)
@@ -925,6 +1062,15 @@ if st.button("1) Nolasīt 01_Input, 03_Memory un 04_Prompt"):
 if not st.session_state.memory_catalog_df.empty:
     with st.expander("03_Memory katalogs"):
         st.dataframe(st.session_state.memory_catalog_df, use_container_width=True)
+if not st.session_state.audit_examples_catalog_df.empty:
+    with st.expander("03_Memory / audit_examples katalogs"):
+        st.dataframe(st.session_state.audit_examples_catalog_df, use_container_width=True)
+
+if not st.session_state.audit_examples_df.empty:
+    with st.expander("Accepted audit examples priekšskatījums"):
+        preview_cols = [c for c in ["example_id", "source_discipline", "source_document_role", "audit_scenario", "issue_type", "problem", "good_comment_style", "comparison_basis"] if c in st.session_state.audit_examples_df.columns]
+        st.dataframe(st.session_state.audit_examples_df[preview_cols].head(100), use_container_width=True)
+
 if not st.session_state.prompt_catalog_df.empty:
     with st.expander("04_Prompt katalogs"):
         st.dataframe(st.session_state.prompt_catalog_df, use_container_width=True)
@@ -1011,17 +1157,24 @@ if not blocks_df.empty:
     st.markdown("### Teksta bloku priekšskatījums")
     st.dataframe(blocks_df[["source_file", "document_type", "page", "block_id", "text", "x0", "y0", "x1", "y1"]].head(100), use_container_width=True)
 
-    if st.button("4) Palaist universālo auditu v3.2"):
+    if st.button("4) Palaist universālo auditu v3.3"):
         try:
             client = get_openai_client()
             discipline_code = blocks_df["discipline"].iloc[0]
-            error_examples_text = st.session_state.error_examples_text or st.session_state.universal_prompt or ""
+            base_examples_text = st.session_state.error_examples_text or st.session_state.universal_prompt or ""
+            error_examples_text = enrich_calibration_text(
+                base_examples_text,
+                st.session_state.audit_examples_df,
+                discipline_code,
+            )
             source_lookup = blocks_df[["source_file", "page", "block_id", "text", "x0", "y0", "x1", "y1"]].copy()
             all_raw_issues: List[Dict[str, Any]] = []
             all_temp_facts: List[Dict[str, Any]] = []
             raw_ai_log: List[Dict[str, Any]] = []
 
             st.markdown("## 5. Audita izpilde")
+            if not st.session_state.audit_examples_df.empty:
+                st.caption(f"v3.3: audita scenāriju bibliotēkā ielādēti {len(st.session_state.audit_examples_df)} accepted audit examples.")
             st.markdown("### 0. Pagaidu faktu indekss")
             fact_batches = make_block_batches(blocks_df, int(max_blocks_per_ai))
             fact_progress = st.progress(0)
@@ -1191,6 +1344,6 @@ if not temp_facts_df.empty or not raw_df.empty:
     json_bytes = make_json_bytes(filtered_df, raw_df, removed_df, temp_facts_df, project_code, blocks_df["discipline"].iloc[0] if not blocks_df.empty else "")
     d1, d2 = st.columns(2)
     with d1:
-        st.download_button("Lejupielādēt universal audit Excel", data=excel_bytes, file_name=f"{project_code.lower().replace('-', '_')}_universal_audit_v3_2.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        st.download_button("Lejupielādēt universal audit Excel", data=excel_bytes, file_name=f"{project_code.lower().replace('-', '_')}_universal_audit_v3_3.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
     with d2:
-        st.download_button("Lejupielādēt universal audit JSON", data=json_bytes, file_name=f"{project_code.lower().replace('-', '_')}_universal_audit_v3_2.json", mime="application/json")
+        st.download_button("Lejupielādēt universal audit JSON", data=json_bytes, file_name=f"{project_code.lower().replace('-', '_')}_universal_audit_v3_3.json", mime="application/json")
