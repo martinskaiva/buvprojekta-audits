@@ -12,9 +12,9 @@ from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
 
-st.set_page_config(page_title="BP audita PDF markup rīks v1.4", layout="wide")
+st.set_page_config(page_title="BP audita PDF markup rīks v1.5", layout="wide")
 
-st.title("BP audita PDF markup rīks v1.4")
+st.title("BP audita PDF markup rīks v1.5")
 st.write(
     "Rīks nolasa ChatGPT/Excel audita piezīmes, sasaista tās ar izvēlētiem PDF failiem "
     "un ģenerē anotētus PDF failus. PDF komentāros tiek rādīts tikai īss komentārs un ieteikums. "
@@ -194,11 +194,29 @@ def get_audit_example_excels(service, memory_folder_id: str) -> pd.DataFrame:
     file_df = df[df["is_folder"] == False].copy()
 
     def is_audit_example(row: pd.Series) -> bool:
-        name = str(row.get("name", "")).lower()
-        path = str(row.get("path", "")).lower()
+        name = str(row.get("name", "")).lower().strip()
+        path = str(row.get("path", "")).lower().strip()
         mime = str(row.get("mimeType", ""))
+
+        # v1.5: audit_examples mapēs drīkst atrasties arī faili, kuru nosaukumā
+        # nav frāzes "accepted_audit_examples". Piemēram:
+        #   RWC2-03_MEP_UK_ZZ_ZZ_MS_00001_Ūdensapgādes_specifikācija_candidates.xlsx
+        #   RWC2-03_MEP_UK_ZZ_ZZ_MS_00002_Kanalizācijas_specifikācija_candidates.xlsx
+        # Tāpēc filtrējam pēc atrašanās 03_Memory/audit_examples kokā un Excel tipa,
+        # nevis pēc konkrētas nosaukuma frāzes.
         is_excel = name.endswith(".xlsx") or mime == GOOGLE_SHEET_MIME_TYPE
-        return is_excel and "audit_examples" in path and "accepted_audit_examples" in name
+        if not is_excel:
+            return False
+        if "audit_examples" not in path:
+            return False
+
+        # Izlaižam Excel pagaidu/lock failus un acīmredzamus vecus rezerves failus.
+        if name.startswith("~$"):
+            return False
+        if name.endswith(".tmp") or name.endswith(".bak"):
+            return False
+
+        return True
 
     ex_df = file_df[file_df.apply(is_audit_example, axis=1)].copy()
     return ex_df.sort_values("path") if not ex_df.empty else ex_df
@@ -789,7 +807,7 @@ st.markdown("## 1. Konfigurācija")
 st.write("Input folder ID:", input_folder_id)
 st.write("Memory folder ID:", memory_folder_id)
 st.info(
-    "v1.4: rīks ģenerē anotētos PDF un ZIP lejupielādei. Rezultāti paredzēti 02_Results mapei. Drive augšupielāde šajā versijā nav ieslēgta. "
+    "v1.5: rīks ģenerē anotētos PDF un ZIP lejupielādei. Rezultāti paredzēti 02_Results mapei. Drive augšupielāde šajā versijā nav ieslēgta. "
     "PDF komentārā tiek rādīts tikai: Komentārs + Ieteikums. Komentārs = kļūdas skaidrojums, Ieteikums = pilns ieteikuma teksts."
 )
 
@@ -878,7 +896,7 @@ if not st.session_state.pdfs_df.empty:
 
     excel_df = st.session_state.excel_df.copy()
     if not excel_df.empty:
-        # v1.4: filter Excel files according to actual Drive structure.
+        # v1.5: filter Excel files according to actual Drive structure.
         # Examples:
         #   03_Memory/audit_examples/08_UKT/*.xlsx
         #   03_Memory/audit_examples/18_UK/UK/*.xlsx
