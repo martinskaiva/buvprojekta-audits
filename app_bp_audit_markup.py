@@ -12,9 +12,9 @@ from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
 
-st.set_page_config(page_title="BP audita PDF markup rīks v1.5", layout="wide")
+st.set_page_config(page_title="BP audita PDF markup rīks v1.6", layout="wide")
 
-st.title("BP audita PDF markup rīks v1.5")
+st.title("BP audita PDF markup rīks v1.6")
 st.write(
     "Rīks nolasa ChatGPT/Excel audita piezīmes, sasaista tās ar izvēlētiem PDF failiem "
     "un ģenerē anotētus PDF failus. PDF komentāros tiek rādīts tikai īss komentārs un ieteikums. "
@@ -198,7 +198,7 @@ def get_audit_example_excels(service, memory_folder_id: str) -> pd.DataFrame:
         path = str(row.get("path", "")).lower().strip()
         mime = str(row.get("mimeType", ""))
 
-        # v1.5: audit_examples mapēs drīkst atrasties arī faili, kuru nosaukumā
+        # v1.6: audit_examples mapēs drīkst atrasties arī faili, kuru nosaukumā
         # nav frāzes "accepted_audit_examples". Piemēram:
         #   RWC2-03_MEP_UK_ZZ_ZZ_MS_00001_Ūdensapgādes_specifikācija_candidates.xlsx
         #   RWC2-03_MEP_UK_ZZ_ZZ_MS_00002_Kanalizācijas_specifikācija_candidates.xlsx
@@ -807,7 +807,7 @@ st.markdown("## 1. Konfigurācija")
 st.write("Input folder ID:", input_folder_id)
 st.write("Memory folder ID:", memory_folder_id)
 st.info(
-    "v1.5: rīks ģenerē anotētos PDF un ZIP lejupielādei. Rezultāti paredzēti 02_Results mapei. Drive augšupielāde šajā versijā nav ieslēgta. "
+    "v1.6: rīks ģenerē anotētos PDF un ZIP lejupielādei. Piezīmju Excel failus var atlasīt automātiski pēc disciplīnas vai manuāli pārlūkojot 03_Memory/audit_examples mapju struktūru. Rezultāti paredzēti 02_Results mapei. Drive augšupielāde šajā versijā nav ieslēgta. "
     "PDF komentārā tiek rādīts tikai: Komentārs + Ieteikums. Komentārs = kļūdas skaidrojums, Ieteikums = pilns ieteikuma teksts."
 )
 
@@ -896,35 +896,79 @@ if not st.session_state.pdfs_df.empty:
 
     excel_df = st.session_state.excel_df.copy()
     if not excel_df.empty:
-        # v1.5: filter Excel files according to actual Drive structure.
-        # Examples:
-        #   03_Memory/audit_examples/08_UKT/*.xlsx
-        #   03_Memory/audit_examples/18_UK/UK/*.xlsx
-        #   03_Memory/audit_examples/18_UK/UK-K/*.xlsx
-        #   03_Memory/audit_examples/18_UK/UK-U/*.xlsx
-        relevant_excel_df = filter_audit_examples_for_discipline(
-            excel_df,
-            selected_folder_name=selected_folder_name,
-            selected_discipline_code=selected_discipline_code,
+        excel_df = excel_df.copy()
+        excel_df["audit_examples_group"] = excel_df["path"].apply(audit_examples_group_from_path)
+        excel_df["audit_examples_subgroup"] = excel_df["path"].apply(audit_examples_subgroup_from_path)
+
+        selection_mode = st.radio(
+            "Piezīmju Excel atlases režīms",
+            options=[
+                "Automātiski pēc izvēlētās disciplīnas",
+                "Manuāli pārlūkot 03_Memory/audit_examples",
+            ],
+            index=0,
+            horizontal=True,
+            help=(
+                "Automātiskais režīms mēģina atrast failus pēc izvēlētās 01_Input disciplīnas. "
+                "Manuālais režīms ļauj pašam ieiet audit_examples struktūrā, piemēram 09_1_SAT, 18_UK, 19_UK-IUK vai jebkurā citā mapē."
+            ),
         )
 
-        show_only_relevant = st.checkbox(
-            "Rādīt tikai izvēlētajai disciplīnai atbilstošos audit_examples failus",
-            value=True,
-        )
+        if selection_mode.startswith("Automātiski"):
+            relevant_excel_df = filter_audit_examples_for_discipline(
+                excel_df,
+                selected_folder_name=selected_folder_name,
+                selected_discipline_code=selected_discipline_code,
+            )
 
-        option_df = relevant_excel_df if show_only_relevant and not relevant_excel_df.empty else excel_df
+            show_only_relevant = st.checkbox(
+                "Rādīt tikai izvēlētajai disciplīnai atbilstošos audit_examples failus",
+                value=True,
+            )
+
+            option_df = relevant_excel_df if show_only_relevant and not relevant_excel_df.empty else excel_df
+            filter_caption = "Automātiska atlase pēc izvēlētās disciplīnas"
+        else:
+            groups = sorted([
+                x for x in excel_df["audit_examples_group"].dropna().astype(str).unique().tolist()
+                if x.strip()
+            ])
+
+            preferred_group = ""
+            selected_folder_lower = str(selected_folder_name or "").strip().lower()
+            for g in groups:
+                if g.lower() == selected_folder_lower:
+                    preferred_group = g
+                    break
+            if not preferred_group:
+                code_lower = str(selected_discipline_code or "").strip().lower()
+                for g in groups:
+                    if token_matches_code(g, code_lower):
+                        preferred_group = g
+                        break
+
+            group_options = ["(visas audit_examples mapes)"] + groups
+            default_group_index = group_options.index(preferred_group) if preferred_group in group_options else 0
+            selected_group = st.selectbox(
+                "Audit examples galvenā mape",
+                group_options,
+                index=default_group_index,
+                help="Izvēlies, piemēram, 08_UKT, 09_1_SAT, 18_UK vai 19_UK-IUK.",
+            )
+
+            if selected_group == "(visas audit_examples mapes)":
+                option_df = excel_df.copy()
+            else:
+                option_df = excel_df[excel_df["audit_examples_group"] == selected_group].copy()
+
+            filter_caption = f"Manuāli izvēlēta mape: {selected_group}"
 
         if option_df.empty:
-            st.warning("Izvēlētajai disciplīnai nav atrasti audit_examples Excel faili.")
+            st.warning("Izvēlētajā audit_examples filtrā nav atrasti Excel faili.")
             selected_excel_df = pd.DataFrame()
         else:
-            option_df = option_df.copy()
-            option_df["audit_examples_group"] = option_df["path"].apply(audit_examples_group_from_path)
-            option_df["audit_examples_subgroup"] = option_df["path"].apply(audit_examples_subgroup_from_path)
-
             st.caption(
-                f"Atlasīti Excel faili izvēlei: {len(option_df)} "
+                f"{filter_caption}. Atlasīti Excel faili izvēlei: {len(option_df)} "
                 f"(no kopā atrastajiem {len(excel_df)} audit_examples Excel failiem)."
             )
 
@@ -934,18 +978,36 @@ if not st.session_state.pdfs_df.empty:
                     use_container_width=True,
                 )
 
-            subgroup_values = sorted([x for x in option_df["audit_examples_subgroup"].dropna().unique().tolist() if str(x).strip()])
+            subgroup_values = sorted([
+                x for x in option_df["audit_examples_subgroup"].dropna().astype(str).unique().tolist()
+                if x.strip()
+            ])
             if subgroup_values:
+                subgroup_key_base = (
+                    "manual" if selection_mode.startswith("Manuāli") else "auto"
+                )
+                group_key_value = "all"
+                if selection_mode.startswith("Manuāli"):
+                    group_key_value = str(locals().get("selected_group", "all"))
+                else:
+                    group_key_value = str(selected_folder_name)
                 selected_subgroups = st.multiselect(
                     "Apakšmapes audit_examples mapē",
                     subgroup_values,
                     default=subgroup_values,
-                    help="Piemēram 18_UK mapē var būt UK, UK-K un UK-U. Atstāj atzīmētas tās, kuru piezīmes jāizmanto.",
+                    key=f"{subgroup_key_base}_audit_examples_subgroups_{group_key_value}",
+                    help=(
+                        "Piemēram 18_UK mapē var būt UK, UK-K un UK-U. "
+                        "Ja neko neatstāj atzīmētu, rīks drošības pēc rādīs visas apakšmapes, nevis tukšu sarakstu."
+                    ),
                 )
-                option_df = option_df[
-                    (option_df["audit_examples_subgroup"].isin(selected_subgroups))
-                    | (option_df["audit_examples_subgroup"].astype(str).str.strip() == "")
-                ].copy()
+                if selected_subgroups:
+                    option_df = option_df[
+                        (option_df["audit_examples_subgroup"].isin(selected_subgroups))
+                        | (option_df["audit_examples_subgroup"].astype(str).str.strip() == "")
+                    ].copy()
+                else:
+                    st.info("Nav atzīmēta neviena apakšmape, tāpēc rādīti visi Excel faili izvēlētajā galvenajā mapē.")
 
             excel_options = option_df["path"].tolist()
             default_excel_paths = excel_options[:]
@@ -954,6 +1016,7 @@ if not st.session_state.pdfs_df.empty:
                 "Audit examples Excel faili",
                 excel_options,
                 default=default_excel_paths,
+                key=f"audit_examples_excel_paths_{selection_mode}_{selected_folder_name}_{len(excel_options)}",
             )
             selected_excel_df = option_df[option_df["path"].isin(selected_excel_paths)].copy()
             st.dataframe(selected_excel_df[["name", "path", "id"]], use_container_width=True)
