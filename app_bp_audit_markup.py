@@ -12,13 +12,13 @@ from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
 
-st.set_page_config(page_title="BP audita PDF markup rīks v1.1", layout="wide")
+st.set_page_config(page_title="BP audita PDF markup rīks v1.2", layout="wide")
 
-st.title("BP audita PDF markup rīks v1.1")
+st.title("BP audita PDF markup rīks v1.2")
 st.write(
     "Rīks nolasa ChatGPT/Excel audita piezīmes, sasaista tās ar izvēlētiem PDF failiem "
     "un ģenerē anotētus PDF failus. PDF komentāros tiek rādīts tikai īss komentārs un ieteikums. "
-    "v1.1: vienai piezīmei tiek likta tikai viena PDF komentāra ikona."
+    "v1.2: komentāra sadaļā tiek rādīts kļūdas skaidrojums, ieteikumā pilns ieteikums; var izslēgt “2 / 2” kārtas piezīmes; īsiem target_text tiek izvairīts no pārāk plašas apvilkšanas."
 )
 
 FOLDER_MIME_TYPE = "application/vnd.google-apps.folder"
@@ -290,14 +290,94 @@ def validate_notes(notes_df: pd.DataFrame, selected_pdf_df: pd.DataFrame) -> pd.
     return work
 
 
+def clean_evidence_text(text: str) -> str:
+    """Return a readable issue explanation for the PDF comment body."""
+    value = re.sub(r"\s+", " ", str(text or "").strip())
+
+    # Many generated rows start with source references, e.g.
+    # "MS L52-L56 — Pozīcijā...". For the visible PDF note, keep the explanation.
+    for separator in [" — ", " - "]:
+        if separator in value:
+            left, right = value.split(separator, 1)
+            if len(right.strip()) >= 20:
+                value = right.strip()
+                break
+
+    return value
+
+
 def make_short_comment(row: pd.Series) -> str:
-    comment = str(row.get("comment_short") or row.get("comment_text") or "").strip()
+    """
+    Build the visible PDF note.
+
+    Principle for v1.2:
+    - Komentārs = issue explanation, preferably comparison_evidence.
+    - Ieteikums = full recommendation, preferably comment_text.
+
+    This avoids putting the full recommendation under both sections.
+    """
+    comment = str(row.get("comment_short") or "").strip()
     suggestion = str(row.get("suggestion_short") or "").strip()
+
+    if not comment:
+        comment = clean_evidence_text(row.get("comparison_evidence") or "")
+
+    if not comment:
+        issue_type = str(row.get("issue_type") or "").strip()
+        target_area = str(row.get("target_area") or "").strip()
+        comment = f"Konstatēta neatbilstība: {issue_type}. {target_area}".strip()
+
+    if not suggestion:
+        suggestion = str(row.get("comment_text") or "").strip()
 
     if not suggestion:
         suggestion = "Lūdzu pārbaudīt un precizēt atbilstoši piezīmei."
 
     return f"Komentārs:\n{comment}\n\nIeteikums:\n{suggestion}"
+
+
+def is_2_of_2_stage_note(row: pd.Series) -> bool:
+    """
+    Exclude notes that interpret “2 / 2” as page count.
+    User clarified this is the project construction stage, not missing page count.
+    """
+    haystack = " ".join([
+        str(row.get("target_text") or ""),
+        str(row.get("target_area") or ""),
+        str(row.get("comment_text") or ""),
+        str(row.get("comparison_evidence") or ""),
+        str(row.get("issue_type") or ""),
+    ]).lower()
+
+    has_2_2 = bool(re.search(r"\b2\s*/\s*2\b", haystack))
+    talks_about_pages = any(word in haystack for word in [
+        "lapu numer",
+        "lapu skaits",
+        "pdf satur vienu lapu",
+        "netrūkst 1. lapas",
+        "page count",
+        "page_note",
+    ])
+    return has_2_2 and talks_about_pages
+
+
+def is_very_short_search_text(text: str) -> bool:
+    value = str(text or "").strip()
+    if not value:
+        return False
+    if len(value) <= 2:
+        return True
+    return bool(re.fullmatch(r"\d+(?:[.,]\d+)?", value))
+
+
+def choose_rects_for_short_target(rects: List[fitz.Rect]) -> List[fitz.Rect]:
+    """For very short targets like row number '7', do not union all matches on page."""
+    if not rects:
+        return []
+    # Choose the upper-left match. This is not perfect, but prevents one tiny target
+    # from creating a huge rectangle around many unrelated matches.
+    ordered = sorted(rects, key=lambda r: (round(r.y0, 1), round(r.x0, 1), r.get_area()))
+    return [ordered[0]]
 
 
 def build_search_variants(target_text: str) -> List[str]:
@@ -432,6 +512,10 @@ def annotate_pdf(pdf_bytes: bytes, notes_df: pd.DataFrame, output_name: str, vis
             "placement_confidence": note.get("placement_confidence"),
         }
 
+        if note.get("skip_reason"):
+            report_rows.append({**base_report, "result": "skipped", "reason": note.get("skip_reason")})
+            continue
+
         if page_no is None:
             report_rows.append({**base_report, "result": "skipped", "reason": "missing_target_page"})
             continue
@@ -467,6 +551,9 @@ def annotate_pdf(pdf_bytes: bytes, notes_df: pd.DataFrame, output_name: str, vis
                 break
 
         if found_rects:
+            if is_very_short_search_text(found_variant):
+                found_rects = choose_rects_for_short_target(found_rects)
+
             strategy_result, rectangles_drawn = add_highlight_markup(
                 page=page,
                 rects=found_rects,
@@ -548,8 +635,8 @@ st.markdown("## 1. Konfigurācija")
 st.write("Input folder ID:", input_folder_id)
 st.write("Memory folder ID:", memory_folder_id)
 st.info(
-    "v1.1: rīks ģenerē anotētos PDF un ZIP lejupielādei. Drive augšupielāde šajā versijā nav ieslēgta. "
-    "PDF komentārā tiek rādīts tikai: Komentārs + Ieteikums. Vienai piezīmei tiek likta tikai viena komentāra ikona."
+    "v1.2: rīks ģenerē anotētos PDF un ZIP lejupielādei. Drive augšupielāde šajā versijā nav ieslēgta. "
+    "PDF komentārā tiek rādīts tikai: Komentārs + Ieteikums. Komentārs = kļūdas skaidrojums, Ieteikums = pilns ieteikuma teksts."
 )
 
 visual_strategy_label = st.radio(
@@ -566,6 +653,11 @@ visual_strategy = (
     "multiple_rects_one_note"
     if visual_strategy_label.startswith("Vairāki")
     else "union"
+)
+
+skip_2_of_2_stage_notes = st.checkbox(
+    "Izlaist piezīmes par “2 / 2” lapu numerāciju, jo UKT gadījumā tā ir būvprojekta kārta",
+    value=True,
 )
 
 if st.button("1) Nolasīt PDF un audit examples Excel failus"):
@@ -697,6 +789,14 @@ if not validated_notes_df.empty:
             report_frames = []
 
             ok_notes = validated_notes_df[validated_notes_df["validation_status"] == "ok"].copy()
+
+            if skip_2_of_2_stage_notes and not ok_notes.empty:
+                skip_mask = ok_notes.apply(is_2_of_2_stage_note, axis=1)
+                ok_notes.loc[skip_mask, "skip_reason"] = "excluded_2_of_2_stage_not_page_count"
+                ok_notes.loc[~skip_mask, "skip_reason"] = ""
+            else:
+                ok_notes["skip_reason"] = ""
+
             if ok_notes.empty:
                 st.warning("Nav derīgu piezīmju anotēšanai.")
             else:
