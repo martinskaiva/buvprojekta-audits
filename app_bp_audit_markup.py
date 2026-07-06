@@ -12,12 +12,13 @@ from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
 
-st.set_page_config(page_title="BP audita PDF markup rīks v1", layout="wide")
+st.set_page_config(page_title="BP audita PDF markup rīks v1.1", layout="wide")
 
-st.title("BP audita PDF markup rīks v1")
+st.title("BP audita PDF markup rīks v1.1")
 st.write(
     "Rīks nolasa ChatGPT/Excel audita piezīmes, sasaista tās ar izvēlētiem PDF failiem "
-    "un ģenerē anotētus PDF failus. PDF komentāros tiek rādīts tikai īss komentārs un ieteikums."
+    "un ģenerē anotētus PDF failus. PDF komentāros tiek rādīts tikai īss komentārs un ieteikums. "
+    "v1.1: vienai piezīmei tiek likta tikai viena PDF komentāra ikona."
 )
 
 FOLDER_MIME_TYPE = "application/vnd.google-apps.folder"
@@ -342,25 +343,74 @@ def add_page_note(page: fitz.Page, content: str, index_on_page: int) -> None:
     annot.update()
 
 
-def add_red_markup_for_rect(page: fitz.Page, rect: fitz.Rect, content: str) -> None:
-    # Red rectangle for visual markup.
-    padding = 1.5
-    r = fitz.Rect(rect.x0 - padding, rect.y0 - padding, rect.x1 + padding, rect.y1 + padding)
-    rect_annot = page.add_rect_annot(r)
+def padded_rect(rect: fitz.Rect, padding: float = 1.5) -> fitz.Rect:
+    return fitz.Rect(rect.x0 - padding, rect.y0 - padding, rect.x1 + padding, rect.y1 + padding)
+
+
+def union_rects(rects: List[fitz.Rect], padding: float = 1.5) -> fitz.Rect:
+    if not rects:
+        raise ValueError("union_rects called with empty rect list")
+
+    r = fitz.Rect(rects[0])
+    for rect in rects[1:]:
+        r.include_rect(rect)
+
+    return padded_rect(r, padding=padding)
+
+
+def add_red_rect(page: fitz.Page, rect: fitz.Rect, content: str = "") -> None:
+    rect_annot = page.add_rect_annot(rect)
     rect_annot.set_colors(stroke=(1, 0, 0))
     rect_annot.set_border(width=1.0)
     rect_annot.set_info(title="AI būvprojekta audits", subject="AI piezīme", content=content)
     rect_annot.update()
 
-    # Sticky note near the first rectangle.
-    note_x = min(page.rect.width - 36, r.x1 + 6)
-    note_y = max(24, r.y0)
+
+def add_sticky_note_near_rect(page: fitz.Page, rect: fitz.Rect, content: str) -> None:
+    note_x = min(page.rect.width - 36, rect.x1 + 6)
+    note_y = max(24, rect.y0)
     note = page.add_text_annot(fitz.Point(note_x, note_y), content)
     note.set_info(title="AI būvprojekta audits", subject="AI piezīme")
     note.update()
 
 
-def annotate_pdf(pdf_bytes: bytes, notes_df: pd.DataFrame, output_name: str) -> Tuple[bytes, pd.DataFrame]:
+def add_highlight_markup(
+    page: fitz.Page,
+    rects: List[fitz.Rect],
+    content: str,
+    visual_strategy: str,
+) -> Tuple[str, int]:
+    """
+    Adds visual markup for one note.
+
+    visual_strategy:
+    - union: one combined red rectangle around all matched text fragments + one sticky note.
+    - multiple_rects_one_note: red rectangles around all matched fragments + one sticky note.
+
+    Returns: (strategy_result, rectangles_drawn)
+    """
+    if not rects:
+        return "no_rects", 0
+
+    limited_rects = rects[:12]
+
+    if visual_strategy == "multiple_rects_one_note":
+        padded = [padded_rect(r) for r in limited_rects]
+        for rect in padded:
+            add_red_rect(page, rect, content="")
+
+        note_anchor = union_rects(padded, padding=0)
+        add_sticky_note_near_rect(page, note_anchor, content)
+        return "multiple_rects_one_note", len(padded)
+
+    # Default: one combined visual zone and one note.
+    combined = union_rects(limited_rects)
+    add_red_rect(page, combined, content=content)
+    add_sticky_note_near_rect(page, combined, content)
+    return "union_rect_one_note", 1
+
+
+def annotate_pdf(pdf_bytes: bytes, notes_df: pd.DataFrame, output_name: str, visual_strategy: str) -> Tuple[bytes, pd.DataFrame]:
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     report_rows: List[Dict[str, Any]] = []
     page_note_counts: Dict[int, int] = {}
@@ -417,15 +467,20 @@ def annotate_pdf(pdf_bytes: bytes, notes_df: pd.DataFrame, output_name: str) -> 
                 break
 
         if found_rects:
-            # Limit repeated occurrences to avoid overwhelming the page.
-            for rect in found_rects[:6]:
-                add_red_markup_for_rect(page, rect, content)
+            strategy_result, rectangles_drawn = add_highlight_markup(
+                page=page,
+                rects=found_rects,
+                content=content,
+                visual_strategy=visual_strategy,
+            )
             report_rows.append(
                 {
                     **base_report,
                     "result": "highlight_added",
                     "reason": f"found_text_variant: {found_variant}",
                     "matches": len(found_rects),
+                    "rectangles_drawn": rectangles_drawn,
+                    "visual_strategy": strategy_result,
                 }
             )
         else:
@@ -493,8 +548,24 @@ st.markdown("## 1. Konfigurācija")
 st.write("Input folder ID:", input_folder_id)
 st.write("Memory folder ID:", memory_folder_id)
 st.info(
-    "v1: rīks ģenerē anotētos PDF un ZIP lejupielādei. Drive augšupielāde šajā versijā nav ieslēgta. "
-    "PDF komentārā tiek rādīts tikai: Komentārs + Ieteikums."
+    "v1.1: rīks ģenerē anotētos PDF un ZIP lejupielādei. Drive augšupielāde šajā versijā nav ieslēgta. "
+    "PDF komentārā tiek rādīts tikai: Komentārs + Ieteikums. Vienai piezīmei tiek likta tikai viena komentāra ikona."
+)
+
+visual_strategy_label = st.radio(
+    "Highlight noformējums",
+    options=[
+        "Viena kopēja sarkanā zona + viena piezīme",
+        "Vairāki sarkanie rāmji + viena piezīme",
+    ],
+    index=0,
+    horizontal=True,
+)
+
+visual_strategy = (
+    "multiple_rects_one_note"
+    if visual_strategy_label.startswith("Vairāki")
+    else "union"
 )
 
 if st.button("1) Nolasīt PDF un audit examples Excel failus"):
@@ -649,7 +720,7 @@ if not validated_notes_df.empty:
 
                     pdf_bytes = download_drive_file_bytes(service, pdf_row["id"])
                     output_name = make_safe_output_name(pdf_row["name"])
-                    annotated_bytes, report_df = annotate_pdf(pdf_bytes, group, output_name)
+                    annotated_bytes, report_df = annotate_pdf(pdf_bytes, group, output_name, visual_strategy)
 
                     pdf_outputs[output_name] = annotated_bytes
                     report_frames.append(report_df)
