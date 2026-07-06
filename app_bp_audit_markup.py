@@ -12,9 +12,9 @@ from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
 
-st.set_page_config(page_title="BP audita PDF markup rīks v1.3", layout="wide")
+st.set_page_config(page_title="BP audita PDF markup rīks v1.4", layout="wide")
 
-st.title("BP audita PDF markup rīks v1.3")
+st.title("BP audita PDF markup rīks v1.4")
 st.write(
     "Rīks nolasa ChatGPT/Excel audita piezīmes, sasaista tās ar izvēlētiem PDF failiem "
     "un ģenerē anotētus PDF failus. PDF komentāros tiek rādīts tikai īss komentārs un ieteikums. "
@@ -680,6 +680,93 @@ def make_zip_bytes(pdf_outputs: Dict[str, bytes], report_df: pd.DataFrame) -> by
     return output.getvalue()
 
 
+
+def token_matches_code(text: Any, code: str) -> bool:
+    """Return True when discipline code appears as a separate path/name token.
+
+    This avoids matching UK inside UKT, while still matching:
+    - 18_UK/UK/UK_GENERAL_DATA...
+    - c2_3_ukt_sa_accepted...
+    - 08_UKT/...
+    """
+    code = str(code or "").strip().lower()
+    if not code:
+        return False
+    text = str(text or "").strip().lower()
+    if not text:
+        return False
+    pattern = rf"(^|[\\/\s_\-]){re.escape(code)}($|[\\/\s_\-])"
+    return re.search(pattern, text) is not None
+
+
+def audit_examples_group_from_path(path: Any) -> str:
+    """Return first folder below 03_Memory/audit_examples, if present."""
+    path_text = str(path or "").strip().replace("\\", "/")
+    lower = path_text.lower()
+    marker = "03_memory/audit_examples/"
+    pos = lower.find(marker)
+    if pos < 0:
+        return ""
+    remainder = path_text[pos + len(marker):].strip("/")
+    if not remainder:
+        return ""
+    return remainder.split("/", 1)[0]
+
+
+def audit_examples_subgroup_from_path(path: Any) -> str:
+    """Return second folder below 03_Memory/audit_examples, if present."""
+    path_text = str(path or "").strip().replace("\\", "/")
+    lower = path_text.lower()
+    marker = "03_memory/audit_examples/"
+    pos = lower.find(marker)
+    if pos < 0:
+        return ""
+    remainder = path_text[pos + len(marker):].strip("/")
+    parts = remainder.split("/")
+    return parts[1] if len(parts) > 2 else ""
+
+
+def filter_audit_examples_for_discipline(
+    excel_df: pd.DataFrame,
+    selected_folder_name: str,
+    selected_discipline_code: str,
+) -> pd.DataFrame:
+    """Filter audit example Excel files for the chosen discipline.
+
+    Supports the actual Drive structure:
+      03_Memory/audit_examples/08_UKT/*.xlsx
+      03_Memory/audit_examples/18_UK/UK/*.xlsx
+      03_Memory/audit_examples/18_UK/UK-K/*.xlsx
+      03_Memory/audit_examples/18_UK/UK-U/*.xlsx
+
+    It uses both exact discipline folder matching and safe token matching by code.
+    """
+    if excel_df.empty:
+        return excel_df
+
+    df = excel_df.copy()
+    selected_folder_lower = str(selected_folder_name or "").strip().lower()
+    code = str(selected_discipline_code or "").strip().lower()
+
+    def is_relevant(row: pd.Series) -> bool:
+        path = str(row.get("path", ""))
+        name = str(row.get("name", ""))
+        group = audit_examples_group_from_path(path).lower()
+
+        # Best case: audit_examples has the same first-level folder as selected input discipline.
+        if selected_folder_lower and group == selected_folder_lower:
+            return True
+
+        # Fallback: code appears as a separate token in path or file name.
+        if code and (token_matches_code(path, code) or token_matches_code(name, code)):
+            return True
+
+        return False
+
+    relevant = df[df.apply(is_relevant, axis=1)].copy()
+    return relevant.sort_values("path") if not relevant.empty else relevant
+
+
 # Session state
 for key, default in {
     "disciplines_df": pd.DataFrame(),
@@ -702,7 +789,7 @@ st.markdown("## 1. Konfigurācija")
 st.write("Input folder ID:", input_folder_id)
 st.write("Memory folder ID:", memory_folder_id)
 st.info(
-    "v1.3: rīks ģenerē anotētos PDF un ZIP lejupielādei. Rezultāti paredzēti 02_Results mapei. Drive augšupielāde šajā versijā nav ieslēgta. "
+    "v1.4: rīks ģenerē anotētos PDF un ZIP lejupielādei. Rezultāti paredzēti 02_Results mapei. Drive augšupielāde šajā versijā nav ieslēgta. "
     "PDF komentārā tiek rādīts tikai: Komentārs + Ieteikums. Komentārs = kļūdas skaidrojums, Ieteikums = pilns ieteikuma teksts."
 )
 
@@ -791,32 +878,83 @@ if not st.session_state.pdfs_df.empty:
 
     excel_df = st.session_state.excel_df.copy()
     if not excel_df.empty:
-        # Preselect likely files for the selected discipline.
-        disc_lower = selected_discipline_code.lower()
-        likely = excel_df[excel_df["name"].str.lower().str.contains(f"_{disc_lower}_", regex=False)].copy()
-        default_excel_paths = likely["path"].tolist() if not likely.empty else []
-
-        excel_options = excel_df["path"].tolist()
-        selected_excel_paths = st.multiselect(
-            "Audit examples Excel faili",
-            excel_options,
-            default=default_excel_paths,
+        # v1.4: filter Excel files according to actual Drive structure.
+        # Examples:
+        #   03_Memory/audit_examples/08_UKT/*.xlsx
+        #   03_Memory/audit_examples/18_UK/UK/*.xlsx
+        #   03_Memory/audit_examples/18_UK/UK-K/*.xlsx
+        #   03_Memory/audit_examples/18_UK/UK-U/*.xlsx
+        relevant_excel_df = filter_audit_examples_for_discipline(
+            excel_df,
+            selected_folder_name=selected_folder_name,
+            selected_discipline_code=selected_discipline_code,
         )
-        selected_excel_df = excel_df[excel_df["path"].isin(selected_excel_paths)].copy()
-        st.dataframe(selected_excel_df[["name", "path", "id"]], use_container_width=True)
+
+        show_only_relevant = st.checkbox(
+            "Rādīt tikai izvēlētajai disciplīnai atbilstošos audit_examples failus",
+            value=True,
+        )
+
+        option_df = relevant_excel_df if show_only_relevant and not relevant_excel_df.empty else excel_df
+
+        if option_df.empty:
+            st.warning("Izvēlētajai disciplīnai nav atrasti audit_examples Excel faili.")
+            selected_excel_df = pd.DataFrame()
+        else:
+            option_df = option_df.copy()
+            option_df["audit_examples_group"] = option_df["path"].apply(audit_examples_group_from_path)
+            option_df["audit_examples_subgroup"] = option_df["path"].apply(audit_examples_subgroup_from_path)
+
+            st.caption(
+                f"Atlasīti Excel faili izvēlei: {len(option_df)} "
+                f"(no kopā atrastajiem {len(excel_df)} audit_examples Excel failiem)."
+            )
+
+            with st.expander("Excel failu filtrs / diagnostika"):
+                st.dataframe(
+                    option_df[["name", "path", "audit_examples_group", "audit_examples_subgroup", "id"]],
+                    use_container_width=True,
+                )
+
+            subgroup_values = sorted([x for x in option_df["audit_examples_subgroup"].dropna().unique().tolist() if str(x).strip()])
+            if subgroup_values:
+                selected_subgroups = st.multiselect(
+                    "Apakšmapes audit_examples mapē",
+                    subgroup_values,
+                    default=subgroup_values,
+                    help="Piemēram 18_UK mapē var būt UK, UK-K un UK-U. Atstāj atzīmētas tās, kuru piezīmes jāizmanto.",
+                )
+                option_df = option_df[
+                    (option_df["audit_examples_subgroup"].isin(selected_subgroups))
+                    | (option_df["audit_examples_subgroup"].astype(str).str.strip() == "")
+                ].copy()
+
+            excel_options = option_df["path"].tolist()
+            default_excel_paths = excel_options[:]
+
+            selected_excel_paths = st.multiselect(
+                "Audit examples Excel faili",
+                excel_options,
+                default=default_excel_paths,
+            )
+            selected_excel_df = option_df[option_df["path"].isin(selected_excel_paths)].copy()
+            st.dataframe(selected_excel_df[["name", "path", "id"]], use_container_width=True)
 
         if st.button("3) Ielasīt un pārbaudīt piezīmes"):
-            try:
-                service = get_drive_service()
-                notes_df = load_selected_notes(service, selected_excel_df)
-                validated = validate_notes(notes_df, selected_pdf_df)
-                st.session_state.selected_notes_df = notes_df
-                st.session_state.validated_notes_df = validated
+            if selected_excel_df.empty:
+                st.warning("Nav izvēlēts neviens piezīmju Excel fails.")
+            else:
+                try:
+                    service = get_drive_service()
+                    notes_df = load_selected_notes(service, selected_excel_df)
+                    validated = validate_notes(notes_df, selected_pdf_df)
+                    st.session_state.selected_notes_df = notes_df
+                    st.session_state.validated_notes_df = validated
 
-                st.success(f"Ielasītas {len(validated)} piezīmes no {len(selected_excel_df)} Excel failiem.")
-            except Exception as e:
-                st.error("Neizdevās ielasīt piezīmju Excel failus.")
-                st.exception(e)
+                    st.success(f"Ielasītas {len(validated)} piezīmes no {len(selected_excel_df)} Excel failiem.")
+                except Exception as e:
+                    st.error("Neizdevās ielasīt piezīmju Excel failus.")
+                    st.exception(e)
     else:
         st.warning("Nav atrasti audit_examples Excel faili.")
 
