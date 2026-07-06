@@ -12,13 +12,13 @@ from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
 
-st.set_page_config(page_title="BP audita PDF markup rīks v1.2", layout="wide")
+st.set_page_config(page_title="BP audita PDF markup rīks v1.3", layout="wide")
 
-st.title("BP audita PDF markup rīks v1.2")
+st.title("BP audita PDF markup rīks v1.3")
 st.write(
     "Rīks nolasa ChatGPT/Excel audita piezīmes, sasaista tās ar izvēlētiem PDF failiem "
     "un ģenerē anotētus PDF failus. PDF komentāros tiek rādīts tikai īss komentārs un ieteikums. "
-    "v1.2: komentāra sadaļā tiek rādīts kļūdas skaidrojums, ieteikumā pilns ieteikums; var izslēgt “2 / 2” kārtas piezīmes; īsiem target_text tiek izvairīts no pārāk plašas apvilkšanas."
+    "v1.3: komentāra sadaļā tiek rādīts kļūdas skaidrojums, ieteikumā pilns ieteikums; failiem bez piezīmēm tiek pievienota “izskatīts, piezīmju nav” atzīme; īsiem target_text tiek izvairīts no pārāk plašas apvilkšanas."
 )
 
 FOLDER_MIME_TYPE = "application/vnd.google-apps.folder"
@@ -423,6 +423,73 @@ def add_page_note(page: fitz.Page, content: str, index_on_page: int) -> None:
     annot.update()
 
 
+def add_reviewed_without_comments_mark(doc: fitz.Document) -> None:
+    """Add a visible mark and a PDF comment for a reviewed document without issues."""
+    if len(doc) == 0:
+        return
+
+    page = doc[0]
+    rect = page.rect
+
+    box_width = min(230, max(150, rect.width * 0.28))
+    box_height = 54
+    margin = 28
+    x0 = max(margin, rect.width - box_width - margin)
+    y0 = margin
+    box = fitz.Rect(x0, y0, x0 + box_width, y0 + box_height)
+
+    text = "AI būvprojekta audits\nDokuments izskatīts.\nPiezīmes nav konstatētas."
+
+    # Draw a light, non-aggressive stamp directly on the page.
+    try:
+        page.draw_rect(box, color=(0, 0.45, 0), fill=(0.92, 1, 0.92), width=0.8)
+        page.insert_textbox(
+            box + (6, 5, -6, -5),
+            text,
+            fontsize=8.5,
+            fontname="helv",
+            color=(0, 0.25, 0),
+            align=0,
+        )
+    except Exception:
+        # If direct drawing fails for a particular PDF, still add the annotation.
+        pass
+
+    content = "Komentārs:\nDokuments izskatīts. Piezīmes nav konstatētas.\n\nIeteikums:\nNav."
+    note = page.add_text_annot(fitz.Point(x0, y0 + box_height + 8), content)
+    note.set_info(title="AI būvprojekta audits", subject="Dokuments izskatīts bez piezīmēm")
+    note.update()
+
+
+def annotate_pdf_without_comments(pdf_bytes: bytes, output_name: str, target_file: str) -> Tuple[bytes, pd.DataFrame]:
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    add_reviewed_without_comments_mark(doc)
+
+    output = io.BytesIO()
+    doc.save(output, garbage=4, deflate=True)
+    doc.close()
+    output.seek(0)
+
+    report_df = pd.DataFrame([
+        {
+            "note_id": "REVIEWED_NO_COMMENTS",
+            "target_file": target_file,
+            "output_file": output_name,
+            "target_page": 1,
+            "target_text": "",
+            "markup_type": "reviewed_no_comments",
+            "placement_confidence": "not_applicable",
+            "result": "reviewed_no_comments",
+            "reason": "selected_pdf_has_no_notes",
+            "matches": 0,
+            "rectangles_drawn": 0,
+            "visual_strategy": "reviewed_stamp",
+        }
+    ])
+
+    return output.read(), report_df
+
+
 def padded_rect(rect: fitz.Rect, padding: float = 1.5) -> fitz.Rect:
     return fitz.Rect(rect.x0 - padding, rect.y0 - padding, rect.x1 + padding, rect.y1 + padding)
 
@@ -635,7 +702,7 @@ st.markdown("## 1. Konfigurācija")
 st.write("Input folder ID:", input_folder_id)
 st.write("Memory folder ID:", memory_folder_id)
 st.info(
-    "v1.2: rīks ģenerē anotētos PDF un ZIP lejupielādei. Drive augšupielāde šajā versijā nav ieslēgta. "
+    "v1.3: rīks ģenerē anotētos PDF un ZIP lejupielādei. Rezultāti paredzēti 02_Results mapei. Drive augšupielāde šajā versijā nav ieslēgta. "
     "PDF komentārā tiek rādīts tikai: Komentārs + Ieteikums. Komentārs = kļūdas skaidrojums, Ieteikums = pilns ieteikuma teksts."
 )
 
@@ -655,8 +722,8 @@ visual_strategy = (
     else "union"
 )
 
-skip_2_of_2_stage_notes = st.checkbox(
-    "Izlaist piezīmes par “2 / 2” lapu numerāciju, jo UKT gadījumā tā ir būvprojekta kārta",
+mark_reviewed_without_comments = st.checkbox(
+    "Atzīmēt izvēlētos PDF failus bez piezīmēm kā “izskatīts, piezīmju nav”",
     value=True,
 )
 
@@ -789,48 +856,59 @@ if not validated_notes_df.empty:
             report_frames = []
 
             ok_notes = validated_notes_df[validated_notes_df["validation_status"] == "ok"].copy()
-
-            if skip_2_of_2_stage_notes and not ok_notes.empty:
-                skip_mask = ok_notes.apply(is_2_of_2_stage_note, axis=1)
-                ok_notes.loc[skip_mask, "skip_reason"] = "excluded_2_of_2_stage_not_page_count"
-                ok_notes.loc[~skip_mask, "skip_reason"] = ""
-            else:
+            if not ok_notes.empty:
                 ok_notes["skip_reason"] = ""
 
-            if ok_notes.empty:
-                st.warning("Nav derīgu piezīmju anotēšanai.")
+            selected_pdf_map = {
+                normalize_filename(row["name"]): row
+                for _, row in selected_pdf_df.iterrows()
+            }
+
+            grouped_notes: Dict[str, pd.DataFrame] = {}
+            if not ok_notes.empty:
+                grouped_notes = {target_norm: group.copy() for target_norm, group in ok_notes.groupby("target_file_norm")}
+
+            if selected_pdf_df.empty:
+                st.warning("Nav izvēlēti PDF faili.")
+            elif ok_notes.empty and not mark_reviewed_without_comments:
+                st.warning("Nav derīgu piezīmju anotēšanai, un failu bez piezīmēm atzīmēšana ir izslēgta.")
             else:
                 progress = st.progress(0)
-                selected_pdf_map = {
-                    normalize_filename(row["name"]): row
-                    for _, row in selected_pdf_df.iterrows()
-                }
+                total_pdfs = len(selected_pdf_df)
 
-                grouped = ok_notes.groupby("target_file_norm")
-                total_groups = len(grouped)
-
-                for idx, (target_norm, group) in enumerate(grouped, start=1):
-                    pdf_row = selected_pdf_map.get(target_norm)
-                    if pdf_row is None:
+                # Report any valid note that points to a file outside the selected PDF set.
+                for target_norm, group in grouped_notes.items():
+                    if target_norm not in selected_pdf_map:
                         missing_report = group.copy()
                         missing_report["result"] = "skipped"
                         missing_report["reason"] = "target_file_not_selected"
                         report_frames.append(missing_report)
+
+                for idx, (_, pdf_row) in enumerate(selected_pdf_df.iterrows(), start=1):
+                    target_norm = normalize_filename(pdf_row["name"])
+                    group = grouped_notes.get(target_norm, pd.DataFrame())
+
+                    if group.empty and not mark_reviewed_without_comments:
+                        progress.progress(idx / max(total_pdfs, 1))
                         continue
 
                     pdf_bytes = download_drive_file_bytes(service, pdf_row["id"])
                     output_name = make_safe_output_name(pdf_row["name"])
-                    annotated_bytes, report_df = annotate_pdf(pdf_bytes, group, output_name, visual_strategy)
+
+                    if group.empty:
+                        annotated_bytes, report_df = annotate_pdf_without_comments(pdf_bytes, output_name, pdf_row["name"])
+                    else:
+                        annotated_bytes, report_df = annotate_pdf(pdf_bytes, group, output_name, visual_strategy)
 
                     pdf_outputs[output_name] = annotated_bytes
                     report_frames.append(report_df)
-                    progress.progress(idx / max(total_groups, 1))
+                    progress.progress(idx / max(total_pdfs, 1))
 
                 final_report = pd.concat(report_frames, ignore_index=True) if report_frames else pd.DataFrame()
                 st.session_state.markup_report_df = final_report
                 st.session_state.zip_bytes = make_zip_bytes(pdf_outputs, final_report)
 
-                st.success(f"Ģenerēti {len(pdf_outputs)} anotēti PDF faili.")
+                st.success(f"Ģenerēti {len(pdf_outputs)} anotēti PDF faili ZIP lejupielādei. Rezultātus pēc pārbaudes ievieto 02_Results mapē.")
         except Exception as e:
             st.error("Neizdevās ģenerēt anotētos PDF.")
             st.exception(e)
