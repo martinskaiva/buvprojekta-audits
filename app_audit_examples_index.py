@@ -1,6 +1,6 @@
 # app_audit_examples_index.py
 # ------------------------------------------------------------
-# BP audit_examples indeksētājs v1
+# BP audit_examples indeksētājs v1.1
 #
 # Mērķis:
 # - nolasa 03_Memory/audit_examples mapē esošos 16 kolonnu audit_examples Excel failus;
@@ -44,7 +44,7 @@ from googleapiclient.errors import HttpError
 from googleapiclient.http import MediaIoBaseDownload
 
 
-APP_TITLE = "BP audit_examples indeksētājs v1"
+APP_TITLE = "BP audit_examples indeksētājs v1.1"
 SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
 
 REQUIRED_COLUMNS = [
@@ -99,19 +99,34 @@ class DriveItem:
 
 @st.cache_resource(show_spinner=False)
 def get_drive_service():
+    """
+    Atbalsta abus secrets pierakstus:
+    1) esošais projekta pieraksts: GOOGLE_SERVICE_ACCOUNT_JSON = '{...}'
+    2) TOML tabula: [google_service_account] / [gcp_service_account] / [service_account]
+    """
     sa_info = None
 
-    if "google_service_account" in st.secrets:
-        sa_info = dict(st.secrets["google_service_account"])
-    elif "gcp_service_account" in st.secrets:
-        sa_info = dict(st.secrets["gcp_service_account"])
-    elif "service_account" in st.secrets:
-        sa_info = dict(st.secrets["service_account"])
+    service_account_json = st.secrets.get("GOOGLE_SERVICE_ACCOUNT_JSON", None)
+    if service_account_json:
+        try:
+            sa_info = json.loads(service_account_json)
+        except Exception as e:
+            st.error(f"GOOGLE_SERVICE_ACCOUNT_JSON nav derīgs JSON: {e}")
+            st.stop()
+
+    if sa_info is None:
+        if "google_service_account" in st.secrets:
+            sa_info = dict(st.secrets["google_service_account"])
+        elif "gcp_service_account" in st.secrets:
+            sa_info = dict(st.secrets["gcp_service_account"])
+        elif "service_account" in st.secrets:
+            sa_info = dict(st.secrets["service_account"])
 
     if not sa_info:
         st.error(
             "Nav atrasti Google service account dati Streamlit secrets. "
-            "Pievieno [google_service_account] vai pielāgo get_drive_service() funkciju."
+            "Šajā projektā parasti jābūt GOOGLE_SERVICE_ACCOUNT_JSON. "
+            "Alternatīvi var izmantot [google_service_account] TOML tabulu."
         )
         st.stop()
 
@@ -577,7 +592,9 @@ def main():
 
     default_memory_id = ""
     try:
-        default_memory_id = st.secrets.get("app", {}).get("memory_folder_id", "")
+        default_memory_id = st.secrets.get("GOOGLE_DRIVE_MEMORY_FOLDER_ID", "")
+        if not default_memory_id:
+            default_memory_id = st.secrets.get("app", {}).get("memory_folder_id", "")
     except Exception:
         default_memory_id = ""
 
