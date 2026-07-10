@@ -1,6 +1,6 @@
 # app_audit_examples_index.py
 # ------------------------------------------------------------
-# BP audit_examples indeksētājs v1.2
+# BP audit_examples indeksētājs v1.3
 #
 # Mērķis:
 # - nolasa 03_Memory/audit_examples mapē esošos 16 kolonnu audit_examples Excel failus;
@@ -45,7 +45,7 @@ from googleapiclient.errors import HttpError
 from googleapiclient.http import MediaIoBaseDownload
 
 
-APP_TITLE = "BP audit_examples indeksētājs v1.2"
+APP_TITLE = "BP audit_examples indeksētājs v1.3"
 SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
 
 REQUIRED_COLUMNS = [
@@ -409,9 +409,20 @@ def infer_family_and_scenario(row: pd.Series) -> Tuple[str, str, str]:
     if any(k in s for k in ["nav izsekoj", "not traceable", "nesasaist", "saskaņot", "starp", "pret", "profile", "site plan"]):
         return "J_traceability", "SC-J01_not_traceable_between_documents", "Izsekojamības problēma starp dokumentiem"
 
-    # K. grafika / salasāmība
-    if any(k in s for k in ["neskaidr", "pārklāj", "salasām", "grafisk", "leģend", "manual_placement_required"]):
-        return "K_graphical_clarity", "SC-K01_graphical_or_placement_clarity", "Grafiska vai izvietojuma skaidrības problēma"
+    # K. risinājuma / grafiskās skaidrības problēmas
+    if any(k in s for k in [
+        "neskaidr", "pārklāj", "salasām", "grafisk", "leģend", "manual_placement_required",
+        "piesaist", "piesaiste", "mezgl", "mezgla", "siena", "sienu", "statņ", "pārsegum",
+        "h=", "augstum", "risinājums", "detaliz", "nav skaidrs", "precizēt novietojumu"
+    ]):
+        return "K_solution_or_graphic_clarity", "SC-K01_solution_or_graphical_clarity", "Risinājuma, grafikas vai piesaistes skaidrības problēma"
+
+    # L. ugunsdrošības / normatīvās loģikas jautājumi
+    if any(k in s for k in [
+        "uguns", "fire", "rei", "ei30", "ei60", "ei90", "ugunsdroš", "fireproof",
+        "fire compartment", "dūmu", "smoke", "sprinkler", "evakuāc", "evacuation", "aizsardzība pret uguni"
+    ]):
+        return "L_fire_safety_or_regulatory_logic", "SC-L01_fire_safety_or_regulatory_logic", "Ugunsdrošības vai normatīvās loģikas neatbilstība"
 
     # fallback pēc issue_type
     if "missing" in issue and "spec" in issue:
@@ -663,11 +674,75 @@ def build_family_catalog() -> pd.DataFrame:
         {"family": "H_quantity_position", "meaning": "Daudzumu, pozīciju, numerācijas un tukšu/neskaidru pozīciju neatbilstības", "api_v1_priority": "medium"},
         {"family": "I_specification_coverage", "meaning": "Risinājumi vai elementi nav iekļauti specifikācijā", "api_v1_priority": "later"},
         {"family": "J_traceability", "meaning": "Izsekojamības problēmas starp SA, plāniem, profiliem, specifikācijām u.c.", "api_v1_priority": "later"},
-        {"family": "K_graphical_clarity", "meaning": "Grafiskās salasāmības, izvietojuma un piesaistes skaidrības problēmas", "api_v1_priority": "later"},
+        {"family": "K_solution_or_graphic_clarity", "meaning": "Risinājuma, grafikas, salasāmības, izvietojuma un piesaistes skaidrības problēmas", "api_v1_priority": "medium"},
+        {"family": "L_fire_safety_or_regulatory_logic", "meaning": "Ugunsdrošības, evakuācijas un normatīvās loģikas neatbilstības", "api_v1_priority": "medium"},
         {"family": "Z_unclassified", "meaning": "Automātiski neklasificēts; jāpārskata", "api_v1_priority": "review"},
     ]
     return pd.DataFrame(rows)
 
+
+
+def build_manual_family_mapping(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Sagatavo darba lapu ģimeņu/scenāriju manuālai sakārtošanai.
+    Galvenais mērķis: ātri pārskatīt Z_unclassified un tukšos/nekonsekventos issue_type,
+    nevis lasīt visas 900+ rindas.
+    """
+    if df.empty:
+        return pd.DataFrame()
+
+    work = df.copy()
+    # Primāri skatām neklasificētos un scenārija ziņā neskaidros.
+    mask = (
+        work["normalized_family"].fillna("").eq("Z_unclassified")
+        | work["normalized_scenario"].fillna("").str.contains("unclassified", case=False, na=False)
+        | work["issue_type"].fillna("").astype(str).str.strip().eq("")
+    )
+    work = work.loc[mask].copy()
+    if work.empty:
+        return pd.DataFrame(columns=[
+            "issue_type", "count", "current_families", "current_scenarios", "example_note_ids",
+            "example_target_text", "example_comment_text", "example_source_paths", "suggested_family",
+            "suggested_scenario", "mapping_status", "review_comment"
+        ])
+
+    def uniq_join(series, limit=8):
+        vals = []
+        for x in series.dropna().astype(str):
+            x = x.strip()
+            if x and x not in vals:
+                vals.append(x)
+            if len(vals) >= limit:
+                break
+        return ", ".join(vals)
+
+    def first_nonempty(series):
+        for x in series.dropna().astype(str):
+            x = x.strip()
+            if x:
+                return x
+        return ""
+
+    grouped = (
+        work.groupby("issue_type", dropna=False)
+        .agg(
+            count=("note_id", "count"),
+            current_families=("normalized_family", lambda s: uniq_join(s, 5)),
+            current_scenarios=("normalized_scenario", lambda s: uniq_join(s, 5)),
+            example_note_ids=("note_id", lambda s: uniq_join(s, 10)),
+            example_target_text=("target_text", first_nonempty),
+            example_comment_text=("comment_text", first_nonempty),
+            example_source_paths=("source_path", lambda s: uniq_join(s, 5)),
+        )
+        .reset_index()
+        .sort_values("count", ascending=False)
+    )
+
+    grouped["suggested_family"] = ""
+    grouped["suggested_scenario"] = ""
+    grouped["mapping_status"] = "needs_review"
+    grouped["review_comment"] = ""
+    return grouped
 
 def to_excel_bytes(sheets: Dict[str, pd.DataFrame]) -> bytes:
     output = io.BytesIO()
@@ -775,6 +850,7 @@ def main():
             scenario_catalog_df = build_scenario_catalog(examples_df)
             review_needed_df = build_review_needed(examples_df, quality_df)
             family_catalog_df = build_family_catalog()
+            manual_family_mapping_df = build_manual_family_mapping(examples_df)
 
             sheets = {
                 "1_examples_index": examples_df,
@@ -787,6 +863,7 @@ def main():
                 "8_quality_check": quality_df,
                 "9_review_needed": review_needed_df,
                 "10_file_catalog": file_catalog_df,
+                "11_manual_family_mapping": manual_family_mapping_df,
             }
             excel_bytes = to_excel_bytes(sheets)
 
@@ -796,6 +873,7 @@ def main():
             st.session_state.scenario_catalog_df = scenario_catalog_df
             st.session_state.review_needed_df = review_needed_df
             st.session_state.family_catalog_df = family_catalog_df
+            st.session_state.manual_family_mapping_df = manual_family_mapping_df
             st.session_state.excel_bytes = excel_bytes
 
             st.success(
@@ -816,6 +894,7 @@ def main():
     scenario_catalog_df: pd.DataFrame = st.session_state.scenario_catalog_df
     review_needed_df: pd.DataFrame = st.session_state.get("review_needed_df", pd.DataFrame())
     family_catalog_df: pd.DataFrame = st.session_state.get("family_catalog_df", pd.DataFrame())
+    manual_family_mapping_df: pd.DataFrame = st.session_state.get("manual_family_mapping_df", pd.DataFrame())
 
     st.header("2. Kopsavilkums")
     c1, c2, c3, c4, c5 = st.columns(5)
@@ -833,6 +912,11 @@ def main():
 
     st.subheader("Darba kļūdu ģimeņu katalogs")
     st.dataframe(family_catalog_df, use_container_width=True)
+
+    if not manual_family_mapping_df.empty:
+        st.subheader("Manuālās ģimeņu kartēšanas lapa")
+        st.caption("Šī lapa palīdz sakārtot Z_unclassified un tukšos issue_type. Aizpildi suggested_family / suggested_scenario eksportētajā Excelā.")
+        st.dataframe(manual_family_mapping_df, use_container_width=True)
 
     if not review_needed_df.empty:
         with st.expander("Pārskatāmās rindas klasifikācijas precizēšanai", expanded=True):
@@ -888,8 +972,9 @@ def main():
     )
 
     st.caption(
-        "Nākamais solis: pārskatīt 9_review_needed lapu, precizēt normalized_family / normalized_scenario un aizpildīt "
-        "scenario_catalog laukus: required_evidence, target_text_strategy, good_comment_pattern, do_not_report_when."
+        "Nākamais solis: pārskatīt 9_review_needed un 11_manual_family_mapping lapas. "
+        "11_manual_family_mapping palīdz ātri sakārtot Z_unclassified issue_type; pēc tam precizē 6_scenario_catalog laukus: "
+        "required_evidence, target_text_strategy, good_comment_pattern, do_not_report_when."
     )
 
 
