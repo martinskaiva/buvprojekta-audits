@@ -1,12 +1,13 @@
 # app_audit_examples_index.py
 # ------------------------------------------------------------
-# BP audit_examples indeksētājs v1.1
+# BP audit_examples indeksētājs v1.2
 #
 # Mērķis:
 # - nolasa 03_Memory/audit_examples mapē esošos 16 kolonnu audit_examples Excel failus;
 # - apvieno vienā indeksā;
 # - pārbauda struktūru un datu kvalitāti;
 # - automātiski piedāvā kļūdu ģimeni un scenāriju;
+# - izveido review_needed lapu klasifikācijas pārskatīšanai;
 # - ļauj lejupielādēt audit_examples_index.xlsx.
 #
 # Streamlit secrets piemērs:
@@ -44,7 +45,7 @@ from googleapiclient.errors import HttpError
 from googleapiclient.http import MediaIoBaseDownload
 
 
-APP_TITLE = "BP audit_examples indeksētājs v1.1"
+APP_TITLE = "BP audit_examples indeksētājs v1.2"
 SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
 
 REQUIRED_COLUMNS = [
@@ -298,15 +299,32 @@ def read_audit_examples_from_xlsx(file_bytes: bytes, source_item: DriveItem) -> 
 # -----------------------------
 
 def text_blob(row: pd.Series) -> str:
+    """
+    Klasifikācijai apzināti NEizmantojam note_id un target_file.
+    Iepriekšējā versijā gandrīz katrā target_file bija C2-03, tāpēc liela daļa
+    piezīmju kļūdaini iekrita dokumenta identitātes / projekta koda ģimenē.
+    Kļūdu ģimeni drīkst noteikt pēc piezīmes satura, nevis tikai pēc faila nosaukuma.
+    """
     fields = [
-        "note_id",
-        "target_file",
         "target_area",
         "target_text",
         "comment_text",
         "issue_type",
         "comparison_evidence",
         "comparison_files",
+        "comparison_pages",
+    ]
+    return " ".join(clean_string(row.get(f, "")) for f in fields).lower()
+
+
+def identity_blob(row: pd.Series) -> str:
+    """Šo izmantojam tikai dokumenta identitātes pazīmju pārbaudei."""
+    fields = [
+        "target_area",
+        "target_text",
+        "comment_text",
+        "issue_type",
+        "comparison_evidence",
         "comparison_pages",
     ]
     return " ".join(clean_string(row.get(f, "")) for f in fields).lower()
@@ -352,8 +370,16 @@ def infer_family_and_scenario(row: pd.Series) -> Tuple[str, str, str]:
         return "C_dates_versions", "SC-C01_date_or_revision_mismatch", "Datumu, versiju vai revīziju neatbilstība"
 
     # D. dokumenta identitāte
-    if any(k in s for k in ["faila nosauk", "titullauk", "rasējuma num", "drawing number", "sheet id", "c2-02", "c2-03", "document identity", "nosaukums"]):
-        if any(k in s for k in ["c2-02", "c2-03", "projekta kod", "project code"]):
+    # Piezīme: neklasificējam par D tikai tāpēc, ka target_file satur C2-03.
+    id_s = identity_blob(row)
+    has_identity_words = any(k in id_s for k in [
+        "faila nosauk", "titullauk", "titullapa", "rasējuma num", "drawing number",
+        "sheet id", "document number", "dokumenta num", "document identity",
+        "projekta kod", "project code", "veca projekta", "nepareizs projekts"
+    ])
+    has_project_code_context = any(k in id_s for k in ["c2-02", "c2-03", "projekta kod", "project code", "veca projekta"])
+    if has_identity_words:
+        if has_project_code_context:
             return "D_document_identity", "SC-D02_wrong_project_code", "Nepareizs projekta kods vai veca projekta atsauce"
         return "D_document_identity", "SC-D01_file_title_block_mismatch", "Faila, titullauka vai dokumenta identitātes neatbilstība"
 
@@ -445,6 +471,12 @@ def enrich_index(df: pd.DataFrame) -> pd.DataFrame:
     out["normalized_scenario"] = [x[1] for x in fams]
     out["scenario_label"] = [x[2] for x in fams]
 
+    # Kolonnas manuālai klasifikācijas labošanai eksportētajā indeksā.
+    out["review_status"] = ""
+    out["corrected_family"] = ""
+    out["corrected_scenario"] = ""
+    out["review_comment"] = ""
+
     out["has_manual_placement"] = out["target_text"].astype(str).str.contains("MANUAL_PLACEMENT_REQUIRED", case=False, na=False)
     out["has_exact_highlight"] = (
         out["markup_type"].astype(str).str.lower().eq("highlight")
@@ -523,6 +555,64 @@ def build_quality_check(df: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def build_review_needed(df: pd.DataFrame, quality_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Izveido rindu kopu, ko vajadzētu pārskatīt, pirms no piemēriem būvē scenāriju katalogu.
+    Šī nav datu kļūdu lapa vien. Tā palīdz ieraudzīt, kur automātiskā klasifikācija varētu būt pārāk rupja.
+    """
+    if df.empty:
+        return pd.DataFrame()
+
+    review_indices = set()
+    reasons: Dict[int, List[str]] = {}
+
+    def add_reason(idx: int, reason: str):
+        review_indices.add(idx)
+        reasons.setdefault(idx, []).append(reason)
+
+    for idx, row in df.iterrows():
+        fam = clean_string(row.get("normalized_family", ""))
+        scen = clean_string(row.get("normalized_scenario", ""))
+        tt = clean_string(row.get("target_text", ""))
+        mt = clean_string(row.get("markup_type", "")).lower()
+        pc = clean_string(row.get("placement_confidence", "")).lower()
+        blob = text_blob(row)
+
+        if fam == "Z_unclassified":
+            add_reason(idx, "unclassified")
+        if fam == "D_document_identity" and not any(k in blob for k in ["titullauk", "titullapa", "faila nosauk", "rasējuma num", "project code", "projekta kod", "c2-02"]):
+            add_reason(idx, "possible_overclassified_document_identity")
+        if mt == "highlight" and pc == "exact" and len(tt) <= 2:
+            add_reason(idx, "very_short_exact_target_text")
+        if "manual_placement_required" in tt.lower():
+            add_reason(idx, "manual_placement")
+        if scen.endswith("unclassified"):
+            add_reason(idx, "scenario_unclassified")
+
+    if quality_df is not None and not quality_df.empty:
+        for _, qrow in quality_df.iterrows():
+            try:
+                idx = int(qrow.get("row_index"))
+                add_reason(idx, "quality_check:" + clean_string(qrow.get("problems", "")))
+            except Exception:
+                continue
+
+    if not review_indices:
+        return pd.DataFrame()
+
+    cols = [
+        "note_id", "audit_examples_group", "audit_examples_subgroup", "discipline_final",
+        "document_role", "normalized_family", "normalized_scenario", "scenario_label",
+        "issue_type", "target_file", "target_page", "target_area", "target_text",
+        "comment_text", "comparison_evidence", "source_path",
+        "review_status", "corrected_family", "corrected_scenario", "review_comment",
+    ]
+    cols = [c for c in cols if c in df.columns]
+    out = df.loc[sorted(review_indices), cols].copy()
+    out.insert(0, "review_reason", ["; ".join(reasons.get(i, [])) for i in sorted(review_indices)])
+    return out
+
+
 def summary_count(df: pd.DataFrame, group_cols: List[str]) -> pd.DataFrame:
     if df.empty:
         return pd.DataFrame(columns=group_cols + ["count"])
@@ -558,6 +648,25 @@ def build_scenario_catalog(df: pd.DataFrame) -> pd.DataFrame:
     agg["do_not_report_when"] = ""
     agg["priority_for_api_v1"] = ""
     return agg
+
+
+def build_family_catalog() -> pd.DataFrame:
+    """Darba kļūdu ģimeņu katalogs, ko vēlāk lietos audit copilot."""
+    rows = [
+        {"family": "A_text_language", "meaning": "Teksta, gramatikas, formulējuma, tehniskā termina un mērvienību kļūdas", "api_v1_priority": "high"},
+        {"family": "B_lv_en", "meaning": "Latviešu un angļu teksta tehniskās vai skaitliskās neatbilstības", "api_v1_priority": "high"},
+        {"family": "C_dates_versions", "meaning": "Datumu, versiju, revīziju un aktualitātes neatbilstības", "api_v1_priority": "high"},
+        {"family": "D_document_identity", "meaning": "Faila nosaukuma, titullauka, rasējuma numura, projekta koda vai dokumenta identitātes problēmas", "api_v1_priority": "high"},
+        {"family": "E_drawing_list_references", "meaning": "Rasējumu sarakstu, savstarpējo atsauču un neesošu dokumentu problēmas", "api_v1_priority": "medium"},
+        {"family": "F_normative_references", "meaning": "Normatīvu, LBN, standartu un ārējo atsauču neatbilstības", "api_v1_priority": "medium"},
+        {"family": "G_material_type_model", "meaning": "Materiālu, tipu, marku, modeļu, diametru un tehnisko parametru neatbilstības", "api_v1_priority": "medium"},
+        {"family": "H_quantity_position", "meaning": "Daudzumu, pozīciju, numerācijas un tukšu/neskaidru pozīciju neatbilstības", "api_v1_priority": "medium"},
+        {"family": "I_specification_coverage", "meaning": "Risinājumi vai elementi nav iekļauti specifikācijā", "api_v1_priority": "later"},
+        {"family": "J_traceability", "meaning": "Izsekojamības problēmas starp SA, plāniem, profiliem, specifikācijām u.c.", "api_v1_priority": "later"},
+        {"family": "K_graphical_clarity", "meaning": "Grafiskās salasāmības, izvietojuma un piesaistes skaidrības problēmas", "api_v1_priority": "later"},
+        {"family": "Z_unclassified", "meaning": "Automātiski neklasificēts; jāpārskata", "api_v1_priority": "review"},
+    ]
+    return pd.DataFrame(rows)
 
 
 def to_excel_bytes(sheets: Dict[str, pd.DataFrame]) -> bytes:
@@ -664,6 +773,8 @@ def main():
             file_catalog_df = build_file_catalog(excel_items, metas)
             quality_df = build_quality_check(examples_df)
             scenario_catalog_df = build_scenario_catalog(examples_df)
+            review_needed_df = build_review_needed(examples_df, quality_df)
+            family_catalog_df = build_family_catalog()
 
             sheets = {
                 "1_examples_index": examples_df,
@@ -672,8 +783,10 @@ def main():
                 "4_document_role_summary": summary_count(examples_df, ["document_role", "normalized_family"]),
                 "5_discipline_summary": summary_count(examples_df, ["audit_examples_group", "audit_examples_subgroup", "discipline_final"]),
                 "6_scenario_catalog": scenario_catalog_df,
-                "7_quality_check": quality_df,
-                "8_file_catalog": file_catalog_df,
+                "7_family_catalog": family_catalog_df,
+                "8_quality_check": quality_df,
+                "9_review_needed": review_needed_df,
+                "10_file_catalog": file_catalog_df,
             }
             excel_bytes = to_excel_bytes(sheets)
 
@@ -681,6 +794,8 @@ def main():
             st.session_state.file_catalog_df = file_catalog_df
             st.session_state.quality_df = quality_df
             st.session_state.scenario_catalog_df = scenario_catalog_df
+            st.session_state.review_needed_df = review_needed_df
+            st.session_state.family_catalog_df = family_catalog_df
             st.session_state.excel_bytes = excel_bytes
 
             st.success(
@@ -699,6 +814,8 @@ def main():
     file_catalog_df: pd.DataFrame = st.session_state.file_catalog_df
     quality_df: pd.DataFrame = st.session_state.quality_df
     scenario_catalog_df: pd.DataFrame = st.session_state.scenario_catalog_df
+    review_needed_df: pd.DataFrame = st.session_state.get("review_needed_df", pd.DataFrame())
+    family_catalog_df: pd.DataFrame = st.session_state.get("family_catalog_df", pd.DataFrame())
 
     st.header("2. Kopsavilkums")
     c1, c2, c3, c4, c5 = st.columns(5)
@@ -706,13 +823,21 @@ def main():
     c2.metric("Excel faili", len(file_catalog_df))
     c3.metric("Kļūdu ģimenes", examples_df["normalized_family"].nunique() if not examples_df.empty else 0)
     c4.metric("Scenāriji", examples_df["normalized_scenario"].nunique() if not examples_df.empty else 0)
-    c5.metric("Kvalitātes problēmas", len(quality_df))
+    c5.metric("Pārskatāmās rindas", len(review_needed_df))
 
     st.subheader("Kļūdu ģimeņu kopsavilkums")
     st.dataframe(summary_count(examples_df, ["normalized_family", "scenario_label"]), use_container_width=True)
 
     st.subheader("Scenāriju katalogs kandidāts")
     st.dataframe(scenario_catalog_df, use_container_width=True)
+
+    st.subheader("Darba kļūdu ģimeņu katalogs")
+    st.dataframe(family_catalog_df, use_container_width=True)
+
+    if not review_needed_df.empty:
+        with st.expander("Pārskatāmās rindas klasifikācijas precizēšanai", expanded=True):
+            st.info("Šīs rindas nav obligāti kļūdainas. Tās ir rindas, kur automātiskā klasifikācija vai markup dati būtu jāpārskata pirms AI copilot būvēšanas.")
+            st.dataframe(review_needed_df, use_container_width=True)
 
     with st.expander("Piezīmju indekss", expanded=False):
         show_cols = [
@@ -763,7 +888,7 @@ def main():
     )
 
     st.caption(
-        "Nākamais solis: šo indeksu pārskatīt, precizēt normalized_family / normalized_scenario un aizpildīt "
+        "Nākamais solis: pārskatīt 9_review_needed lapu, precizēt normalized_family / normalized_scenario un aizpildīt "
         "scenario_catalog laukus: required_evidence, target_text_strategy, good_comment_pattern, do_not_report_when."
     )
 
