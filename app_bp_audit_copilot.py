@@ -34,7 +34,7 @@ except Exception:
     HttpError = Exception
 
 
-APP_VERSION = "v0.6.3.5"
+APP_VERSION = "v0.6.3.6"
 APP_TITLE = f"BP AI Audit Copilot {APP_VERSION}"
 
 REQUIRED_EXPORT_COLUMNS = [
@@ -1288,9 +1288,11 @@ def init_state():
         "pdf_pages": [],
         "candidates": [],
         "ai_errors": [],
-        "selected_folder_filter": "Visas mapes",
+        "selected_project_filter": "",
+        "selected_folder_filter": "Viss projekts",
         "pdf_search_value": "",
-        "applied_folder_filter": "Visas mapes",
+        "applied_project_filter": "",
+        "applied_folder_filter": "Viss projekts",
         "applied_pdf_search": "",
         "selected_pdf_ids_ui": [],
         "audit_run_id": "",
@@ -1438,16 +1440,27 @@ def main():
     if pdf_files:
         st.subheader("3. Izvēlies un nolasi auditējamos PDF")
         st.caption(
-            "Mapes filtrs tiek piemērots tikai pēc pogas nospiešanas. "
-            "Tas novērš smagu Streamlit pārzīmēšanu uzreiz pēc mapes izvēles."
+            "Vispirms izvēlies projekta mapi tieši zem 01_Input, pēc tam projekta "
+            "apakšmapi. Filtrs tiek piemērots tikai pēc pogas nospiešanas."
         )
 
         try:
-            def _pdf_folder(rel_path: str) -> str:
-                rel_path = clean_text(rel_path)
-                if "/" not in rel_path:
+            def _path_parts(rel_path: str) -> List[str]:
+                return [part for part in clean_text(rel_path).split("/") if part]
+
+            def _project_folder(rel_path: str) -> str:
+                parts = _path_parts(rel_path)
+                if len(parts) <= 1:
                     return "01_Input sakne"
-                return rel_path.rsplit("/", 1)[0]
+                return parts[0]
+
+            def _pdf_folder(rel_path: str) -> str:
+                parts = _path_parts(rel_path)
+                if len(parts) <= 1:
+                    return "01_Input sakne"
+                if len(parts) == 2:
+                    return parts[0]
+                return "/".join(parts[:-1])
 
             normalized_pdf_files: List[Dict[str, Any]] = []
             for raw in pdf_files:
@@ -1459,6 +1472,7 @@ def main():
                 if not rel_path or not file_id:
                     continue
                 item["rel_path"] = rel_path
+                item["project_path"] = _project_folder(rel_path)
                 item["folder_path"] = _pdf_folder(rel_path)
                 item["display_name"] = rel_path.rsplit("/", 1)[-1]
                 normalized_pdf_files.append(item)
@@ -1466,33 +1480,84 @@ def main():
             if not normalized_pdf_files:
                 st.warning("PDF sarakstā nav derīgu failu ierakstu.")
             else:
-                folders = sorted({
-                    clean_text(f.get("folder_path")) or "01_Input sakne"
+                project_options = sorted({
+                    clean_text(f.get("project_path")) or "01_Input sakne"
                     for f in normalized_pdf_files
                 })
+                project_counts = {
+                    project: sum(
+                        1 for f in normalized_pdf_files
+                        if clean_text(f.get("project_path")) == project
+                    )
+                    for project in project_options
+                }
+
+                current_project = clean_text(
+                    st.session_state.get("selected_project_filter")
+                )
+                if current_project not in project_options:
+                    current_project = project_options[0]
+                    st.session_state.selected_project_filter = current_project
+
+                project_files_for_options = [
+                    f for f in normalized_pdf_files
+                    if clean_text(f.get("project_path")) == current_project
+                ]
+                project_folder_paths = sorted({
+                    clean_text(f.get("folder_path"))
+                    for f in project_files_for_options
+                    if clean_text(f.get("folder_path"))
+                })
+                folder_options = ["Viss projekts"] + project_folder_paths
                 folder_counts = {
                     folder: sum(
-                        1 for f in normalized_pdf_files
+                        1 for f in project_files_for_options
                         if clean_text(f.get("folder_path")) == folder
                     )
-                    for folder in folders
+                    for folder in project_folder_paths
                 }
-                folder_options = ["Visas mapes"] + folders
 
                 current_folder = st.session_state.get(
-                    "selected_folder_filter", "Visas mapes"
+                    "selected_folder_filter", "Viss projekts"
                 )
                 if current_folder not in folder_options:
-                    st.session_state.selected_folder_filter = "Visas mapes"
+                    st.session_state.selected_folder_filter = "Viss projekts"
 
                 with st.form("pdf_folder_filter_form", clear_on_submit=False):
+                    project_value = st.selectbox(
+                        "Auditējamā projekta mape 01_Input mapē",
+                        options=project_options,
+                        format_func=lambda x: f"{x} ({project_counts.get(x, 0)} PDF)",
+                        key="selected_project_filter",
+                    )
+
+                    selected_project_files = [
+                        f for f in normalized_pdf_files
+                        if clean_text(f.get("project_path")) == project_value
+                    ]
+                    selected_project_folders = sorted({
+                        clean_text(f.get("folder_path"))
+                        for f in selected_project_files
+                        if clean_text(f.get("folder_path"))
+                    })
+                    dynamic_folder_options = ["Viss projekts"] + selected_project_folders
+                    dynamic_folder_counts = {
+                        folder: sum(
+                            1 for f in selected_project_files
+                            if clean_text(f.get("folder_path")) == folder
+                        )
+                        for folder in selected_project_folders
+                    }
+                    if st.session_state.get("selected_folder_filter") not in dynamic_folder_options:
+                        st.session_state.selected_folder_filter = "Viss projekts"
+
                     folder_value = st.selectbox(
-                        "Pārbaudāmā mape",
-                        options=folder_options,
+                        "Apakšmape projektā",
+                        options=dynamic_folder_options,
                         format_func=lambda x: (
-                            "Visas mapes"
-                            if x == "Visas mapes"
-                            else f"{x} ({folder_counts.get(x, 0)})"
+                            f"Viss projekts ({len(selected_project_files)} PDF)"
+                            if x == "Viss projekts"
+                            else f"{x} ({dynamic_folder_counts.get(x, 0)})"
                         ),
                         key="selected_folder_filter",
                     )
@@ -1505,20 +1570,37 @@ def main():
                     filter_btn_col, _ = st.columns([1, 4])
                     with filter_btn_col:
                         apply_filter_clicked = st.form_submit_button(
-                            "Parādīt mapes PDF",
+                            "Parādīt izvēlētās mapes PDF",
                             use_container_width=True,
                         )
 
                 if apply_filter_clicked:
+                    st.session_state.applied_project_filter = project_value
                     st.session_state.applied_folder_filter = folder_value
                     st.session_state.applied_pdf_search = clean_text(search_value)
                     st.session_state.selected_pdf_ids_ui = []
 
-                applied_folder = st.session_state.get(
-                    "applied_folder_filter", "Visas mapes"
+                applied_project = clean_text(
+                    st.session_state.get("applied_project_filter")
                 )
-                if applied_folder not in folder_options:
-                    applied_folder = "Visas mapes"
+                if applied_project not in project_options:
+                    applied_project = current_project
+                    st.session_state.applied_project_filter = applied_project
+
+                applied_project_files = [
+                    f for f in normalized_pdf_files
+                    if clean_text(f.get("project_path")) == applied_project
+                ]
+                valid_applied_folders = ["Viss projekts"] + sorted({
+                    clean_text(f.get("folder_path"))
+                    for f in applied_project_files
+                    if clean_text(f.get("folder_path"))
+                })
+                applied_folder = st.session_state.get(
+                    "applied_folder_filter", "Viss projekts"
+                )
+                if applied_folder not in valid_applied_folders:
+                    applied_folder = "Viss projekts"
                     st.session_state.applied_folder_filter = applied_folder
 
                 applied_search = clean_text(
@@ -1526,8 +1608,8 @@ def main():
                 )
                 search_norm = applied_search.lower()
 
-                filtered_pdf_files = normalized_pdf_files
-                if applied_folder != "Visas mapes":
+                filtered_pdf_files = applied_project_files
+                if applied_folder != "Viss projekts":
                     filtered_pdf_files = [
                         f for f in filtered_pdf_files
                         if clean_text(f.get("folder_path")) == applied_folder
@@ -1538,24 +1620,25 @@ def main():
                         if search_norm in clean_text(f.get("rel_path")).lower()
                     ]
 
-                st.caption(
-                    f"Aktīvais filtrs: {applied_folder}"
-                    + (f" | Meklējums: {applied_search}" if applied_search else "")
-                )
+                active_filter_text = f"Projekts: {applied_project} | Mape: {applied_folder}"
+                if applied_search:
+                    active_filter_text += f" | Meklējums: {applied_search}"
+                st.caption(f"Aktīvais filtrs: {active_filter_text}")
                 st.caption(
                     f"Atrasti PDF izvēlē: {len(filtered_pdf_files)} "
-                    f"no {len(normalized_pdf_files)}"
+                    f"no {len(applied_project_files)} projekta PDF"
                 )
 
                 if not filtered_pdf_files:
-                    st.warning("Šajā mapē vai meklējumā PDF faili nav atrasti.")
+                    st.warning("Šajā projekta mapē vai meklējumā PDF faili nav atrasti.")
                 else:
                     max_selectable = 50
                     shown_pdf_files = filtered_pdf_files[:max_selectable]
                     if len(filtered_pdf_files) > max_selectable:
                         st.warning(
                             f"Izvēlei parādīti pirmie {max_selectable} no "
-                            f"{len(filtered_pdf_files)} PDF. Izmanto meklēšanu, lai sašaurinātu sarakstu."
+                            f"{len(filtered_pdf_files)} PDF. Izmanto apakšmapi vai meklēšanu, "
+                            "lai sašaurinātu sarakstu."
                         )
 
                     by_id = {clean_text(f.get("id")): f for f in shown_pdf_files}
@@ -1566,7 +1649,7 @@ def main():
                     ]
 
                     selection_signature = hashlib.sha1(
-                        f"{applied_folder}|{applied_search}".encode("utf-8")
+                        f"{applied_project}|{applied_folder}|{applied_search}".encode("utf-8")
                     ).hexdigest()[:10]
                     with st.form(f"pdf_file_selection_form_{selection_signature}", clear_on_submit=False):
                         st.markdown("**Atzīmē auditējamos PDF:**")
@@ -1705,7 +1788,7 @@ def main():
 
         except Exception as e:
             st.error(
-                "PDF mapes vai failu izvēles bloku neizdevās attēlot. "
+                "PDF projekta, mapes vai failu izvēles bloku neizdevās attēlot. "
                 "Lietotne turpina darboties."
             )
             st.code(str(e))
