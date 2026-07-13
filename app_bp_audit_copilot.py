@@ -1,6 +1,7 @@
 import io
 import os
 import re
+import hashlib
 import json
 import time
 import zipfile
@@ -33,7 +34,7 @@ except Exception:
     HttpError = Exception
 
 
-APP_VERSION = "v0.6.3.2"
+APP_VERSION = "v0.6.3.3"
 APP_TITLE = f"BP AI Audit Copilot {APP_VERSION}"
 
 REQUIRED_EXPORT_COLUMNS = [
@@ -1041,6 +1042,8 @@ def init_state():
         "pdf_pages": [],
         "candidates": [],
         "ai_errors": [],
+        "selected_folder_filter": "Visas mapes",
+        "pdf_search_value": "",
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -1085,11 +1088,15 @@ def main():
     st.header("1. Zināšanu bāzes nolasīšana")
     st.caption("Vispirms nolasi audit_examples_index un negatīvo atmiņu. Bez indeksa AI analīzi nevar sākt.")
 
-    if st.button(
-        "Nolasīt audit_examples_index un feedback",
-        type="primary",
-        use_container_width=True,
-    ):
+    kb_btn_col, _ = st.columns([1, 4])
+    with kb_btn_col:
+        read_kb_clicked = st.button(
+            "Nolasīt zināšanu bāzi",
+            type="primary",
+            use_container_width=True,
+        )
+
+    if read_kb_clicked:
         if not memory_folder_id.strip():
             st.error("Nav norādīts 03_Memory folder ID.")
         else:
@@ -1097,7 +1104,6 @@ def main():
                 with st.spinner("Nolasu audit_examples_index..."):
                     df, index_file, index_messages = load_audit_examples_index(service, memory_folder_id.strip())
 
-                # Saglabājam indeksu tikai pēc kontrolētas nolasīšanas.
                 st.session_state.index_df = df
                 st.session_state.index_file = index_file
 
@@ -1119,7 +1125,6 @@ def main():
                 else:
                     st.error("Indekss nav nolasīts. PDF failu solis paliek bloķēts.")
             except Exception as e:
-                # Pēdējais drošības slānis, lai Streamlit nerādītu tikai vispārīgo “Oh no”.
                 st.session_state.index_df = pd.DataFrame()
                 st.session_state.index_file = None
                 st.session_state.feedback_df = pd.DataFrame()
@@ -1142,23 +1147,29 @@ def main():
     if not index_ready:
         st.caption("Vispirms pabeidz 1. soli — nolasi audit_examples_index.")
 
-    if st.button(
-        "Nolasīt PDF failus no 01_Input",
-        disabled=not index_ready,
-        use_container_width=True,
-    ):
+    pdf_list_btn_col, _ = st.columns([1, 4])
+    with pdf_list_btn_col:
+        read_pdf_list_clicked = st.button(
+            "Nolasīt PDF sarakstu",
+            disabled=not index_ready,
+            use_container_width=True,
+        )
+
+    if read_pdf_list_clicked:
         if not input_folder_id.strip():
             st.error("Nav norādīts 01_Input folder ID.")
         else:
             try:
                 with st.spinner("Nolasu PDF failu sarakstu..."):
-                    st.session_state.pdf_files = drive_list_recursive(
+                    listed_files = drive_list_recursive(
                         service,
                         input_folder_id.strip(),
                         (".pdf",),
                         prefix="",
                         max_files=1000,
                     )
+                # Saglabā tikai vienkāršas kopijas. UI nedrīkst mainīt Drive rezultātu objektus uz vietas.
+                st.session_state.pdf_files = [dict(item) for item in listed_files if isinstance(item, dict)]
                 st.success(f"Atrasti PDF faili: {len(st.session_state.pdf_files)}")
                 if len(st.session_state.pdf_files) == 0:
                     st.warning("01_Input mapē vai tās apakšmapēs netika atrasts neviens PDF. Pārbaudi folder ID un service account piekļuvi.")
@@ -1176,118 +1187,168 @@ def main():
     pdf_files = st.session_state.pdf_files
     if pdf_files:
         st.subheader("3. Izvēlies un nolasi auditējamos PDF")
-        st.caption("PDF faili tiek rādīti pa 01_Input apakšmapēm. Var atzīmēt vairākus failus; izvēle ir vertikālā sarakstā, lai redzams pilns nosaukums.")
+        st.caption("Vispirms izvēlies mapi, pēc tam atzīmē auditējamos PDF. Vienā reizē tiek parādīts ierobežots failu skaits, lai Streamlit nepārslogotu pārzīmēšanu.")
 
-        def _pdf_folder(rel_path: str) -> str:
-            rel_path = clean_text(rel_path)
-            if "/" not in rel_path:
-                return "01_Input sakne"
-            return rel_path.rsplit("/", 1)[0]
+        try:
+            def _pdf_folder(rel_path: str) -> str:
+                rel_path = clean_text(rel_path)
+                if "/" not in rel_path:
+                    return "01_Input sakne"
+                return rel_path.rsplit("/", 1)[0]
 
-        def _pdf_name(rel_path: str) -> str:
-            rel_path = clean_text(rel_path)
-            return rel_path.rsplit("/", 1)[-1]
+            normalized_pdf_files: List[Dict[str, Any]] = []
+            for raw in pdf_files:
+                if not isinstance(raw, dict):
+                    continue
+                item = dict(raw)
+                rel_path = clean_text(item.get("rel_path") or item.get("name"))
+                file_id = clean_text(item.get("id"))
+                if not rel_path or not file_id:
+                    continue
+                item["rel_path"] = rel_path
+                item["folder_path"] = _pdf_folder(rel_path)
+                item["display_name"] = rel_path.rsplit("/", 1)[-1]
+                normalized_pdf_files.append(item)
 
-        for f in pdf_files:
-            f["folder_path"] = _pdf_folder(f.get("rel_path", f.get("name", "")))
-            f["display_name"] = _pdf_name(f.get("rel_path", f.get("name", "")))
+            if not normalized_pdf_files:
+                st.warning("PDF sarakstā nav derīgu failu ierakstu.")
+            else:
+                folders = sorted({clean_text(f.get("folder_path")) or "01_Input sakne" for f in normalized_pdf_files})
+                folder_counts = {
+                    folder: sum(1 for f in normalized_pdf_files if clean_text(f.get("folder_path")) == folder)
+                    for folder in folders
+                }
+                folder_options = ["Visas mapes"] + folders
+                current_folder = st.session_state.get("selected_folder_filter", "Visas mapes")
+                if current_folder not in folder_options:
+                    current_folder = "Visas mapes"
 
-        folders = sorted(set(f.get("folder_path", "01_Input sakne") for f in pdf_files))
-        folder_counts = {folder: sum(1 for f in pdf_files if f.get("folder_path") == folder) for folder in folders}
-        folder_options = ["Visas mapes"] + [f"{folder} ({folder_counts.get(folder, 0)})" for folder in folders]
-        folder_value = st.selectbox("Mape", options=folder_options, index=0)
+                folder_value = st.selectbox(
+                    "Pārbaudāmā mape",
+                    options=folder_options,
+                    index=folder_options.index(current_folder),
+                    format_func=lambda x: "Visas mapes" if x == "Visas mapes" else f"{x} ({folder_counts.get(x, 0)})",
+                    key="selected_folder_filter",
+                )
 
-        selected_folder = None
-        if folder_value != "Visas mapes":
-            selected_folder = folder_value.rsplit(" (", 1)[0]
+                search_value = st.text_input(
+                    "Meklēt PDF pēc nosaukuma vai ceļa",
+                    value=st.session_state.get("pdf_search_value", ""),
+                    placeholder="piem., GENERAL DATA, UKT, RA_11100",
+                    key="pdf_search_value",
+                )
+                search_norm = clean_text(search_value).lower()
 
-        search_value = st.text_input("Meklēt PDF pēc nosaukuma vai ceļa", value="", placeholder="piem., GENERAL DATA, UKT, RA_11100")
-        search_norm = clean_text(search_value).lower()
+                filtered_pdf_files = normalized_pdf_files
+                if folder_value != "Visas mapes":
+                    filtered_pdf_files = [f for f in filtered_pdf_files if clean_text(f.get("folder_path")) == folder_value]
+                if search_norm:
+                    filtered_pdf_files = [
+                        f for f in filtered_pdf_files
+                        if search_norm in clean_text(f.get("rel_path")).lower()
+                    ]
 
-        filtered_pdf_files = pdf_files
-        if selected_folder:
-            filtered_pdf_files = [f for f in filtered_pdf_files if f.get("folder_path") == selected_folder]
-        if search_norm:
-            filtered_pdf_files = [
-                f for f in filtered_pdf_files
-                if search_norm in clean_text(f.get("rel_path", f.get("name", ""))).lower()
-            ]
+                st.caption(f"Atrasti PDF izvēlē: {len(filtered_pdf_files)} no {len(normalized_pdf_files)}")
 
-        st.caption(f"Atrasti PDF izvēlē: {len(filtered_pdf_files)} no {len(pdf_files)}")
+                if not filtered_pdf_files:
+                    st.warning("Šajā mapē vai meklējumā PDF faili nav atrasti.")
+                else:
+                    max_visible = 100
+                    shown_pdf_files = filtered_pdf_files[:max_visible]
+                    if len(filtered_pdf_files) > max_visible:
+                        st.warning(
+                            f"Parādīti pirmie {max_visible} no {len(filtered_pdf_files)} PDF. "
+                            "Izvēlies konkrētāku mapi vai izmanto meklēšanu."
+                        )
 
-        if not filtered_pdf_files:
-            st.warning("Šajā mapē / meklējumā PDF faili nav atrasti.")
-        else:
-            select_all_visible = st.checkbox("Atzīmēt visus redzamos PDF", value=False, key="select_all_visible_pdfs")
-            max_visible = 250
-            if len(filtered_pdf_files) > max_visible:
-                st.warning(f"Redzami pirmie {max_visible} no {len(filtered_pdf_files)} PDF. Sašaurini meklējumu, lai izvēle būtu pārskatāma.")
-            shown_pdf_files = filtered_pdf_files[:max_visible]
+                    controls_col, _ = st.columns([1, 4])
+                    with controls_col:
+                        select_all_visible = st.checkbox(
+                            "Atzīmēt visus redzamos",
+                            value=False,
+                            key=f"select_all_{hashlib.sha1((folder_value + search_norm).encode('utf-8')).hexdigest()[:10]}",
+                        )
 
-            st.markdown("**Atzīmē auditējamos PDF:**")
-            selected_pdf_ids: List[str] = []
-            for f in shown_pdf_files:
-                rel = clean_text(f.get("rel_path", f.get("name", "")))
-                key = f"pdf_pick_{f.get('id')}"
-                default_val = bool(select_all_visible)
-                checked = st.checkbox(rel, value=default_val, key=key)
-                if checked:
-                    selected_pdf_ids.append(f.get("id"))
+                    st.markdown("**Atzīmē auditējamos PDF:**")
+                    selected_pdf_ids: List[str] = []
+                    for f in shown_pdf_files:
+                        rel = clean_text(f.get("rel_path"))
+                        file_id = clean_text(f.get("id"))
+                        stable = hashlib.sha1(f"{file_id}|{rel}".encode("utf-8")).hexdigest()[:16]
+                        key = f"pdf_pick_{stable}"
+                        if select_all_visible and key not in st.session_state:
+                            st.session_state[key] = True
+                        checked = st.checkbox(rel, key=key)
+                        if checked:
+                            selected_pdf_ids.append(file_id)
 
-            selected_pdf_files = [f for f in shown_pdf_files if f.get("id") in set(selected_pdf_ids)]
-            st.caption(f"Atzīmēti PDF: {len(selected_pdf_files)}")
+                    selected_id_set = set(selected_pdf_ids)
+                    selected_pdf_files = [f for f in shown_pdf_files if clean_text(f.get("id")) in selected_id_set]
+                    st.caption(f"Atzīmēti PDF: {len(selected_pdf_files)}")
 
-            if selected_pdf_files:
-                with st.expander("Izvēlētie PDF ceļi", expanded=True):
-                    for f in selected_pdf_files:
-                        st.write(f.get("rel_path", f.get("name", "")))
+                    if selected_pdf_files:
+                        with st.expander("Izvēlētie PDF ceļi", expanded=True):
+                            for f in selected_pdf_files:
+                                st.write(clean_text(f.get("rel_path")))
 
-                if st.button("Nolasīt izvēlēto PDF saturu", type="primary", use_container_width=True):
-                    loaded_items: List[Dict[str, Any]] = []
-                    errors: List[str] = []
-                    progress = st.progress(0)
-                    status = st.empty()
-                    for i, selected_pdf in enumerate(selected_pdf_files, start=1):
-                        try:
-                            status.write(f"Nolasu {i}/{len(selected_pdf_files)}: {selected_pdf.get('name')}")
-                            pdf_bytes = drive_download_bytes(service, selected_pdf["id"])
-                            text, pages, err = extract_pdf_text(pdf_bytes, max_context_chars)
-                            if err:
-                                errors.append(f"{selected_pdf.get('rel_path', selected_pdf.get('name'))}: {err}")
+                        read_content_col, _ = st.columns([1, 4])
+                        with read_content_col:
+                            read_selected_clicked = st.button(
+                                "Nolasīt izvēlēto PDF saturu",
+                                type="primary",
+                                use_container_width=True,
+                            )
+
+                        if read_selected_clicked:
+                            loaded_items: List[Dict[str, Any]] = []
+                            errors: List[str] = []
+                            progress = st.progress(0)
+                            status = st.empty()
+                            for i, selected_pdf in enumerate(selected_pdf_files, start=1):
+                                try:
+                                    status.write(f"Nolasu {i}/{len(selected_pdf_files)}: {selected_pdf.get('name')}")
+                                    pdf_bytes = drive_download_bytes(service, selected_pdf["id"])
+                                    text, pages, err = extract_pdf_text(pdf_bytes, max_context_chars)
+                                    if err:
+                                        errors.append(f"{selected_pdf.get('rel_path', selected_pdf.get('name'))}: {err}")
+                                    else:
+                                        loaded_items.append({
+                                            "id": selected_pdf.get("id"),
+                                            "name": selected_pdf.get("name", "audit.pdf"),
+                                            "rel_path": selected_pdf.get("rel_path", selected_pdf.get("name", "audit.pdf")),
+                                            "bytes": pdf_bytes,
+                                            "text": text,
+                                            "pages": pages,
+                                        })
+                                except Exception as e:
+                                    errors.append(f"{selected_pdf.get('rel_path', selected_pdf.get('name'))}: {e}")
+                                progress.progress(i / max(1, len(selected_pdf_files)))
+                            status.write("PDF nolasīšana pabeigta.")
+
+                            st.session_state.selected_pdf_items = loaded_items
+                            if loaded_items:
+                                first = loaded_items[0]
+                                st.session_state.selected_pdf_bytes = first.get("bytes")
+                                st.session_state.selected_pdf_name = first.get("name", "audit.pdf")
+                                st.session_state.selected_pdf_rel_path = first.get("rel_path", first.get("name", "audit.pdf"))
+                                st.session_state.pdf_text = "\n\n".join(
+                                    [f"===== PDF: {it.get('rel_path')} =====\n{it.get('text', '')}" for it in loaded_items]
+                                )[:max_context_chars * max(1, len(loaded_items))]
+                                st.session_state.pdf_pages = first.get("pages", [])
+                                st.success(f"Nolasīti PDF: {len(loaded_items)} | kopā teksts priekšskatījumam: {len(st.session_state.pdf_text)} zīmes")
                             else:
-                                loaded_items.append({
-                                    "id": selected_pdf.get("id"),
-                                    "name": selected_pdf.get("name", "audit.pdf"),
-                                    "rel_path": selected_pdf.get("rel_path", selected_pdf.get("name", "audit.pdf")),
-                                    "bytes": pdf_bytes,
-                                    "text": text,
-                                    "pages": pages,
-                                })
-                        except Exception as e:
-                            errors.append(f"{selected_pdf.get('rel_path', selected_pdf.get('name'))}: {e}")
-                        progress.progress(i / max(1, len(selected_pdf_files)))
-                    status.write("PDF nolasīšana pabeigta.")
-
-                    st.session_state.selected_pdf_items = loaded_items
-                    if loaded_items:
-                        # Backward-compatible fields keep the first PDF for preview labels.
-                        first = loaded_items[0]
-                        st.session_state.selected_pdf_bytes = first.get("bytes")
-                        st.session_state.selected_pdf_name = first.get("name", "audit.pdf")
-                        st.session_state.selected_pdf_rel_path = first.get("rel_path", first.get("name", "audit.pdf"))
-                        st.session_state.pdf_text = "\n\n".join(
-                            [f"===== PDF: {it.get('rel_path')} =====\n{it.get('text', '')}" for it in loaded_items]
-                        )[:max_context_chars * max(1, len(loaded_items))]
-                        st.session_state.pdf_pages = first.get("pages", [])
-                        st.success(f"Nolasīti PDF: {len(loaded_items)} | kopā teksts priekšskatījumam: {len(st.session_state.pdf_text)} zīmes")
-                    else:
-                        st.session_state.selected_pdf_items = []
-                        st.session_state.pdf_text = ""
-                        st.error("Neizdevās nolasīt nevienu izvēlēto PDF.")
-                    if errors:
-                        with st.expander("PDF nolasīšanas kļūdas"):
-                            for e in errors:
-                                st.warning(e)
+                                st.session_state.selected_pdf_items = []
+                                st.session_state.pdf_text = ""
+                                st.error("Neizdevās nolasīt nevienu izvēlēto PDF.")
+                            if errors:
+                                with st.expander("PDF nolasīšanas kļūdas"):
+                                    for e in errors:
+                                        st.warning(e)
+        except Exception as e:
+            st.error("PDF mapes vai failu izvēles bloku neizdevās attēlot. Lietotne turpina darboties.")
+            st.code(str(e))
+            with st.expander("Pilns tehniskais traceback"):
+                st.code(traceback.format_exc())
     if st.session_state.pdf_text:
         with st.expander("PDF teksta priekšskatījums"):
             st.text_area("PDF teksts", value=st.session_state.pdf_text[:10000], height=300)
