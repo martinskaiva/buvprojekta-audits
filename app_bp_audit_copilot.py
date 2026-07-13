@@ -34,7 +34,7 @@ except Exception:
     HttpError = Exception
 
 
-APP_VERSION = "v0.6.3.6"
+APP_VERSION = "v0.6.3.7"
 APP_TITLE = f"BP AI Audit Copilot {APP_VERSION}"
 
 REQUIRED_EXPORT_COLUMNS = [
@@ -256,6 +256,62 @@ def drive_list_children(service, folder_id: str, mime_filter: Optional[str] = No
         if not page_token:
             break
     return files
+
+
+def drive_get_file_metadata(service, file_id: str) -> Dict[str, Any]:
+    """Nolasa Drive faila/mapes pamata metadatus, ieskaitot vecākmapes."""
+    return service.files().get(
+        fileId=file_id,
+        fields="id,name,mimeType,parents,modifiedTime",
+        supportsAllDrives=True,
+    ).execute()
+
+
+def resolve_input_root(service, configured_folder_id: str, wanted_name: str = "01_Input") -> Dict[str, Any]:
+    """Atrod īsto 01_Input mapi arī tad, ja secrets norāda uz tās apakšmapi.
+
+    Meklē no konfigurētās mapes uz augšu pa pirmo vecākmapju ķēdi.
+    Ja 01_Input netiek atrasta, izmanto konfigurēto mapi un atgriež brīdinājumu.
+    """
+    current_id = clean_text(configured_folder_id)
+    visited = set()
+    chain: List[Dict[str, Any]] = []
+
+    while current_id and current_id not in visited and len(chain) < 20:
+        visited.add(current_id)
+        meta = drive_get_file_metadata(service, current_id)
+        chain.append(meta)
+
+        if clean_text(meta.get("name")).lower() == wanted_name.lower():
+            return {
+                "id": clean_text(meta.get("id")),
+                "name": clean_text(meta.get("name")),
+                "resolved": True,
+                "configured_id": clean_text(configured_folder_id),
+                "chain": chain,
+                "warning": "",
+            }
+
+        parents = meta.get("parents") or []
+        if not parents:
+            break
+        current_id = clean_text(parents[0])
+
+    fallback = chain[0] if chain else {
+        "id": clean_text(configured_folder_id),
+        "name": "",
+    }
+    return {
+        "id": clean_text(fallback.get("id")) or clean_text(configured_folder_id),
+        "name": clean_text(fallback.get("name")) or "Konfigurētā mape",
+        "resolved": False,
+        "configured_id": clean_text(configured_folder_id),
+        "chain": chain,
+        "warning": (
+            f"Neizdevās atrast vecākmapi ar nosaukumu {wanted_name}. "
+            "Tiek izmantota konfigurētā mape."
+        ),
+    }
 
 
 def drive_find_child_folder(service, parent_id: str, folder_name: str) -> Optional[Dict[str, Any]]:
@@ -1295,6 +1351,8 @@ def init_state():
         "applied_folder_filter": "Viss projekts",
         "applied_pdf_search": "",
         "selected_pdf_ids_ui": [],
+        "input_root_info": None,
+        "project_folders": [],
         "audit_run_id": "",
     }
     for k, v in defaults.items():
@@ -1412,17 +1470,50 @@ def main():
             st.error("Nav norādīts 01_Input folder ID.")
         else:
             try:
-                with st.spinner("Nolasu PDF failu sarakstu..."):
-                    listed_files = drive_list_recursive(
+                with st.spinner("Atrodu 01_Input saknes mapi..."):
+                    input_root_info = resolve_input_root(
                         service,
                         input_folder_id.strip(),
+                        wanted_name="01_Input",
+                    )
+                    input_root_id = clean_text(input_root_info.get("id"))
+
+                with st.spinner("Nolasu projektu mapes un PDF failu sarakstu..."):
+                    project_folders = drive_list_children(
+                        service,
+                        input_root_id,
+                        "application/vnd.google-apps.folder",
+                    )
+                    listed_files = drive_list_recursive(
+                        service,
+                        input_root_id,
                         (".pdf",),
                         prefix="",
-                        max_files=1000,
+                        max_files=5000,
                     )
+
+                st.session_state.input_root_info = input_root_info
+                st.session_state.project_folders = [
+                    dict(item) for item in project_folders if isinstance(item, dict)
+                ]
                 # Saglabā tikai vienkāršas kopijas. UI nedrīkst mainīt Drive rezultātu objektus uz vietas.
-                st.session_state.pdf_files = [dict(item) for item in listed_files if isinstance(item, dict)]
-                st.success(f"Atrasti PDF faili: {len(st.session_state.pdf_files)}")
+                st.session_state.pdf_files = [
+                    dict(item) for item in listed_files if isinstance(item, dict)
+                ]
+
+                root_name = clean_text(input_root_info.get("name"))
+                resolved_note = (
+                    f"01_Input atrasta automātiski: {root_name}"
+                    if input_root_info.get("resolved")
+                    else f"Izmantota konfigurētā mape: {root_name}"
+                )
+                st.success(
+                    f"{resolved_note}. Projektu mapes: "
+                    f"{len(st.session_state.project_folders)}; "
+                    f"PDF faili: {len(st.session_state.pdf_files)}"
+                )
+                if input_root_info.get("warning"):
+                    st.warning(clean_text(input_root_info.get("warning")))
                 if len(st.session_state.pdf_files) == 0:
                     st.warning("01_Input mapē vai tās apakšmapēs netika atrasts neviens PDF. Pārbaudi folder ID un service account piekļuvi.")
                 if st.session_state.get("drive_list_warnings"):
@@ -1436,12 +1527,29 @@ def main():
                 with st.expander("Pilns tehniskais traceback"):
                     st.code(traceback.format_exc())
 
+    input_root_info = st.session_state.get("input_root_info")
+    if input_root_info:
+        root_chain = input_root_info.get("chain") or []
+        configured_name = clean_text(root_chain[0].get("name")) if root_chain else ""
+        root_name = clean_text(input_root_info.get("name"))
+        if input_root_info.get("resolved"):
+            st.info(
+                f"PDF nolasīšanas sakne: {root_name}. "
+                f"Konfigurētā mape: {configured_name or 'nav zināma'}."
+            )
+        else:
+            st.warning(
+                f"PDF nolasīšanas sakne nav apstiprināta kā 01_Input; "
+                f"tiek izmantota: {root_name}."
+            )
+
     pdf_files = st.session_state.pdf_files
-    if pdf_files:
+    if pdf_files or st.session_state.get("project_folders"):
         st.subheader("3. Izvēlies un nolasi auditējamos PDF")
         st.caption(
-            "Vispirms izvēlies projekta mapi tieši zem 01_Input, pēc tam projekta "
-            "apakšmapi. Filtrs tiek piemērots tikai pēc pogas nospiešanas."
+            "Vispirms izvēlies reālu projekta mapi tieši zem 01_Input, pēc tam "
+            "projekta apakšmapi. Arī tukšas projekta mapes tiek parādītas. "
+            "Filtrs tiek piemērots tikai pēc pogas nospiešanas."
         )
 
         try:
@@ -1477,13 +1585,37 @@ def main():
                 item["display_name"] = rel_path.rsplit("/", 1)[-1]
                 normalized_pdf_files.append(item)
 
-            if not normalized_pdf_files:
-                st.warning("PDF sarakstā nav derīgu failu ierakstu.")
+            if not normalized_pdf_files and not st.session_state.get("project_folders"):
+                st.warning("PDF sarakstā nav derīgu failu ierakstu un nav projektu mapju.")
             else:
+                # Projektu izvēle tiek veidota no reālajām mapēm tieši zem
+                # 01_Input, nevis secināta tikai no PDF ceļiem. Tādēļ redzamas
+                # arī tukšas jaunizveidotas projekta mapes.
+                actual_project_folders = [
+                    dict(item)
+                    for item in st.session_state.get("project_folders", [])
+                    if isinstance(item, dict)
+                    and clean_text(item.get("name"))
+                ]
                 project_options = sorted({
-                    clean_text(f.get("project_path")) or "01_Input sakne"
-                    for f in normalized_pdf_files
+                    clean_text(item.get("name"))
+                    for item in actual_project_folders
+                    if clean_text(item.get("name"))
                 })
+
+                # Ja 01_Input saknē ir PDF bez projekta mapes, saglabā atsevišķu opciju.
+                if any(
+                    clean_text(f.get("project_path")) == "01_Input sakne"
+                    for f in normalized_pdf_files
+                ):
+                    project_options = ["01_Input sakne"] + project_options
+
+                if not project_options:
+                    st.warning(
+                        "01_Input mapē nav atrasta neviena projekta apakšmape."
+                    )
+                    st.stop()
+
                 project_counts = {
                     project: sum(
                         1 for f in normalized_pdf_files
