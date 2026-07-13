@@ -33,7 +33,7 @@ except Exception:
     HttpError = Exception
 
 
-APP_VERSION = "v0.6.1"
+APP_VERSION = "v0.6.3.1"
 APP_TITLE = f"BP AI Audit Copilot {APP_VERSION}"
 
 REQUIRED_EXPORT_COLUMNS = [
@@ -531,35 +531,91 @@ def strip_json_fences(text: str) -> str:
 
 
 
+def extract_specific_values(text: str) -> List[str]:
+    """Atrod salīdzinājumam izmantojamas konkrētas vērtības/kodus.
+
+    Heiristika nav domāta tehniskai validācijai. Tā tikai palīdz atmest AI
+    formulējumus, kuros teikts "neatbilst", bet nav nosauktas abas puses.
+    """
+    text = clean_text(text)
+    values: List[str] = []
+
+    for match in re.findall(r'["“”\']([^"“”\']{2,120})["“”\']', text):
+        value = clean_text(match)
+        if value:
+            values.append(value.lower())
+
+    patterns = [
+        r"\b(?:DN|D|Ø)\s*\d{2,4}\b",
+        r"\b\d+(?:[.,]\d+)?\s*(?:mm|cm|m|m²|m2|m³|m3|MPa|kPa|bar|kW|W|V|A|l/s|m3/h)\b",
+        r"\b\d{4}[-./]\d{1,2}[-./]\d{1,2}\b",
+        r"\b(?:REV|R|V)\s*[-_.]?\s*\d+[A-Z]?\b",
+        r"\b[A-Z]{2,}(?:[-_][A-Z0-9]{2,})+\b",
+        r"\b[A-Z]{2,}\s*(?:SN\d+|SDR\d+|PN\d+)\b",
+        r"\b(?:PVC|PP|PE|HDPE|LDPE|BETONS|TĒRAUDS|ČUGUNS)\b",
+    ]
+    for pattern in patterns:
+        for match in re.findall(pattern, text, flags=re.I):
+            value = clean_text(match)
+            if value:
+                values.append(value.lower())
+
+    # Saglabā secību, izmetot dublikātus.
+    return list(dict.fromkeys(values))
+
+
 def candidate_is_too_vague(c: Dict[str, Any]) -> bool:
-    text = " ".join([
-        clean_text(c.get("title")),
-        clean_text(c.get("problem")),
-        clean_text(c.get("designer_note")),
-        clean_text(c.get("evidence")),
-    ]).lower()
+    problem = clean_text(c.get("problem"))
+    note = clean_text(c.get("designer_note") or c.get("comment_text"))
+    evidence = clean_text(c.get("evidence"))
+    target_area = clean_text(c.get("target_area") or c.get("where"))
+    text = " ".join([clean_text(c.get("title")), problem, note, evidence]).lower()
+
+    if not note and not problem:
+        return True
 
     vague_phrases = [
         "var neatbilst",
         "var nebūt",
-        "var radīt",
         "dažādos dokumentos",
         "citiem projekta dokumentiem",
         "jāsaskaņo ar citiem",
         "pārbaudīt un saskaņot",
         "pilnībā saskaņots",
         "nav pilnībā saskaņots",
+        "iespējama neatbilstība",
+        "nepieciešams pārbaudīt",
+    ]
+    comparison_phrases = [
+        " neatbilst ",
+        " nesakrīt ",
+        " atšķiras ",
+        " pretrunā ",
+        " savukārt ",
+        " salīdzinot ar ",
+        " norādīts citādi ",
     ]
     has_vague = any(p in text for p in vague_phrases)
-    if not has_vague:
-        return False
+    has_comparison = any(p in f" {text} " for p in comparison_phrases)
 
-    # Vājas piezīmes parasti nesatur konkrētas citētas vērtības vai salīdzinājumu.
-    has_quotes = ('"' in text) or ("“" in text) or ("”" in text) or ("'" in text)
-    has_vs = any(x in text for x in [" neatbilst ", " atšķiras ", " pret ", " salīdzinot ar ", " bet "])
-    has_specific_number = bool(re.search(r"\b(dn|d|ø)?\s*\d{2,4}\b|\b\d+[,.]?\d*\s*(mm|m|mpa|kw|v|a|m²|m3|m³)\b", text, flags=re.I))
-    return not ((has_quotes or has_specific_number) and has_vs)
+    specifics = extract_specific_values(" ".join([problem, note, evidence]))
+    has_source_location = bool(target_area) or any(
+        source in text
+        for source in [
+            "titullauk", "faila nosauk", "galvenajā tekst", "tabulā", "profilā",
+            "plānā", "site plan", "specifikācijā", "aprakstā", "rasējumā", "lapā",
+        ]
+    )
 
+    # Salīdzinājuma piezīmei vajag vismaz divas konkrētas puses un avota/vietas norādi.
+    if has_comparison and (len(specifics) < 2 or not has_source_location):
+        return True
+
+    # Vispārīgas frāzes bez divām konkrētām pusēm netiek rādītas.
+    if has_vague and len(specifics) < 2:
+        return True
+
+    return False
 
 def call_ai_for_family(
     client,
@@ -583,6 +639,8 @@ def call_ai_for_family(
         "Ja nav pietiekama pierādījuma, atgriez tukšu candidates sarakstu. "
         "Raksti īsi. Neraksti sekas, riskus vai risinājuma instrukcijas. "
         "PDF komentāram vajag tikai konkrētu konstatējumu: kas dokumentā redzams un ar ko tas nesakrīt. "
+        "designer_note jābūt tik garai, cik nepieciešams konkrētās kļūdas vai nesakritības nepārprotamam aprakstam, bet bez lieka konteksta. "
+        "Nelieto virsrakstus Kāpēc tas ir svarīgi, Ieteikums vai Risinājums. "
         "Atbildi tikai derīgā JSON formātā."
     )
     user = {
@@ -597,7 +655,9 @@ def call_ai_for_family(
             "Ja salīdzināmais avots nav iekļauts auditējamā PDF tekstā, neatsaucies uz šo avotu kā uz pierādījumu.",
             "Nedrīkst pārņemt faktus no similar_positive_examples; tie ir tikai stila un tipoloģijas piemēri.",
             "Frāzes 'var neatbilst', 'var nebūt saskaņots', 'jāpārbauda ar citiem dokumentiem' ir atļautas tikai tad, ja blakus ir konkrēts nepareizais teksts un konkrēts salīdzināmais teksts.",
-            "designer_note jābūt lietojamai bez failu atvēršanas: tajā jāmin konkrētās vērtības/teksti, kas jāsaskaņo.",
+            "designer_note jābūt lietojamai bez failu atvēršanas: tajā jāmin abas konkrētās vērtības/teksti un vietas/avoti.",
+            "designer_note nav cieta zīmju vai teikumu limita; izmanto tikai tik daudz teksta, cik vajadzīgs konkrētās kļūdas vai nesakritības pilnam aprakstam.",
+            "designer_note nedrīkst saturēt: Kāpēc tas ir svarīgi, Ieteikums, Risinājums, Lūdzu pārbaudīt, Lūdzu saskaņot, risku vai seku aprakstu.",
         ],
         "similar_positive_examples": examples,
         "negative_rules_do_not_repeat": negative_rules,
@@ -613,7 +673,9 @@ def call_ai_for_family(
                     "status": "kļūdas tips vai risks",
                     "problem": "precīzi apraksti kļūdu: norādi nepareizo tekstu/vērtību pēdiņās, salīdzināmo pareizo vai konfliktējošo tekstu/vērtību pēdiņās un avotu; bez vispārīgām frāzēm",
                     "why_important": "atstāj tukšu; neraksti sekas vai riska aprakstu",
-                    "designer_note": "īss PDF komentāra teksts: tikai konkrēts konstatējums, kas ar ko nesakrīt; bez risinājuma instrukcijām",
+                    "designer_note": "konkrēts PDF komentārs bez cieta garuma limita: apraksti tikai konstatēto kļūdu vai nesakritību, norādot vajadzīgās vērtības/tekstus un to vietas; bez pamatojuma, ieteikuma, riska, sekām vai risinājuma",
+                    "comparison_files": "salīdzināmo failu nosaukumi; tukšs, ja salīdzinājums ir vienā failā",
+                    "comparison_pages": "salīdzināmo lapu numuri; tukšs, ja nav zināmi",
                     "issue_type": "normalizēts issue_type",
                     "severity": "low|medium|high",
                     "markup_type": "highlight|rectangle|sticky_note|page_note",
@@ -670,11 +732,11 @@ def candidate_to_export_row(c: Dict[str, Any], idx: int, pdf_name: str, discipli
         "target_page": page,
         "target_area": clean_text(c.get("target_area") or c.get("where")),
         "target_text": target_text,
-        "comment_text": clean_text(c.get("designer_note") or c.get("comment_text") or comparison_evidence),
+        "comment_text": shorten_pdf_comment(clean_text(c.get("designer_note") or c.get("comment_text") or comparison_evidence)),
         "issue_type": clean_text(c.get("issue_type") or c.get("family")),
         "severity": clean_text(c.get("severity")) or "medium",
-        "comparison_files": "",
-        "comparison_pages": "",
+        "comparison_files": clean_text(c.get("comparison_files")),
+        "comparison_pages": clean_text(c.get("comparison_pages")),
         "comparison_evidence": comparison_evidence,
         "markup_type": markup,
         "placement_confidence": placement,
@@ -683,6 +745,7 @@ def candidate_to_export_row(c: Dict[str, Any], idx: int, pdf_name: str, discipli
 
 
 def candidate_to_rejected_row(c: Dict[str, Any], idx: int, pdf_name: str, reason: str, do_not_show: bool) -> Dict[str, Any]:
+    comparison_evidence = clean_text(c.get("problem") or c.get("evidence"))
     return {
         "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "source_file": pdf_name,
@@ -702,34 +765,64 @@ def candidate_to_rejected_row(c: Dict[str, Any], idx: int, pdf_name: str, reason
 
 
 
-def make_pdf_comment(row: Dict[str, Any]) -> str:
-    problem = clean_text(row.get("comparison_evidence")) or clean_text(row.get("comment_text"))
-    if not problem:
-        problem = "Piezīme auditā."
-    problem = shorten_pdf_comment(problem)
-    return f"Komentārs:\n{problem}"
+def shorten_pdf_comment(text: str) -> str:
+    """Atstāj PDF anotācijā tikai konkrēto kļūdu vai nesakritību.
 
-
-def shorten_pdf_comment(text: str, max_chars: int = 520) -> str:
+    Garums netiek mehāniski ierobežots: komentārs drīkst būt garāks, ja tas
+    nepieciešams, lai nepārprotami nosauktu abas salīdzinājuma puses un vietas.
+    """
     text = clean_text(text)
-    # Izmet tipiskus vispārīgus seku/riska teikumus, lai PDF komentārs paliek īss.
-    stop_phrases = [
-        "var radīt", "var izraisīt", "var ietekmēt", "apgrūtina",
-        "lai nodrošinātu", "nepieciešams", "lūdzu pārbaudīt", "lūdzu saskaņot",
-        "būvniecības procesā", "projekta izpildē", "dokumentu pārvaldībā",
-    ]
-    sentences = re.split(r"(?<=[.!?])\s+", text)
-    kept = []
-    for sent in sentences:
-        low = sent.lower()
-        if any(p in low for p in stop_phrases) and kept:
-            continue
-        kept.append(sent.strip())
-    result = " ".join([x for x in kept if x]).strip() or text
-    if len(result) > max_chars:
-        result = result[:max_chars].rstrip() + "…"
-    return result
+    if not text:
+        return "Piezīme auditā."
 
+    # Ja tekstā parādās atsevišķa pamatojuma, seku vai risinājuma sadaļa,
+    # atmetam šo sadaļu un visu, kas seko aiz tās.
+    section_pattern = re.compile(
+        r"(?i)(?:^|\s)(?:kāpēc tas ir svarīgi|ieteikums|risinājums|sekas|riski?|kā novērst)\s*:\s*"
+    )
+    section_match = section_pattern.search(text)
+    if section_match:
+        text = text[:section_match.start()].strip()
+
+    # Noņem tikai tehnisku ievada virsrakstu, saglabājot pašu konstatējumu.
+    text = re.sub(r"(?i)^komentārs\s*:\s*", "", text).strip()
+
+    non_factual_markers = [
+        "lūdzu pārbaudīt",
+        "lūdzu saskaņot",
+        "nepieciešams pārbaudīt",
+        "nepieciešams saskaņot",
+        "ieteicams",
+        "lai nodrošinātu",
+        "var radīt",
+        "var izraisīt",
+        "var ietekmēt",
+        "rada risku",
+        "tas ir svarīgi",
+        "būvniecības procesā",
+        "projekta izpildē",
+        "dokumentu pārvaldībā",
+    ]
+
+    kept: List[str] = []
+    for sentence in re.split(r"(?<=[.!?])\s+", text):
+        sentence = clean_text(sentence)
+        if not sentence:
+            continue
+        low = sentence.lower()
+        cut_positions = [low.find(marker) for marker in non_factual_markers if marker in low]
+        if cut_positions:
+            sentence = sentence[:min(cut_positions)].rstrip(" ,;:-")
+        if sentence:
+            kept.append(sentence)
+
+    return " ".join(kept).strip() or text or "Piezīme auditā."
+
+def make_pdf_comment(row: Dict[str, Any]) -> str:
+    # Prioritāte ir lietotāja pārskatītajam īsajam comment_text, nevis garajam
+    # comparison_evidence/problēmas aprakstam.
+    comment = clean_text(row.get("comment_text")) or clean_text(row.get("comparison_evidence"))
+    return f"Komentārs:\n{shorten_pdf_comment(comment)}"
 
 def safe_int_page(value: Any, page_count: int) -> int:
     txt = clean_text(value)
@@ -882,11 +975,17 @@ def make_zip(
                 pdf_bytes = item.get("bytes")
                 if not pdf_name or not pdf_bytes:
                     continue
-                pdf_rows = accepted_df[accepted_df["target_file"].astype(str) == pdf_name].copy()
+                pdf_rel_path = clean_text(item.get("rel_path")) or pdf_name
+                target_series = accepted_df["target_file"].astype(str).map(clean_text)
+                pdf_rows = accepted_df[target_series.eq(pdf_rel_path)].copy()
+                if pdf_rows.empty:
+                    # Atpakaļsaderība vecākiem ierakstiem, kuros target_file bija tikai faila nosaukums.
+                    pdf_rows = accepted_df[target_series.eq(pdf_name)].copy()
                 if pdf_rows.empty:
                     continue
                 annotated_pdf, pdf_report = annotate_pdf_bytes(pdf_bytes, pdf_rows)
-                safe_pdf_base = re.sub(r"[^A-Za-z0-9_\-]+", "_", os.path.splitext(pdf_name)[0])[:80]
+                safe_pdf_source = os.path.splitext(pdf_rel_path)[0]
+                safe_pdf_base = re.sub(r"[^A-Za-z0-9_\-]+", "_", safe_pdf_source)[:100]
                 if annotated_pdf:
                     zf.writestr(f"annotated_pdf_{safe_pdf_base}_{ts}.pdf", annotated_pdf)
                 for r in pdf_report:
@@ -1175,7 +1274,7 @@ def main():
                     candidates, err = call_ai_for_family(
                         client=client,
                         model=model,
-                        pdf_name=pdf_name,
+                        pdf_name=pdf_rel_path,
                         pdf_text=pdf_text,
                         family=family,
                         examples=examples,
@@ -1225,7 +1324,7 @@ def main():
                     "Labot īso komentāru",
                     value=clean_text(c.get("designer_note") or c.get("comment_text")),
                     key=f"designer_note_{idx}",
-                    height=90,
+                    height=75,
                 )
                 c["designer_note"] = edited_note
                 decision = st.radio(
@@ -1248,8 +1347,9 @@ def main():
                 row_review["reject_reason"] = reject_reason
                 row_review["do_not_show_similar"] = do_not_show
                 review_rows.append(row_review)
-                source_pdf_for_row = clean_text(c.get("source_pdf")) or st.session_state.selected_pdf_name
-                discipline = infer_discipline_from_filename(source_pdf_for_row)
+                source_pdf_name = clean_text(c.get("source_pdf")) or st.session_state.selected_pdf_name
+                source_pdf_for_row = clean_text(c.get("source_pdf_rel_path")) or source_pdf_name
+                discipline = infer_discipline_from_filename(source_pdf_name)
                 if include and not reject:
                     accepted_rows.append(candidate_to_export_row(c, len(accepted_rows) + 1, source_pdf_for_row, discipline))
                 if reject:
