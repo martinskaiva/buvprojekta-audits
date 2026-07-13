@@ -33,7 +33,7 @@ except Exception:
     HttpError = Exception
 
 
-APP_VERSION = "v0.5.1"
+APP_VERSION = "v0.6"
 APP_TITLE = f"BP AI Audit Copilot {APP_VERSION}"
 
 REQUIRED_EXPORT_COLUMNS = [
@@ -769,16 +769,29 @@ def annotate_pdf_bytes(pdf_bytes: bytes, accepted_df: pd.DataFrame) -> Tuple[Opt
     return out.getvalue(), report
 
 
-def make_zip(accepted_df: pd.DataFrame, rejected_df: pd.DataFrame, review_df: pd.DataFrame, base_name: str, pdf_bytes: Optional[bytes] = None) -> bytes:
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+def make_zip(
+    accepted_df: pd.DataFrame,
+    rejected_df: pd.DataFrame,
+    review_df: pd.DataFrame,
+    base_name: str,
+    pdf_items: Optional[List[Dict[str, Any]]] = None,
+) -> bytes:
+    """Create export ZIP.
+
+    v0.6 supports multiple selected PDFs. Accepted rows are split by target_file
+    and each matching PDF is annotated separately.
+    """
     bio = io.BytesIO()
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    pdf_items = pdf_items or []
+
     with zipfile.ZipFile(bio, "w", zipfile.ZIP_DEFLATED) as zf:
         acc_b = io.BytesIO()
         with pd.ExcelWriter(acc_b, engine="openpyxl") as writer:
             accepted_df.to_excel(writer, sheet_name="accepted_candidates", index=False)
         zf.writestr(f"accepted_candidates_{base_name}_{ts}.xlsx", acc_b.getvalue())
 
-        # Rejected feedback files are only useful when the user actually rejects at least one candidate.
+        # Rejected feedback files are only useful when the user actually rejects at least one note.
         # Do not create empty rejected_patterns files. They add noise and can confuse the workflow.
         if rejected_df is not None and not rejected_df.empty:
             rej_b = io.BytesIO()
@@ -789,16 +802,33 @@ def make_zip(accepted_df: pd.DataFrame, rejected_df: pd.DataFrame, review_df: pd
 
         rev_b = io.BytesIO()
         with pd.ExcelWriter(rev_b, engine="openpyxl") as writer:
-            review_df.to_excel(writer, sheet_name="all_ai_candidates_review", index=False)
-        zf.writestr(f"all_ai_candidates_review_{base_name}_{ts}.xlsx", rev_b.getvalue())
+            review_df.to_excel(writer, sheet_name="all_ai_notes_review", index=False)
+        zf.writestr(f"all_ai_notes_review_{base_name}_{ts}.xlsx", rev_b.getvalue())
 
-        if pdf_bytes and accepted_df is not None and not accepted_df.empty:
-            annotated_pdf, pdf_report = annotate_pdf_bytes(pdf_bytes, accepted_df)
-            if annotated_pdf:
-                zf.writestr(f"annotated_pdf_{base_name}_{ts}.pdf", annotated_pdf)
+        # Annotate each selected PDF separately.
+        all_reports: List[Dict[str, Any]] = []
+        if accepted_df is not None and not accepted_df.empty and pdf_items:
+            for item in pdf_items:
+                pdf_name = clean_text(item.get("name"))
+                pdf_bytes = item.get("bytes")
+                if not pdf_name or not pdf_bytes:
+                    continue
+                pdf_rows = accepted_df[accepted_df["target_file"].astype(str) == pdf_name].copy()
+                if pdf_rows.empty:
+                    continue
+                annotated_pdf, pdf_report = annotate_pdf_bytes(pdf_bytes, pdf_rows)
+                safe_pdf_base = re.sub(r"[^A-Za-z0-9_\-]+", "_", os.path.splitext(pdf_name)[0])[:80]
+                if annotated_pdf:
+                    zf.writestr(f"annotated_pdf_{safe_pdf_base}_{ts}.pdf", annotated_pdf)
+                for r in pdf_report:
+                    r["pdf_file"] = pdf_name
+                    r["pdf_rel_path"] = clean_text(item.get("rel_path"))
+                    all_reports.append(r)
+
+        if all_reports:
             rep_b = io.BytesIO()
             with pd.ExcelWriter(rep_b, engine="openpyxl") as writer:
-                pd.DataFrame(pdf_report).to_excel(writer, sheet_name="pdf_markup_report", index=False)
+                pd.DataFrame(all_reports).to_excel(writer, sheet_name="pdf_markup_report", index=False)
             zf.writestr(f"pdf_markup_report_{base_name}_{ts}.xlsx", rep_b.getvalue())
     return bio.getvalue()
 
@@ -811,6 +841,8 @@ def init_state():
         "feedback_df": pd.DataFrame(),
         "selected_pdf_bytes": None,
         "selected_pdf_name": "",
+        "selected_pdf_rel_path": "",
+        "selected_pdf_items": [],
         "pdf_text": "",
         "pdf_pages": [],
         "candidates": [],
@@ -904,8 +936,8 @@ def main():
 
     pdf_files = st.session_state.pdf_files
     if pdf_files:
-        st.subheader("2. Izvēlies auditējamo PDF")
-        st.caption("PDF faili tiek rādīti pa 01_Input apakšmapēm, nevis vienā kopējā sarakstā.")
+        st.subheader("2. Izvēlies auditējamos PDF")
+        st.caption("PDF faili tiek rādīti pa 01_Input apakšmapēm. Var atzīmēt vairākus failus; izvēle ir vertikālā sarakstā, lai redzams pilns nosaukums.")
 
         def _pdf_folder(rel_path: str) -> str:
             rel_path = clean_text(rel_path)
@@ -946,33 +978,77 @@ def main():
 
         if not filtered_pdf_files:
             st.warning("Šajā mapē / meklējumā PDF faili nav atrasti.")
-            selected_pdf = None
         else:
-            label_map = {}
-            for f in filtered_pdf_files:
-                label = f"{f.get('display_name', f.get('name'))}  —  {f.get('folder_path', '')}"
-                label_map[label] = f
-            selected_label = st.selectbox("PDF", options=list(label_map.keys()))
-            selected_pdf = label_map[selected_label]
+            select_all_visible = st.checkbox("Atzīmēt visus redzamos PDF", value=False, key="select_all_visible_pdfs")
+            max_visible = 250
+            if len(filtered_pdf_files) > max_visible:
+                st.warning(f"Redzami pirmie {max_visible} no {len(filtered_pdf_files)} PDF. Sašaurini meklējumu, lai izvēle būtu pārskatāma.")
+            shown_pdf_files = filtered_pdf_files[:max_visible]
 
-        if selected_pdf:
-            with st.expander("Izvēlētā PDF ceļš"):
-                st.write(selected_pdf.get("rel_path", selected_pdf.get("name", "")))
+            st.markdown("**Atzīmē auditējamos PDF:**")
+            selected_pdf_ids: List[str] = []
+            for f in shown_pdf_files:
+                rel = clean_text(f.get("rel_path", f.get("name", "")))
+                key = f"pdf_pick_{f.get('id')}"
+                default_val = bool(select_all_visible)
+                checked = st.checkbox(rel, value=default_val, key=key)
+                if checked:
+                    selected_pdf_ids.append(f.get("id"))
 
-            if st.button("Lejupielādēt un nolasīt PDF tekstu"):
-                with st.spinner("Lejupielādēju un nolasu PDF..."):
-                    pdf_bytes = drive_download_bytes(service, selected_pdf["id"])
-                    text, pages, err = extract_pdf_text(pdf_bytes, max_context_chars)
-                    if err:
-                        st.error(err)
+            selected_pdf_files = [f for f in shown_pdf_files if f.get("id") in set(selected_pdf_ids)]
+            st.caption(f"Atzīmēti PDF: {len(selected_pdf_files)}")
+
+            if selected_pdf_files:
+                with st.expander("Izvēlētie PDF ceļi", expanded=True):
+                    for f in selected_pdf_files:
+                        st.write(f.get("rel_path", f.get("name", "")))
+
+                if st.button("Lejupielādēt un nolasīt izvēlētos PDF tekstus"):
+                    loaded_items: List[Dict[str, Any]] = []
+                    errors: List[str] = []
+                    progress = st.progress(0)
+                    status = st.empty()
+                    for i, selected_pdf in enumerate(selected_pdf_files, start=1):
+                        try:
+                            status.write(f"Nolasu {i}/{len(selected_pdf_files)}: {selected_pdf.get('name')}")
+                            pdf_bytes = drive_download_bytes(service, selected_pdf["id"])
+                            text, pages, err = extract_pdf_text(pdf_bytes, max_context_chars)
+                            if err:
+                                errors.append(f"{selected_pdf.get('rel_path', selected_pdf.get('name'))}: {err}")
+                            else:
+                                loaded_items.append({
+                                    "id": selected_pdf.get("id"),
+                                    "name": selected_pdf.get("name", "audit.pdf"),
+                                    "rel_path": selected_pdf.get("rel_path", selected_pdf.get("name", "audit.pdf")),
+                                    "bytes": pdf_bytes,
+                                    "text": text,
+                                    "pages": pages,
+                                })
+                        except Exception as e:
+                            errors.append(f"{selected_pdf.get('rel_path', selected_pdf.get('name'))}: {e}")
+                        progress.progress(i / max(1, len(selected_pdf_files)))
+                    status.write("PDF nolasīšana pabeigta.")
+
+                    st.session_state.selected_pdf_items = loaded_items
+                    if loaded_items:
+                        # Backward-compatible fields keep the first PDF for preview labels.
+                        first = loaded_items[0]
+                        st.session_state.selected_pdf_bytes = first.get("bytes")
+                        st.session_state.selected_pdf_name = first.get("name", "audit.pdf")
+                        st.session_state.selected_pdf_rel_path = first.get("rel_path", first.get("name", "audit.pdf"))
+                        st.session_state.pdf_text = "\n\n".join(
+                            [f"===== PDF: {it.get('rel_path')} =====\n{it.get('text', '')}" for it in loaded_items]
+                        )[:max_context_chars * max(1, len(loaded_items))]
+                        st.session_state.pdf_pages = first.get("pages", [])
+                        st.success(f"Nolasīti PDF: {len(loaded_items)} | kopā teksts priekšskatījumam: {len(st.session_state.pdf_text)} zīmes")
                     else:
-                        st.session_state.selected_pdf_bytes = pdf_bytes
-                        st.session_state.selected_pdf_name = selected_pdf.get("name", "audit.pdf")
-                        st.session_state.selected_pdf_rel_path = selected_pdf.get("rel_path", selected_pdf.get("name", "audit.pdf"))
-                        st.session_state.pdf_text = text
-                        st.session_state.pdf_pages = pages
-                        st.success(f"Nolasīts: {selected_pdf.get('name')} | lapas: {len(pages)} | teksts: {len(text)} zīmes")
-
+                        st.session_state.selected_pdf_items = []
+                        st.session_state.pdf_text = ""
+                        st.error("Neizdevās nolasīt nevienu izvēlēto PDF.")
+                    if errors:
+                        with st.expander("PDF nolasīšanas kļūdas"):
+                            for e in errors:
+                                st.warning(e)
     if st.session_state.pdf_text:
         with st.expander("PDF teksta priekšskatījums"):
             st.text_area("PDF teksts", value=st.session_state.pdf_text[:10000], height=300)
@@ -990,11 +1066,13 @@ def main():
             st.dataframe(fam_summary, use_container_width=True)
 
     st.header("3. AI piezīmju ģenerēšana")
-    ready = bool(st.session_state.pdf_text) and not st.session_state.index_df.empty
+    selected_pdf_items = st.session_state.get("selected_pdf_items", [])
+    ready = bool(selected_pdf_items) and not st.session_state.index_df.empty
     if not ready:
-        st.caption("Vispirms jānolasa PDF un audit_examples_index.")
+        st.caption("Vispirms jānolasa vismaz viens PDF un audit_examples_index.")
     else:
-        if st.button("Analizēt PDF", type="primary"):
+        st.caption(f"Analīzei sagatavoti PDF: {len(selected_pdf_items)}")
+        if st.button("Analizēt izvēlētos PDF", type="primary"):
             client = get_openai_client()
             if client is None:
                 st.stop()
@@ -1004,33 +1082,46 @@ def main():
             status = st.empty()
             families_to_run = [f for f in selected_families if max_candidates_per_family > 0]
             negative_rules = make_negative_rules(st.session_state.feedback_df)
-            for i, family in enumerate(families_to_run, start=1):
-                status.write(f"Pārbaude {i}/{len(families_to_run)}: {family}")
-                examples = select_examples(
-                    st.session_state.index_df,
-                    family,
-                    st.session_state.selected_pdf_name,
-                    st.session_state.pdf_text,
-                    max_examples_per_family,
-                )
-                candidates, err = call_ai_for_family(
-                    client=client,
-                    model=model,
-                    pdf_name=st.session_state.selected_pdf_name,
-                    pdf_text=st.session_state.pdf_text,
-                    family=family,
-                    examples=examples,
-                    negative_rules=negative_rules,
-                    max_candidates=max_candidates_per_family,
-                )
-                if err:
-                    errors.append({"family": family, "error": err})
-                for c in candidates:
-                    c["source_pdf"] = st.session_state.selected_pdf_name
-                    c["include_default"] = True
-                    c["reject_default"] = False
-                    all_candidates.append(c)
-                progress.progress(i / max(1, len(families_to_run)))
+            total_steps = max(1, len(selected_pdf_items) * len(families_to_run))
+            step = 0
+
+            for pdf_i, pdf_item in enumerate(selected_pdf_items, start=1):
+                pdf_name = clean_text(pdf_item.get("name")) or "audit.pdf"
+                pdf_rel_path = clean_text(pdf_item.get("rel_path")) or pdf_name
+                pdf_text = clean_text(pdf_item.get("text"))
+                if not pdf_text:
+                    errors.append({"pdf": pdf_rel_path, "family": "", "error": "PDF teksts ir tukšs; AI analīze izlaista."})
+                    continue
+
+                for family in families_to_run:
+                    step += 1
+                    status.write(f"PDF {pdf_i}/{len(selected_pdf_items)} | pārbaude {step}/{total_steps}: {family} | {pdf_rel_path}")
+                    examples = select_examples(
+                        st.session_state.index_df,
+                        family,
+                        pdf_name,
+                        pdf_text,
+                        max_examples_per_family,
+                    )
+                    candidates, err = call_ai_for_family(
+                        client=client,
+                        model=model,
+                        pdf_name=pdf_name,
+                        pdf_text=pdf_text,
+                        family=family,
+                        examples=examples,
+                        negative_rules=negative_rules,
+                        max_candidates=max_candidates_per_family,
+                    )
+                    if err:
+                        errors.append({"pdf": pdf_rel_path, "family": family, "error": err})
+                    for c in candidates:
+                        c["source_pdf"] = pdf_name
+                        c["source_pdf_rel_path"] = pdf_rel_path
+                        c["include_default"] = True
+                        c["reject_default"] = False
+                        all_candidates.append(c)
+                    progress.progress(step / total_steps)
             st.session_state.candidates = all_candidates
             st.session_state.ai_errors = errors
             status.write("AI analīze pabeigta.")
@@ -1047,12 +1138,14 @@ def main():
         accepted_rows = []
         rejected_rows = []
         review_rows = []
-        discipline = infer_discipline_from_filename(st.session_state.selected_pdf_name)
         for idx, c in enumerate(candidates, start=1):
             title = clean_text(c.get("title")) or f"Piezīme {idx}"
             family = clean_text(c.get("family"))
             with st.container(border=True):
                 st.markdown(f"### {idx}. {title}")
+                source_pdf = clean_text(c.get("source_pdf")) or st.session_state.selected_pdf_name
+                source_pdf_rel = clean_text(c.get("source_pdf_rel_path")) or source_pdf
+                st.markdown(f"**PDF:** {source_pdf_rel}")
                 st.markdown(f"**Ģimene:** `{family}`")
                 st.markdown(f"**Kur:** {clean_text(c.get('where') or c.get('target_area'))}")
                 st.markdown(f"**Statuss:** {clean_text(c.get('status'))}")
@@ -1088,10 +1181,12 @@ def main():
                 row_review["reject_reason"] = reject_reason
                 row_review["do_not_show_similar"] = do_not_show
                 review_rows.append(row_review)
+                source_pdf_for_row = clean_text(c.get("source_pdf")) or st.session_state.selected_pdf_name
+                discipline = infer_discipline_from_filename(source_pdf_for_row)
                 if include and not reject:
-                    accepted_rows.append(candidate_to_export_row(c, len(accepted_rows) + 1, st.session_state.selected_pdf_name, discipline))
+                    accepted_rows.append(candidate_to_export_row(c, len(accepted_rows) + 1, source_pdf_for_row, discipline))
                 if reject:
-                    rejected_rows.append(candidate_to_rejected_row(c, idx, st.session_state.selected_pdf_name, reject_reason, do_not_show))
+                    rejected_rows.append(candidate_to_rejected_row(c, idx, source_pdf_for_row, reject_reason, do_not_show))
 
         st.header("5. Eksports")
         accepted_df = pd.DataFrame(accepted_rows, columns=REQUIRED_EXPORT_COLUMNS)
@@ -1102,8 +1197,13 @@ def main():
         c2.metric("Noraidītas", len(rejected_df))
         c3.metric("Kopā piezīmes", len(review_df))
         st.caption("ZIP satur accepted/review Excel. Rejected faili tiek pievienoti tikai tad, ja ir noraidītas piezīmes. Ja ir akceptētas piezīmes un PDF ir nolasīts, ZIP satur arī annotated_pdf_*.pdf un pdf_markup_report_*.xlsx.")
-        base = re.sub(r"[^A-Za-z0-9_\-]+", "_", os.path.splitext(st.session_state.selected_pdf_name)[0])[:80]
-        zip_bytes = make_zip(accepted_df, rejected_df, review_df, base, st.session_state.selected_pdf_bytes)
+        selected_pdf_items = st.session_state.get("selected_pdf_items", [])
+        if len(selected_pdf_items) == 1:
+            base_source = selected_pdf_items[0].get("name", st.session_state.selected_pdf_name)
+            base = re.sub(r"[^A-Za-z0-9_\-]+", "_", os.path.splitext(base_source)[0])[:80]
+        else:
+            base = f"multi_pdf_{len(selected_pdf_items)}_files"
+        zip_bytes = make_zip(accepted_df, rejected_df, review_df, base, selected_pdf_items)
         st.download_button(
             "Lejupielādēt ZIP ar PDF + Excel",
             data=zip_bytes,
