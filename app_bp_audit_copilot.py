@@ -25,13 +25,15 @@ try:
     from google.oauth2 import service_account
     from googleapiclient.discovery import build
     from googleapiclient.http import MediaIoBaseDownload
+    from googleapiclient.errors import HttpError
 except Exception:
     service_account = None
     build = None
     MediaIoBaseDownload = None
+    HttpError = Exception
 
 
-APP_VERSION = "v0.3"
+APP_VERSION = "v0.3.1"
 APP_TITLE = f"BP AI Audit Copilot {APP_VERSION}"
 
 REQUIRED_EXPORT_COLUMNS = [
@@ -264,22 +266,55 @@ def drive_find_child_folder(service, parent_id: str, folder_name: str) -> Option
 
 
 def drive_list_recursive(service, folder_id: str, extensions: Tuple[str, ...], prefix: str = "", max_files: int = 5000) -> List[Dict[str, Any]]:
-    out = []
-    stack = [(folder_id, prefix)]
+    """Recursively list Drive files by extension.
+
+    This function is intentionally defensive: a single inaccessible subfolder or
+    strange Drive item must not crash the whole Streamlit app.
+    """
+    out: List[Dict[str, Any]] = []
+    stack: List[Tuple[str, str]] = [(str(folder_id).strip(), prefix)]
+    visited = set()
+    warnings: List[str] = []
+
     while stack and len(out) < max_files:
         current_id, current_prefix = stack.pop()
-        for item in drive_list_children(service, current_id):
-            name = item.get("name", "")
-            mime_type = item.get("mimeType", "")
-            rel_path = f"{current_prefix}/{name}" if current_prefix else name
-            if mime_type == "application/vnd.google-apps.folder":
-                stack.append((item["id"], rel_path))
-            else:
-                if name.lower().endswith(extensions):
+        if not current_id or current_id in visited:
+            continue
+        visited.add(current_id)
+
+        try:
+            children = drive_list_children(service, current_id)
+        except Exception as e:
+            where = current_prefix or current_id
+            warnings.append(f"Neizdevās nolasīt mapi: {where} — {e}")
+            continue
+
+        for item in children:
+            try:
+                name = clean_text(item.get("name", ""))
+                mime_type = clean_text(item.get("mimeType", ""))
+                item_id = clean_text(item.get("id", ""))
+                if not name or not item_id:
+                    continue
+                rel_path = f"{current_prefix}/{name}" if current_prefix else name
+
+                if mime_type == "application/vnd.google-apps.folder":
+                    stack.append((item_id, rel_path))
+                    continue
+
+                if name.lower().endswith(tuple(x.lower() for x in extensions)):
                     item2 = dict(item)
                     item2["rel_path"] = rel_path
                     out.append(item2)
-    return sorted(out, key=lambda x: x.get("rel_path", ""))
+                    if len(out) >= max_files:
+                        break
+            except Exception as e:
+                warnings.append(f"Izlaists Drive ieraksts mapē {current_prefix or folder_id}: {e}")
+                continue
+
+    if warnings:
+        st.session_state["drive_list_warnings"] = warnings[:50]
+    return sorted(out, key=lambda x: clean_text(x.get("rel_path", x.get("name", ""))))
 
 
 def drive_download_bytes(service, file_id: str) -> bytes:
@@ -697,9 +732,22 @@ def main():
             if not input_folder_id.strip():
                 st.error("Nav norādīts 01_Input folder ID.")
             else:
-                with st.spinner("Nolasu PDF failus..."):
-                    st.session_state.pdf_files = drive_list_recursive(service, input_folder_id.strip(), (".pdf",), prefix="", max_files=1000)
-                st.success(f"Atrasti PDF faili: {len(st.session_state.pdf_files)}")
+                try:
+                    with st.spinner("Nolasu PDF failus..."):
+                        st.session_state.pdf_files = drive_list_recursive(service, input_folder_id.strip(), (".pdf",), prefix="", max_files=1000)
+                    st.success(f"Atrasti PDF faili: {len(st.session_state.pdf_files)}")
+                    if len(st.session_state.pdf_files) == 0:
+                        st.warning("01_Input mapē vai tās apakšmapēs netika atrasts neviens PDF. Pārbaudi folder ID un service account piekļuvi.")
+                    if st.session_state.get("drive_list_warnings"):
+                        with st.expander("Drive nolasīšanas brīdinājumi"):
+                            for w in st.session_state.get("drive_list_warnings", []):
+                                st.warning(w)
+                except Exception as e:
+                    st.session_state.pdf_files = []
+                    st.error("Neizdevās nolasīt PDF failus no 01_Input. Rīks neapstājās; zemāk ir tehniskā kļūda.")
+                    st.code(str(e))
+                    with st.expander("Pilns tehniskais traceback"):
+                        st.code(traceback.format_exc())
 
     with c2:
         if st.button("Nolasīt audit_examples_index un feedback"):
