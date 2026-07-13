@@ -34,7 +34,7 @@ except Exception:
     HttpError = Exception
 
 
-APP_VERSION = "v0.6.3.4"
+APP_VERSION = "v0.6.3.5"
 APP_TITLE = f"BP AI Audit Copilot {APP_VERSION}"
 
 REQUIRED_EXPORT_COLUMNS = [
@@ -591,6 +591,83 @@ def extract_specific_values(text: str) -> List[str]:
     return list(dict.fromkeys(values))
 
 
+def _quoted_values(text: str) -> List[str]:
+    return [
+        clean_text(x)
+        for x in re.findall(r'["“”\']([^"“”\']{1,160})["“”\']', clean_text(text))
+        if clean_text(x)
+    ]
+
+
+def _value_kind(value: str) -> str:
+    value = clean_text(value)
+    compact = re.sub(r"\s+", "", value)
+    if re.fullmatch(r"\d{4}\s+\d{3}\s+\d{4}", value):
+        return "cadastral_number"
+    if re.fullmatch(r"RWC\d+(?:[-_][A-Z0-9]+)+", value, flags=re.I):
+        return "document_code"
+    if re.fullmatch(r"C\s*\d+(?:[-–]\d+)+", value, flags=re.I):
+        return "object_code"
+    if re.fullmatch(r"(?:DN|D|Ø)\s*\d{2,4}", value, flags=re.I):
+        return "diameter"
+    if re.fullmatch(r"\d{4}[-./]\d{1,2}[-./]\d{1,2}", value):
+        return "date"
+    if re.fullmatch(r"\d+(?:[.,]\d+)?\s*(?:mm|cm|m|m²|m2|m³|m3|MPa|Mpa|kPa|Kpa|bar|kW|Kw|W|V|A|l/s|m3/h)", value, flags=re.I):
+        return "technical_value"
+    if re.fullmatch(r"[A-Z]{2,}(?:[-_][A-Z0-9]{2,})+", compact, flags=re.I):
+        return "code"
+    return "text"
+
+
+def _candidate_says_no_issue(text: str) -> bool:
+    low = clean_text(text).lower()
+    phrases = [
+        "nav neatbilstības",
+        "neatbilstība nav konstatēta",
+        "atšķirība nav konstatēta",
+        "abi teksti sakrīt",
+        "vērtības sakrīt",
+        "vērtības ir vienādas",
+        "kļūda nav konstatēta",
+        "pretruna nav konstatēta",
+    ]
+    return any(p in low for p in phrases)
+
+
+def _comparison_types_conflict(text: str) -> bool:
+    values = _quoted_values(text)
+    if len(values) < 2:
+        return False
+    kinds = [_value_kind(v) for v in values[:4]]
+    known = [k for k in kinds if k != "text"]
+    if len(known) < 2:
+        return False
+    # Acīmredzami nesalīdzināmi datu lauki nedrīkst kļūt par neatbilstību.
+    incompatible = {
+        frozenset({"cadastral_number", "object_code"}),
+        frozenset({"cadastral_number", "document_code"}),
+        frozenset({"date", "document_code"}),
+        frozenset({"diameter", "date"}),
+    }
+    return any(frozenset({a, b}) in incompatible for a in known for b in known if a != b)
+
+
+def normalize_candidate(c: Dict[str, Any], family: str) -> Dict[str, Any]:
+    """Normalizē kandidātu tā, lai problēma un PDF komentārs aprakstītu vienu kļūdu."""
+    out = dict(c)
+    out["family"] = family
+    problem = clean_text(out.get("problem") or out.get("evidence"))
+    note = clean_text(out.get("designer_note") or out.get("comment_text"))
+    if not problem:
+        problem = note
+    # Vienots avots abiem laukiem novērš AI lauku savstarpēju sajaukšanu.
+    out["problem"] = problem
+    out["designer_note"] = shorten_pdf_comment(problem)
+    if not clean_text(out.get("target_text")):
+        out["target_text"] = "MANUAL_PLACEMENT_REQUIRED"
+    return out
+
+
 def candidate_is_too_vague(c: Dict[str, Any]) -> bool:
     problem = clean_text(c.get("problem"))
     note = clean_text(c.get("designer_note") or c.get("comment_text"))
@@ -600,31 +677,37 @@ def candidate_is_too_vague(c: Dict[str, Any]) -> bool:
 
     if not note and not problem:
         return True
+    if _candidate_says_no_issue(text):
+        return True
 
-    vague_phrases = [
+    speculative_phrases = [
+        "nav skaidrs, vai",
+        "nav zināms, vai",
+        "iespējams, ka",
+        "varētu būt",
         "var neatbilst",
         "var nebūt",
+        "iespējama neatbilstība",
+        "nepieciešams pārbaudīt",
+        "jāpārbauda ar citiem",
+    ]
+    if any(p in text for p in speculative_phrases):
+        return True
+
+    vague_phrases = [
         "dažādos dokumentos",
         "citiem projekta dokumentiem",
         "jāsaskaņo ar citiem",
         "pārbaudīt un saskaņot",
         "pilnībā saskaņots",
         "nav pilnībā saskaņots",
-        "iespējama neatbilstība",
-        "nepieciešams pārbaudīt",
     ]
     comparison_phrases = [
-        " neatbilst ",
-        " nesakrīt ",
-        " atšķiras ",
-        " pretrunā ",
-        " savukārt ",
-        " salīdzinot ar ",
-        " norādīts citādi ",
+        " neatbilst ", " nesakrīt ", " atšķiras ", " pretrunā ",
+        " savukārt ", " salīdzinot ar ", " norādīts citādi ",
     ]
     has_vague = any(p in text for p in vague_phrases)
     has_comparison = any(p in f" {text} " for p in comparison_phrases)
-
     specifics = extract_specific_values(" ".join([problem, note, evidence]))
     has_source_location = bool(target_area) or any(
         source in text
@@ -634,15 +717,76 @@ def candidate_is_too_vague(c: Dict[str, Any]) -> bool:
         ]
     )
 
-    # Salīdzinājuma piezīmei vajag vismaz divas konkrētas puses un avota/vietas norādi.
     if has_comparison and (len(specifics) < 2 or not has_source_location):
         return True
-
-    # Vispārīgas frāzes bez divām konkrētām pusēm netiek rādītas.
     if has_vague and len(specifics) < 2:
         return True
+    if _comparison_types_conflict(" ".join([problem, note, evidence])):
+        return True
+
+    # B_lv_en salīdzinājumā identiski citāti nav kļūda.
+    if clean_text(c.get("family")) == "B_lv_en":
+        values = _quoted_values(problem)
+        if len(values) >= 2:
+            a = re.sub(r"\s+", " ", values[0]).strip().casefold()
+            b = re.sub(r"\s+", " ", values[1]).strip().casefold()
+            if a == b:
+                return True
 
     return False
+
+
+def make_candidate_id(c: Dict[str, Any], audit_run_id: str, ordinal: int) -> str:
+    raw = "|".join([
+        audit_run_id,
+        clean_text(c.get("source_pdf_rel_path") or c.get("source_pdf")),
+        clean_text(c.get("family")),
+        clean_text(c.get("target_page")),
+        clean_text(c.get("target_text")),
+        clean_text(c.get("problem")),
+        str(ordinal),
+    ])
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:20]
+
+
+def clear_review_widget_state() -> None:
+    prefixes = ("designer_note_", "decision_", "reject_reason_", "do_not_show_")
+    for key in list(st.session_state.keys()):
+        if any(str(key).startswith(prefix) for prefix in prefixes):
+            del st.session_state[key]
+
+
+def detect_unit_case_candidates(pdf_item: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Deterministiski atrod biežākās SI mērvienību reģistra kļūdas."""
+    replacements = {
+        "Mpa": "MPa",
+        "Kpa": "kPa",
+        "Kw": "kW",
+    }
+    out: List[Dict[str, Any]] = []
+    for page_data in pdf_item.get("pages", []) or []:
+        page_no = int(page_data.get("page") or 1)
+        page_text = str(page_data.get("text") or "")
+        for wrong, correct in replacements.items():
+            if re.search(rf"(?<![A-Za-z]){re.escape(wrong)}(?![A-Za-z])", page_text):
+                out.append({
+                    "title": f"Mērvienības simbola pieraksts: {wrong}",
+                    "where": f"{page_no}. lapa",
+                    "target_page": page_no,
+                    "target_area": "teksts",
+                    "target_text": wrong,
+                    "status": "unit_symbol_case_error",
+                    "problem": f"{page_no}. lapā mērvienības simbols norādīts kā “{wrong}”; pareizais SI pieraksts ir “{correct}”.",
+                    "designer_note": f"{page_no}. lapā mērvienības simbols norādīts kā “{wrong}”; pareizais SI pieraksts ir “{correct}”.",
+                    "issue_type": "unit_symbol_case_error",
+                    "severity": "low",
+                    "markup_type": "highlight",
+                    "placement_confidence": "exact",
+                    "evidence": wrong,
+                    "family": "A_text_language",
+                })
+    return out
+
 
 def call_ai_for_family(
     client,
@@ -668,6 +812,9 @@ def call_ai_for_family(
         "PDF komentāram vajag tikai konkrētu konstatējumu: kas dokumentā redzams un ar ko tas nesakrīt. "
         "designer_note jābūt tik garai, cik nepieciešams konkrētās kļūdas vai nesakritības nepārprotamam aprakstam, bet bez lieka konteksta. "
         "Nelieto virsrakstus Kāpēc tas ir svarīgi, Ieteikums vai Risinājums. "
+        "Virsrakstam, problem, designer_note, target_text un evidence obligāti jāapraksta viena un tā pati problēma. "
+        "Ja secini, ka vērtības sakrīt vai neatbilstības nav, kandidātu neradi. "
+        "Nesalīdzini atšķirīgus datu laukus, piemēram, kadastra numuru ar objekta apzīmējumu. "
         "Atbildi tikai derīgā JSON formātā."
     )
     user = {
@@ -685,6 +832,10 @@ def call_ai_for_family(
             "designer_note jābūt lietojamai bez failu atvēršanas: tajā jāmin abas konkrētās vērtības/teksti un vietas/avoti.",
             "designer_note nav cieta zīmju vai teikumu limita; izmanto tikai tik daudz teksta, cik vajadzīgs konkrētās kļūdas vai nesakritības pilnam aprakstam.",
             "designer_note nedrīkst saturēt: Kāpēc tas ir svarīgi, Ieteikums, Risinājums, Lūdzu pārbaudīt, Lūdzu saskaņot, risku vai seku aprakstu.",
+            "title, problem, designer_note, target_text un evidence apraksta tikai vienu un to pašu kļūdu.",
+            "Ja abi salīdzinātie teksti vai skaitļi sakrīt, kandidātu neatgriez.",
+            "Neizmanto spekulatīvas frāzes: nav skaidrs vai, iespējams, varētu būt.",
+            "Salīdzini tikai viena tipa laukus: kodu ar kodu, datumu ar datumu, diametru ar diametru, kadastra numuru ar kadastra numuru.",
         ],
         "similar_positive_examples": examples,
         "negative_rules_do_not_repeat": negative_rules,
@@ -730,10 +881,105 @@ def call_ai_for_family(
         cleaned_candidates = []
         for c in candidates:
             if isinstance(c, dict):
-                c["family"] = family
-                if not candidate_is_too_vague(c):
-                    cleaned_candidates.append(c)
+                normalized = normalize_candidate(c, family)
+                if not candidate_is_too_vague(normalized):
+                    cleaned_candidates.append(normalized)
         return cleaned_candidates, ""
+    except Exception as e:
+        return [], str(e)
+
+
+def call_ai_for_cross_document_family(
+    client,
+    model: str,
+    pdf_items: List[Dict[str, Any]],
+    examples: List[Dict[str, str]],
+    negative_rules: List[str],
+    max_candidates: int,
+) -> Tuple[List[Dict[str, Any]], str]:
+    """J ģimeni palaiž vienā pieprasījumā ar vairāku PDF skaidri marķētu kontekstu."""
+    family = "J_cross_document_traceability"
+    docs = []
+    total_chars = 0
+    for item in pdf_items:
+        rel_path = clean_text(item.get("rel_path") or item.get("name"))
+        content = str(item.get("text") or "")[:18000]
+        block = f"===== FILE: {rel_path} =====\n{content}"
+        if total_chars + len(block) > 100000:
+            break
+        docs.append(block)
+        total_chars += len(block)
+    if len(docs) < 2:
+        return [], "J_cross_document_traceability vajag vismaz divus nolasītus PDF."
+
+    system = (
+        "Tu pārbaudi izsekojamību starp vairākiem būvprojekta PDF. "
+        "Ziņo tikai par konkrētu viena un tā paša elementa pretrunu starp vismaz diviem nosauktiem failiem. "
+        "Obligāti nosauc abus failus, lapas, abas vērtības un precīzos citātus. "
+        "Dažādi mezglu kodi paši par sevi nav kļūda. Neraksti 'nav skaidrs, vai', 'iespējams' vai 'varētu'. "
+        "Ja nav pierādāmas pretrunas, atgriez tukšu candidates sarakstu. "
+        "problem un designer_note apraksta vienu un to pašu konstatējumu. Atbildi tikai JSON."
+    )
+    payload = {
+        "family": family,
+        "max_candidates": max_candidates,
+        "rules": [
+            "Salīdzini tikai vienu un to pašu elementu vai dokumenta lauku.",
+            "Katrai piezīmei norādi target_file, comparison_files, target_page un comparison_pages.",
+            "Ja vērtības sakrīt, piezīmi neradi.",
+            "Nesalīdzini kadastra numuru ar objekta kodu vai citus atšķirīgus datu tipus.",
+        ],
+        "similar_positive_examples": examples,
+        "negative_rules_do_not_repeat": negative_rules,
+        "documents": "\n\n".join(docs),
+        "required_json_schema": {
+            "candidates": [{
+                "title": "īss virsraksts",
+                "target_file": "fails, kur tiks ievietota piezīme",
+                "target_page": 1,
+                "target_area": "vieta target failā",
+                "target_text": "precīzs target faila teksts",
+                "comparison_files": "otrs fails vai faili",
+                "comparison_pages": "otra faila lapas",
+                "comparison_target_text": "precīzs teksts otrā failā",
+                "problem": "konkrēta pretruna ar abām vērtībām un avotiem",
+                "designer_note": "tas pats konkrētais konstatējums bez riska un ieteikuma",
+                "issue_type": "cross_document_mismatch",
+                "severity": "low|medium|high",
+                "markup_type": "highlight|page_note",
+                "placement_confidence": "exact|approximate|manual_needed",
+                "evidence": "abi citāti",
+            }]
+        },
+    }
+    try:
+        resp = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+            ],
+            temperature=0.1,
+            response_format={"type": "json_object"},
+        )
+        data = json.loads(strip_json_fences(resp.choices[0].message.content or "{}"))
+        candidates = data.get("candidates", [])
+        if not isinstance(candidates, list):
+            return [], "AI JSON laukam candidates nav saraksta tips."
+        cleaned = []
+        valid_paths = {clean_text(x.get("rel_path") or x.get("name")) for x in pdf_items}
+        for raw in candidates:
+            if not isinstance(raw, dict):
+                continue
+            c = normalize_candidate(raw, family)
+            target_file = clean_text(c.get("target_file"))
+            if target_file not in valid_paths:
+                continue
+            if not clean_text(c.get("comparison_files")):
+                continue
+            if not candidate_is_too_vague(c):
+                cleaned.append(c)
+        return cleaned, ""
     except Exception as e:
         return [], str(e)
 
@@ -1047,6 +1293,7 @@ def init_state():
         "applied_folder_filter": "Visas mapes",
         "applied_pdf_search": "",
         "selected_pdf_ids_ui": [],
+        "audit_run_id": "",
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -1075,7 +1322,7 @@ def main():
         model = st.text_input("OpenAI modelis", value=get_secret("OPENAI_MODEL", default="gpt-4.1-mini") or "gpt-4.1-mini")
         max_context_chars = st.slider("PDF konteksta garums", 5000, 60000, 25000, 5000)
         max_examples_per_family = st.slider("Piemēri vienai ģimenei", 1, 12, 5, 1)
-        max_candidates_per_family = st.slider("Max piezīmes vienai ģimenei", 0, 5, 1, 1)
+        max_candidates_per_family = st.slider("Max piezīmes vienai ģimenei", 0, 8, 3, 1)
         st.caption("0 nozīmē: ģimeni šoreiz nepalaist.")
 
         index_df = st.session_state.get("index_df", pd.DataFrame())
@@ -1303,45 +1550,55 @@ def main():
                 if not filtered_pdf_files:
                     st.warning("Šajā mapē vai meklējumā PDF faili nav atrasti.")
                 else:
-                    max_selectable = 75
+                    max_selectable = 50
                     shown_pdf_files = filtered_pdf_files[:max_selectable]
                     if len(filtered_pdf_files) > max_selectable:
                         st.warning(
                             f"Izvēlei parādīti pirmie {max_selectable} no "
-                            f"{len(filtered_pdf_files)} PDF. "
-                            "Izmanto meklēšanu, lai sašaurinātu sarakstu."
+                            f"{len(filtered_pdf_files)} PDF. Izmanto meklēšanu, lai sašaurinātu sarakstu."
                         )
 
-                    option_ids = [clean_text(f.get("id")) for f in shown_pdf_files]
-                    by_id = {
-                        clean_text(f.get("id")): f
-                        for f in shown_pdf_files
-                    }
-
-                    selected_state = [
-                        file_id
-                        for file_id in st.session_state.get(
-                            "selected_pdf_ids_ui", []
-                        )
-                        if file_id in by_id
+                    by_id = {clean_text(f.get("id")): f for f in shown_pdf_files}
+                    active_ids = set(by_id)
+                    stored_ids = [
+                        x for x in st.session_state.get("selected_pdf_ids_ui", [])
+                        if x in active_ids
                     ]
-                    st.session_state.selected_pdf_ids_ui = selected_state
 
-                    selected_pdf_ids = st.multiselect(
-                        "Auditējamie PDF",
-                        options=option_ids,
-                        format_func=lambda file_id: clean_text(
-                            by_id.get(file_id, {}).get("rel_path")
-                        ),
-                        key="selected_pdf_ids_ui",
-                        placeholder="Izvēlies vienu vai vairākus PDF",
-                    )
+                    selection_signature = hashlib.sha1(
+                        f"{applied_folder}|{applied_search}".encode("utf-8")
+                    ).hexdigest()[:10]
+                    with st.form(f"pdf_file_selection_form_{selection_signature}", clear_on_submit=False):
+                        st.markdown("**Atzīmē auditējamos PDF:**")
+                        checked_ids: List[str] = []
+                        for file_id, item in by_id.items():
+                            rel_path = clean_text(item.get("rel_path"))
+                            key_hash = hashlib.sha1(
+                                f"{selection_signature}|{file_id}".encode("utf-8")
+                            ).hexdigest()[:16]
+                            checked = st.checkbox(
+                                rel_path,
+                                value=file_id in stored_ids,
+                                key=f"pdf_check_{key_hash}",
+                            )
+                            if checked:
+                                checked_ids.append(file_id)
 
-                    selected_pdf_files = [
-                        by_id[file_id]
-                        for file_id in selected_pdf_ids
-                        if file_id in by_id
+                        select_btn_col, _ = st.columns([1, 4])
+                        with select_btn_col:
+                            apply_pdf_selection = st.form_submit_button(
+                                "Apstiprināt PDF izvēli",
+                                use_container_width=True,
+                            )
+
+                    if apply_pdf_selection:
+                        st.session_state.selected_pdf_ids_ui = checked_ids
+
+                    selected_pdf_ids = [
+                        x for x in st.session_state.get("selected_pdf_ids_ui", [])
+                        if x in by_id
                     ]
+                    selected_pdf_files = [by_id[x] for x in selected_pdf_ids]
                     st.caption(f"Atzīmēti PDF: {len(selected_pdf_files)}")
 
                     if selected_pdf_files:
@@ -1478,17 +1735,40 @@ def main():
         st.caption("Vispirms jānolasa vismaz viens PDF un audit_examples_index.")
     else:
         st.caption(f"Analīzei sagatavoti PDF: {len(selected_pdf_items)}")
-        if st.button("Analizēt izvēlētos PDF", type="primary"):
+        analyze_col, _ = st.columns([1, 4])
+        with analyze_col:
+            analyze_clicked = st.button("Analizēt izvēlētos PDF", type="primary", use_container_width=True)
+        if analyze_clicked:
             client = get_openai_client()
             if client is None:
                 st.stop()
-            all_candidates = []
-            errors = []
+
+            clear_review_widget_state()
+            audit_run_id = f"RUN-{datetime.now().strftime('%Y%m%d%H%M%S')}-{str(time.time_ns())[-6:]}"
+            st.session_state.audit_run_id = audit_run_id
+            st.session_state.candidates = []
+            st.session_state.ai_errors = []
+
+            all_candidates: List[Dict[str, Any]] = []
+            errors: List[Dict[str, Any]] = []
             progress = st.progress(0)
             status = st.empty()
-            families_to_run = [f for f in selected_families if max_candidates_per_family > 0]
+            selected_family_set = set(selected_families)
+            per_pdf_families = [
+                f for f in selected_families
+                if f != "J_cross_document_traceability" and max_candidates_per_family > 0
+            ]
+            run_cross_document = (
+                "J_cross_document_traceability" in selected_family_set
+                and max_candidates_per_family > 0
+                and len(selected_pdf_items) >= 2
+            )
             negative_rules = make_negative_rules(st.session_state.feedback_df)
-            total_steps = max(1, len(selected_pdf_items) * len(families_to_run))
+            total_steps = max(
+                1,
+                len(selected_pdf_items) * len(per_pdf_families)
+                + (1 if run_cross_document else 0),
+            )
             step = 0
 
             for pdf_i, pdf_item in enumerate(selected_pdf_items, start=1):
@@ -1499,9 +1779,19 @@ def main():
                     errors.append({"pdf": pdf_rel_path, "family": "", "error": "PDF teksts ir tukšs; AI analīze izlaista."})
                     continue
 
-                for family in families_to_run:
+                # Deterministiskās pārbaudes papildina AI un nerada API izmaksas.
+                if "A_text_language" in selected_family_set:
+                    for c in detect_unit_case_candidates(pdf_item):
+                        c["source_pdf"] = pdf_name
+                        c["source_pdf_rel_path"] = pdf_rel_path
+                        all_candidates.append(c)
+
+                for family in per_pdf_families:
                     step += 1
-                    status.write(f"PDF {pdf_i}/{len(selected_pdf_items)} | pārbaude {step}/{total_steps}: {family} | {pdf_rel_path}")
+                    status.write(
+                        f"PDF {pdf_i}/{len(selected_pdf_items)} | pārbaude {step}/{total_steps}: "
+                        f"{family} | {pdf_rel_path}"
+                    )
                     examples = select_examples(
                         st.session_state.index_df,
                         family,
@@ -1524,14 +1814,68 @@ def main():
                     for c in candidates:
                         c["source_pdf"] = pdf_name
                         c["source_pdf_rel_path"] = pdf_rel_path
-                        c["include_default"] = True
-                        c["reject_default"] = False
                         all_candidates.append(c)
                     progress.progress(step / total_steps)
-            st.session_state.candidates = all_candidates
+
+            if run_cross_document:
+                step += 1
+                status.write(f"Starpdokumentu pārbaude {step}/{total_steps}: J_cross_document_traceability")
+                combined_text = "\n".join(str(x.get("text") or "")[:5000] for x in selected_pdf_items)
+                examples = select_examples(
+                    st.session_state.index_df,
+                    "J_cross_document_traceability",
+                    "MULTI_PDF",
+                    combined_text,
+                    max_examples_per_family,
+                )
+                cross_candidates, err = call_ai_for_cross_document_family(
+                    client=client,
+                    model=model,
+                    pdf_items=selected_pdf_items,
+                    examples=examples,
+                    negative_rules=negative_rules,
+                    max_candidates=max_candidates_per_family,
+                )
+                if err:
+                    errors.append({"pdf": "MULTI_PDF", "family": "J_cross_document_traceability", "error": err})
+                for c in cross_candidates:
+                    rel_path = clean_text(c.get("target_file"))
+                    matched = next(
+                        (x for x in selected_pdf_items if clean_text(x.get("rel_path") or x.get("name")) == rel_path),
+                        None,
+                    )
+                    c["source_pdf"] = clean_text(matched.get("name")) if matched else rel_path.rsplit("/", 1)[-1]
+                    c["source_pdf_rel_path"] = rel_path
+                    all_candidates.append(c)
+                progress.progress(step / total_steps)
+
+            # Gala normalizācija, dublikātu izmešana un unikāli kandidātu ID.
+            final_candidates: List[Dict[str, Any]] = []
+            seen = set()
+            for ordinal, raw in enumerate(all_candidates, start=1):
+                family = clean_text(raw.get("family"))
+                c = normalize_candidate(raw, family)
+                if candidate_is_too_vague(c):
+                    continue
+                dedupe_key = (
+                    clean_text(c.get("source_pdf_rel_path")),
+                    family,
+                    clean_text(c.get("target_page")),
+                    clean_text(c.get("target_text")).casefold(),
+                    clean_text(c.get("problem")).casefold(),
+                )
+                if dedupe_key in seen:
+                    continue
+                seen.add(dedupe_key)
+                c["candidate_id"] = make_candidate_id(c, audit_run_id, ordinal)
+                c["include_default"] = True
+                c["reject_default"] = False
+                final_candidates.append(c)
+
+            st.session_state.candidates = final_candidates
             st.session_state.ai_errors = errors
             status.write("AI analīze pabeigta.")
-            st.success(f"Ģenerētas piezīmes: {len(all_candidates)}")
+            st.success(f"Ģenerētas pārskatāmas piezīmes: {len(final_candidates)}")
 
     if st.session_state.ai_errors:
         with st.expander("AI batch kļūdas"):
@@ -1544,7 +1888,9 @@ def main():
         accepted_rows = []
         rejected_rows = []
         review_rows = []
+        audit_run_id = clean_text(st.session_state.get("audit_run_id")) or "RUN-UNKNOWN"
         for idx, c in enumerate(candidates, start=1):
+            candidate_id = clean_text(c.get("candidate_id")) or make_candidate_id(c, audit_run_id, idx)
             title = clean_text(c.get("title")) or f"Piezīme {idx}"
             family = clean_text(c.get("family"))
             with st.container(border=True):
@@ -1560,8 +1906,8 @@ def main():
                 st.markdown("**PDF komentārs:**")
                 edited_note = st.text_area(
                     "Labot īso komentāru",
-                    value=clean_text(c.get("designer_note") or c.get("comment_text")),
-                    key=f"designer_note_{idx}",
+                    value=clean_text(c.get("designer_note") or c.get("problem") or c.get("comment_text")),
+                    key=f"designer_note_{audit_run_id}_{candidate_id}",
                     height=75,
                 )
                 c["designer_note"] = edited_note
@@ -1570,16 +1916,18 @@ def main():
                     options=["Iekļaut Excel / markup", "Noraidīt"],
                     index=0,
                     horizontal=True,
-                    key=f"decision_{idx}",
+                    key=f"decision_{audit_run_id}_{candidate_id}",
                 )
                 include = decision == "Iekļaut Excel / markup"
                 reject = decision == "Noraidīt"
                 reject_reason = ""
                 do_not_show = False
                 if reject:
-                    reject_reason = st.text_input("Noraidīšanas iemesls", key=f"reject_reason_{idx}")
-                    do_not_show = st.checkbox("Turpmāk līdzīgas piezīmes nerādīt", key=f"do_not_show_{idx}")
+                    reject_reason = st.text_input("Noraidīšanas iemesls", key=f"reject_reason_{audit_run_id}_{candidate_id}")
+                    do_not_show = st.checkbox("Turpmāk līdzīgas piezīmes nerādīt", key=f"do_not_show_{audit_run_id}_{candidate_id}")
                 row_review = dict(c)
+                row_review["candidate_id"] = candidate_id
+                row_review["audit_run_id"] = audit_run_id
                 row_review["ui_include"] = include
                 row_review["ui_reject"] = reject
                 row_review["reject_reason"] = reject_reason
@@ -1589,7 +1937,12 @@ def main():
                 source_pdf_for_row = clean_text(c.get("source_pdf_rel_path")) or source_pdf_name
                 discipline = infer_discipline_from_filename(source_pdf_name)
                 if include and not reject:
-                    accepted_rows.append(candidate_to_export_row(c, len(accepted_rows) + 1, source_pdf_for_row, discipline))
+                    export_candidate = dict(c)
+                    export_candidate["designer_note"] = edited_note
+                    if clean_text(edited_note) and not _candidate_says_no_issue(edited_note):
+                        accepted_rows.append(candidate_to_export_row(export_candidate, len(accepted_rows) + 1, source_pdf_for_row, discipline))
+                    else:
+                        st.warning("Piezīme netiks eksportēta, jo PDF komentārs ir tukšs vai pasaka, ka neatbilstības nav.")
                 if reject:
                     rejected_rows.append(candidate_to_rejected_row(c, idx, source_pdf_for_row, reject_reason, do_not_show))
 
