@@ -1,6 +1,6 @@
 # app_audit_examples_index.py
 # ------------------------------------------------------------
-# BP audit_examples indeksētājs v1.3
+# BP audit_examples indeksētājs v1.4
 #
 # Mērķis:
 # - nolasa 03_Memory/audit_examples mapē esošos 16 kolonnu audit_examples Excel failus;
@@ -8,7 +8,8 @@
 # - pārbauda struktūru un datu kvalitāti;
 # - automātiski piedāvā kļūdu ģimeni un scenāriju;
 # - izveido review_needed lapu klasifikācijas pārskatīšanai;
-# - ļauj lejupielādēt audit_examples_index.xlsx.
+# - ļauj lejupielādēt audit_examples_index.xlsx;
+# - v1.4: pievieno manuālos issue_type mappingus un M/N ģimenes.
 #
 # Streamlit secrets piemērs:
 # [google_service_account]
@@ -45,7 +46,7 @@ from googleapiclient.errors import HttpError
 from googleapiclient.http import MediaIoBaseDownload
 
 
-APP_TITLE = "BP audit_examples indeksētājs v1.3"
+APP_TITLE = "BP audit_examples indeksētājs v1.4"
 SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
 
 REQUIRED_COLUMNS = [
@@ -351,6 +352,23 @@ def infer_family_and_scenario(row: pd.Series) -> Tuple[str, str, str]:
     s = text_blob(row)
     issue = clean_string(row.get("issue_type", "")).lower()
 
+    # v1.4: tiešie mappingi no 11_manual_family_mapping analīzes.
+    # Tie jāizpilda pirms vispārīgās atslēgvārdu loģikas, lai biežie issue_type
+    # nenokļūtu Z_unclassified vai pārāk plašās ģimenēs.
+    issue_mapping = {
+        "text_error": ("A_text_language", "SC-A01_spelling_or_wording_error", "Drukas, locījuma vai formulējuma kļūda"),
+        "architecture_description_text_error": ("A_text_language", "SC-A01_spelling_or_wording_error", "Drukas, locījuma vai formulējuma kļūda"),
+        "technical_notation_error": ("A_text_language", "SC-A03_unit_or_symbol_error", "Mērvienības vai simbola pieraksta kļūda"),
+        "system_code_mismatch": ("J_cross_document_traceability", "SC-J02_system_code_mismatch", "Sistēmas koda neatbilstība starp dokumentiem"),
+        "door_hardware_code_ambiguity": ("K_solution_or_graphic_clarity", "SC-K02_unclear_reference_or_designation", "Neskaidra atsauce, apzīmējums vai mezgla/elementa identifikācija"),
+        "formatting_incomplete": ("N_completeness_or_missing_content", "SC-N02_incomplete_document_formatting", "Nepabeigts dokumenta formatējums vai struktūra"),
+        "incomplete_text": ("N_completeness_or_missing_content", "SC-N01_incomplete_or_unfinished_text", "Nepabeigts vai pārrauts teksts"),
+        "discipline_scope_mismatch": ("M_scope_or_discipline_boundary", "SC-M01_wrong_discipline_scope", "Neatbilstoša sadaļas atbildības robeža"),
+        "document_completeness_mismatch": ("N_completeness_or_missing_content", "SC-N03_document_content_missing", "Dokumenta saturs nav pilnīgs vai neatbilst satura rādītājam"),
+    }
+    if issue in issue_mapping:
+        return issue_mapping[issue]
+
     # A. teksts / gramatika / terminoloģija
     if any(k in s for k in ["drukas", "gramatik", "valodas kļ", "pārrakst", "typo", "spelling", "termin", "mērvien", "mpa", "centralizētāj", "excretion"]):
         if any(k in s for k in ["excretion", "translation", "tulkoj", "angļu", "english"]):
@@ -407,7 +425,7 @@ def infer_family_and_scenario(row: pd.Series) -> Tuple[str, str, str]:
 
     # J. izsekojamība
     if any(k in s for k in ["nav izsekoj", "not traceable", "nesasaist", "saskaņot", "starp", "pret", "profile", "site plan"]):
-        return "J_traceability", "SC-J01_not_traceable_between_documents", "Izsekojamības problēma starp dokumentiem"
+        return "J_cross_document_traceability", "SC-J01_not_traceable_between_documents", "Izsekojamības problēma starp dokumentiem"
 
     # K. risinājuma / grafiskās skaidrības problēmas
     if any(k in s for k in [
@@ -424,6 +442,23 @@ def infer_family_and_scenario(row: pd.Series) -> Tuple[str, str, str]:
     ]):
         return "L_fire_safety_or_regulatory_logic", "SC-L01_fire_safety_or_regulatory_logic", "Ugunsdrošības vai normatīvās loģikas neatbilstība"
 
+    # M. sadaļu robežas / disciplīnas atbildība
+    if any(k in s for k in [
+        "discipline_scope", "sadaļas robež", "atbildības robež", "nepareiza sadaļa",
+        "citas sadaļas", "nav šīs sadaļas", "scope mismatch", "wrong discipline",
+        "ietilpst citā sadaļā", "jāpārnes uz", "jāattiecina uz"
+    ]):
+        return "M_scope_or_discipline_boundary", "SC-M01_wrong_discipline_scope", "Neatbilstoša sadaļas atbildības robeža"
+
+    # N. pilnīgums / trūkstošs vai nepabeigts saturs
+    if any(k in s for k in [
+        "nepiln", "incomplete", "nav pabeigt", "pārrauts teksts", "trūkst teksta",
+        "tukšs", "empty", "formatting incomplete", "document completeness",
+        "satura rādītāj", "saturs neatbilst", "nav iekļauta sadaļa", "missing content",
+        "nav pievienots", "nav pievienota", "nav norādīts", "nav norādīta"
+    ]):
+        return "N_completeness_or_missing_content", "SC-N01_incomplete_or_unfinished_text", "Nepabeigts vai trūkstošs dokumenta saturs"
+
     # fallback pēc issue_type
     if "missing" in issue and "spec" in issue:
         return "I_specification_coverage", "SC-I01_missing_from_specification", "Risinājums/elements nav iekļauts specifikācijā"
@@ -433,6 +468,10 @@ def infer_family_and_scenario(row: pd.Series) -> Tuple[str, str, str]:
         return "C_dates_versions", "SC-C01_date_or_revision_mismatch", "Datumu, versiju vai revīziju neatbilstība"
     if "drawing" in issue or "identity" in issue:
         return "D_document_identity", "SC-D01_file_title_block_mismatch", "Faila, titullauka vai dokumenta identitātes neatbilstība"
+    if "scope" in issue or "discipline" in issue:
+        return "M_scope_or_discipline_boundary", "SC-M01_wrong_discipline_scope", "Neatbilstoša sadaļas atbildības robeža"
+    if "completeness" in issue or "incomplete" in issue or "formatting" in issue:
+        return "N_completeness_or_missing_content", "SC-N01_incomplete_or_unfinished_text", "Nepabeigts vai trūkstošs dokumenta saturs"
     if "quantity" in issue:
         return "H_quantity_position", "SC-H01_quantity_or_position_mismatch", "Daudzuma, pozīcijas vai numerācijas neatbilstība"
     if "material" in issue or "type" in issue or "model" in issue:
@@ -673,9 +712,11 @@ def build_family_catalog() -> pd.DataFrame:
         {"family": "G_material_type_model", "meaning": "Materiālu, tipu, marku, modeļu, diametru un tehnisko parametru neatbilstības", "api_v1_priority": "medium"},
         {"family": "H_quantity_position", "meaning": "Daudzumu, pozīciju, numerācijas un tukšu/neskaidru pozīciju neatbilstības", "api_v1_priority": "medium"},
         {"family": "I_specification_coverage", "meaning": "Risinājumi vai elementi nav iekļauti specifikācijā", "api_v1_priority": "later"},
-        {"family": "J_traceability", "meaning": "Izsekojamības problēmas starp SA, plāniem, profiliem, specifikācijām u.c.", "api_v1_priority": "later"},
+        {"family": "J_cross_document_traceability", "meaning": "Izsekojamības problēmas starp SA, plāniem, profiliem, specifikācijām u.c.", "api_v1_priority": "later"},
         {"family": "K_solution_or_graphic_clarity", "meaning": "Risinājuma, grafikas, salasāmības, izvietojuma un piesaistes skaidrības problēmas", "api_v1_priority": "medium"},
         {"family": "L_fire_safety_or_regulatory_logic", "meaning": "Ugunsdrošības, evakuācijas un normatīvās loģikas neatbilstības", "api_v1_priority": "medium"},
+        {"family": "M_scope_or_discipline_boundary", "meaning": "Sadaļu robežu, disciplīnu tvēruma un projektētāju atbildības robežu neatbilstības", "api_v1_priority": "medium"},
+        {"family": "N_completeness_or_missing_content", "meaning": "Nepabeigts, trūkstošs vai strukturāli nepilnīgs dokumenta saturs", "api_v1_priority": "medium"},
         {"family": "Z_unclassified", "meaning": "Automātiski neklasificēts; jāpārskata", "api_v1_priority": "review"},
     ]
     return pd.DataFrame(rows)
