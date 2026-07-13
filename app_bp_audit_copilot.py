@@ -34,7 +34,7 @@ except Exception:
     HttpError = Exception
 
 
-APP_VERSION = "v0.6.3.7"
+APP_VERSION = "v0.6.3.8"
 APP_TITLE = f"BP AI Audit Copilot {APP_VERSION}"
 
 REQUIRED_EXPORT_COLUMNS = [
@@ -1547,9 +1547,9 @@ def main():
     if pdf_files or st.session_state.get("project_folders"):
         st.subheader("3. Izvēlies un nolasi auditējamos PDF")
         st.caption(
-            "Vispirms izvēlies reālu projekta mapi tieši zem 01_Input, pēc tam "
-            "projekta apakšmapi. Arī tukšas projekta mapes tiek parādītas. "
-            "Filtrs tiek piemērots tikai pēc pogas nospiešanas."
+            "Izvēloties projekta mapi, tās PDF tiek parādīti uzreiz. "
+            "Apakšmapes un nosaukuma meklēšanas filtrs tiek piemērots pēc pogas nospiešanas. "
+            "Arī tukšas projekta mapes tiek parādītas."
         )
 
         try:
@@ -1631,58 +1631,53 @@ def main():
                     current_project = project_options[0]
                     st.session_state.selected_project_filter = current_project
 
-                project_files_for_options = [
+                # Projekta izvēle ir ārpus formas. Mainot projektu, Streamlit veic
+                # vienu rerun un uzreiz pārrēķina apakšmapes un redzamos PDF.
+                project_value = st.selectbox(
+                    "Auditējamā projekta mape 01_Input mapē",
+                    options=project_options,
+                    format_func=lambda x: f"{x} ({project_counts.get(x, 0)} PDF)",
+                    key="selected_project_filter",
+                )
+
+                previous_applied_project = clean_text(
+                    st.session_state.get("applied_project_filter")
+                )
+                if project_value != previous_applied_project:
+                    st.session_state.applied_project_filter = project_value
+                    st.session_state.selected_folder_filter = "Viss projekts"
+                    st.session_state.applied_folder_filter = "Viss projekts"
+                    st.session_state.pdf_search_value = ""
+                    st.session_state.applied_pdf_search = ""
+                    st.session_state.selected_pdf_ids_ui = []
+
+                selected_project_files = [
                     f for f in normalized_pdf_files
-                    if clean_text(f.get("project_path")) == current_project
+                    if clean_text(f.get("project_path")) == project_value
                 ]
-                project_folder_paths = sorted({
+                selected_project_folders = sorted({
                     clean_text(f.get("folder_path"))
-                    for f in project_files_for_options
+                    for f in selected_project_files
                     if clean_text(f.get("folder_path"))
                 })
-                folder_options = ["Viss projekts"] + project_folder_paths
-                folder_counts = {
+                dynamic_folder_options = ["Viss projekts"] + selected_project_folders
+                dynamic_folder_counts = {
                     folder: sum(
-                        1 for f in project_files_for_options
+                        1 for f in selected_project_files
                         if clean_text(f.get("folder_path")) == folder
                     )
-                    for folder in project_folder_paths
+                    for folder in selected_project_folders
                 }
 
-                current_folder = st.session_state.get(
-                    "selected_folder_filter", "Viss projekts"
-                )
-                if current_folder not in folder_options:
+                if st.session_state.get("selected_folder_filter") not in dynamic_folder_options:
                     st.session_state.selected_folder_filter = "Viss projekts"
 
-                with st.form("pdf_folder_filter_form", clear_on_submit=False):
-                    project_value = st.selectbox(
-                        "Auditējamā projekta mape 01_Input mapē",
-                        options=project_options,
-                        format_func=lambda x: f"{x} ({project_counts.get(x, 0)} PDF)",
-                        key="selected_project_filter",
-                    )
-
-                    selected_project_files = [
-                        f for f in normalized_pdf_files
-                        if clean_text(f.get("project_path")) == project_value
-                    ]
-                    selected_project_folders = sorted({
-                        clean_text(f.get("folder_path"))
-                        for f in selected_project_files
-                        if clean_text(f.get("folder_path"))
-                    })
-                    dynamic_folder_options = ["Viss projekts"] + selected_project_folders
-                    dynamic_folder_counts = {
-                        folder: sum(
-                            1 for f in selected_project_files
-                            if clean_text(f.get("folder_path")) == folder
-                        )
-                        for folder in selected_project_folders
-                    }
-                    if st.session_state.get("selected_folder_filter") not in dynamic_folder_options:
-                        st.session_state.selected_folder_filter = "Viss projekts"
-
+                # Apakšmape un meklēšana paliek formā, lai rakstīšana meklēšanas
+                # laukā nerenderētu PDF sarakstu pēc katras ievadītās rakstzīmes.
+                with st.form(
+                    f"pdf_folder_filter_form_{hashlib.sha1(project_value.encode('utf-8')).hexdigest()[:10]}",
+                    clear_on_submit=False,
+                ):
                     folder_value = st.selectbox(
                         "Apakšmape projektā",
                         options=dynamic_folder_options,
@@ -1702,7 +1697,7 @@ def main():
                     filter_btn_col, _ = st.columns([1, 4])
                     with filter_btn_col:
                         apply_filter_clicked = st.form_submit_button(
-                            "Parādīt izvēlētās mapes PDF",
+                            "Piemērot apakšmapes / meklēšanas filtru",
                             use_container_width=True,
                         )
 
