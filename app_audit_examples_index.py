@@ -1,6 +1,6 @@
 # app_audit_examples_index.py
 # ------------------------------------------------------------
-# BP audit_examples indeksētājs v1.5
+# BP audit_examples indeksētājs v1.6
 #
 # Mērķis:
 # - nolasa 03_Memory/audit_examples mapē esošos 16 kolonnu audit_examples Excel failus;
@@ -46,7 +46,7 @@ from googleapiclient.errors import HttpError
 from googleapiclient.http import MediaIoBaseDownload
 
 
-APP_TITLE = "BP audit_examples indeksētājs v1.5"
+APP_TITLE = "BP audit_examples indeksētājs v1.6"
 SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
 
 REQUIRED_COLUMNS = [
@@ -383,12 +383,24 @@ def infer_family_and_scenario(row: pd.Series) -> Tuple[str, str, str]:
         "technical_text_error": ("A_text_language", "SC-A02_technical_term_error", "Tehniskā termina kļūda"),
         "title_text_error": ("A_text_language", "SC-A01_spelling_or_wording_error", "Drukas, locījuma vai formulējuma kļūda"),
         "traceability_issue": ("J_cross_document_traceability", "SC-J01_not_traceable_between_documents", "Izsekojamības problēma starp dokumentiem"),
+
+        # v1.6: kvalitātes precizējumi pēc 2026-07-13 05:07 indeksa.
+        "missing_from_specification": ("I_specification_coverage", "SC-I01_missing_from_specification", "Risinājums/elements nav iekļauts specifikācijā"),
+        "drawing_text_error": ("A_text_language", "SC-A01_spelling_or_wording_error", "Drukas, locījuma vai formulējuma kļūda"),
+        "placeholder_left_in_drawing": ("N_completeness_or_missing_content", "SC-N01_incomplete_or_unfinished_text", "Nepabeigts vai trūkstošs dokumenta saturs"),
+        "street_name_text_error": ("A_text_language", "SC-A01_spelling_or_wording_error", "Drukas, locījuma vai formulējuma kļūda"),
+        "spelling_or_wording_error": ("A_text_language", "SC-A01_spelling_or_wording_error", "Drukas, locījuma vai formulējuma kļūda"),
     }
     if issue in issue_mapping:
         return issue_mapping[issue]
 
     # A. teksts / gramatika / terminoloģija
-    if any(k in s for k in ["drukas", "gramatik", "valodas kļ", "pārrakst", "typo", "spelling", "termin", "mērvien", "mpa", "centralizētāj", "excretion"]):
+    if any(k in s for k in [
+        "drukas", "gramatik", "valodas kļ", "pārrakst", "typo", "spelling",
+        "termin", "mērvien", "mpa", "centralizētāj", "excretion",
+        "pislēgums", "kontrukcijas", "atjunošanu", "pēteresalas", "petresalas",
+        "pareizrakst", "wording", "text error", "teksta kļ"
+    ]):
         if any(k in s for k in ["excretion", "translation", "tulkoj", "angļu", "english"]):
             return "A_text_language", "SC-A02_wrong_technical_translation", "Teksta / valodas / tehniskā termina kļūda"
         if any(k in s for k in ["mērvien", "mpa", "l/s", "bar", "mm", "m³", "m3"]):
@@ -419,6 +431,15 @@ def infer_family_and_scenario(row: pd.Series) -> Tuple[str, str, str]:
             return "D_document_identity", "SC-D02_wrong_project_code", "Nepareizs projekta kods vai veca projekta atsauce"
         return "D_document_identity", "SC-D01_file_title_block_mismatch", "Faila, titullauka vai dokumenta identitātes neatbilstība"
 
+    # I. specifikācijas trūkumi
+    # Šis jāizpilda pirms E/G, jo šādās piezīmēs bieži ir arī "atsauce", "materiāls" vai tehnisks parametrs.
+    if any(k in s for k in [
+        "nav iekļauts", "nav iekļauti", "nav specifik", "trūkst specifik",
+        "missing_from_specification", "papildināt specifik", "jāpapildina specifik",
+        "specifikācijā nav", "nav paredzēts specifikācijā"
+    ]):
+        return "I_specification_coverage", "SC-I01_missing_from_specification", "Risinājums/elements nav iekļauts specifikācijā"
+
     # E. rasējumu saraksti / atsauces
     if any(k in s for k in ["rasējumu sarak", "drawing list", "atsauce", "reference", "neeksist", "nav atrodams", "sarakstā"]):
         return "E_drawing_list_references", "SC-E01_drawing_list_or_reference_mismatch", "Rasējumu saraksta vai savstarpējas atsauces neatbilstība"
@@ -436,10 +457,6 @@ def infer_family_and_scenario(row: pd.Series) -> Tuple[str, str, str]:
     # H. daudzumi / pozīcijas
     if any(k in s for k in ["daudzum", "quantity", "pozīc", "position", "tukša rinda", "kpl", "set", "numerāc"]):
         return "H_quantity_position", "SC-H01_quantity_or_position_mismatch", "Daudzuma, pozīcijas vai numerācijas neatbilstība"
-
-    # I. specifikācijas trūkumi
-    if any(k in s for k in ["nav iekļauts", "nav iekļauti", "nav specifik", "trūkst specifik", "missing_from_specification", "papildināt specifik"]):
-        return "I_specification_coverage", "SC-I01_missing_from_specification", "Risinājums/elements nav iekļauts specifikācijā"
 
     # J. izsekojamība
     if any(k in s for k in ["nav izsekoj", "not traceable", "nesasaist", "saskaņot", "starp", "pret", "profile", "site plan"]):
@@ -469,6 +486,9 @@ def infer_family_and_scenario(row: pd.Series) -> Tuple[str, str, str]:
         return "M_scope_or_discipline_boundary", "SC-M01_wrong_discipline_scope", "Neatbilstoša sadaļas atbildības robeža"
 
     # N. pilnīgums / trūkstošs vai nepabeigts saturs
+    if clean_string(row.get("target_text", "")).strip() in ["?", "??", "???"]:
+        return "N_completeness_or_missing_content", "SC-N01_incomplete_or_unfinished_text", "Nepabeigts vai trūkstošs dokumenta saturs"
+
     if any(k in s for k in [
         "nepiln", "incomplete", "nav pabeigt", "pārrauts teksts", "trūkst teksta",
         "tukšs", "empty", "formatting incomplete", "document completeness",
