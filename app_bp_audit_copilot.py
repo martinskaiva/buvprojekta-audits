@@ -33,7 +33,7 @@ except Exception:
     HttpError = Exception
 
 
-APP_VERSION = "v0.6"
+APP_VERSION = "v0.6.1"
 APP_TITLE = f"BP AI Audit Copilot {APP_VERSION}"
 
 REQUIRED_EXPORT_COLUMNS = [
@@ -530,6 +530,37 @@ def strip_json_fences(text: str) -> str:
     return text
 
 
+
+def candidate_is_too_vague(c: Dict[str, Any]) -> bool:
+    text = " ".join([
+        clean_text(c.get("title")),
+        clean_text(c.get("problem")),
+        clean_text(c.get("designer_note")),
+        clean_text(c.get("evidence")),
+    ]).lower()
+
+    vague_phrases = [
+        "var neatbilst",
+        "var nebūt",
+        "var radīt",
+        "dažādos dokumentos",
+        "citiem projekta dokumentiem",
+        "jāsaskaņo ar citiem",
+        "pārbaudīt un saskaņot",
+        "pilnībā saskaņots",
+        "nav pilnībā saskaņots",
+    ]
+    has_vague = any(p in text for p in vague_phrases)
+    if not has_vague:
+        return False
+
+    # Vājas piezīmes parasti nesatur konkrētas citētas vērtības vai salīdzinājumu.
+    has_quotes = ('"' in text) or ("“" in text) or ("”" in text) or ("'" in text)
+    has_vs = any(x in text for x in [" neatbilst ", " atšķiras ", " pret ", " salīdzinot ar ", " bet "])
+    has_specific_number = bool(re.search(r"\b(dn|d|ø)?\s*\d{2,4}\b|\b\d+[,.]?\d*\s*(mm|m|mpa|kw|v|a|m²|m3|m³)\b", text, flags=re.I))
+    return not ((has_quotes or has_specific_number) and has_vs)
+
+
 def call_ai_for_family(
     client,
     model: str,
@@ -543,7 +574,15 @@ def call_ai_for_family(
     instr = FAMILY_INSTRUCTIONS.get(family, {"name": family, "look_for": "", "report_if": "", "do_not_report": ""})
     system = (
         "Tu esi būvprojekta audita asistents. Ģenerē tikai pierādāmas piezīmes. "
-        "Neizdomā faktus. Ja nav pietiekama pierādījuma, atgriez tukšu candidates sarakstu. "
+        "Neizdomā faktus. Līdzīgie audit_examples piemēri ir tikai FORMULĒJUMA un kļūdu tipa paraugi — "
+        "nekad nepārnes no tiem konkrētus faktus, diametrus, materiālus, failu nosaukumus vai dokumentu atsauces uz jaunu piezīmi. "
+        "Piezīmi drīkst ģenerēt tikai tad, ja auditējamā PDF tekstā ir konkrēts pierādījums. "
+        "Ja piezīme salīdzina divas vērtības, skaidri nosauc abas vērtības un to avotus. "
+        "Nedrīkst rakstīt vispārīgi: 'var neatbilst', 'dažādos dokumentos', 'jāsaskaņo ar citiem dokumentiem', "
+        "ja nav precīzi nosaukts, kas tieši kam neatbilst. "
+        "Ja nav pietiekama pierādījuma, atgriez tukšu candidates sarakstu. "
+        "Raksti īsi. Neraksti sekas, riskus vai risinājuma instrukcijas. "
+        "PDF komentāram vajag tikai konkrētu konstatējumu: kas dokumentā redzams un ar ko tas nesakrīt. "
         "Atbildi tikai derīgā JSON formātā."
     )
     user = {
@@ -552,6 +591,14 @@ def call_ai_for_family(
         "family": family,
         "family_instruction": instr,
         "max_candidates": max_candidates,
+        "precision_rules": [
+            "Problēmas aprakstā jābūt konkrētai kļūdai, nevis vispārīgam riskam.",
+            "Ja raksti, ka A neatbilst B, obligāti nosauc A vērtību/tekstu un B vērtību/tekstu.",
+            "Ja salīdzināmais avots nav iekļauts auditējamā PDF tekstā, neatsaucies uz šo avotu kā uz pierādījumu.",
+            "Nedrīkst pārņemt faktus no similar_positive_examples; tie ir tikai stila un tipoloģijas piemēri.",
+            "Frāzes 'var neatbilst', 'var nebūt saskaņots', 'jāpārbauda ar citiem dokumentiem' ir atļautas tikai tad, ja blakus ir konkrēts nepareizais teksts un konkrēts salīdzināmais teksts.",
+            "designer_note jābūt lietojamai bez failu atvēršanas: tajā jāmin konkrētās vērtības/teksti, kas jāsaskaņo.",
+        ],
         "similar_positive_examples": examples,
         "negative_rules_do_not_repeat": negative_rules,
         "pdf_text": pdf_text,
@@ -564,14 +611,14 @@ def call_ai_for_family(
                     "target_area": "zona, tabula vai vieta dokumentā",
                     "target_text": "precīzs teksts, ko var mēģināt iezīmēt PDF; ja nav, MANUAL_PLACEMENT_REQUIRED",
                     "status": "kļūdas tips vai risks",
-                    "problem": "kas tieši nav pareizi",
-                    "why_important": "kāpēc tas ir būtiski",
-                    "designer_note": "īsa gatava piezīme projektētājam PDF komentāram",
+                    "problem": "precīzi apraksti kļūdu: norādi nepareizo tekstu/vērtību pēdiņās, salīdzināmo pareizo vai konfliktējošo tekstu/vērtību pēdiņās un avotu; bez vispārīgām frāzēm",
+                    "why_important": "atstāj tukšu; neraksti sekas vai riska aprakstu",
+                    "designer_note": "īss PDF komentāra teksts: tikai konkrēts konstatējums, kas ar ko nesakrīt; bez risinājuma instrukcijām",
                     "issue_type": "normalizēts issue_type",
                     "severity": "low|medium|high",
                     "markup_type": "highlight|rectangle|sticky_note|page_note",
                     "placement_confidence": "exact|approximate|manual_needed",
-                    "evidence": "īss pierādījums no dokumenta vai salīdzinājuma",
+                    "evidence": "precīzs pierādījums: citāts vai vērtības no auditējamā PDF; ja ir salīdzinājums, norādi abas puses",
                 }
             ]
         },
@@ -591,10 +638,13 @@ def call_ai_for_family(
         candidates = data.get("candidates", [])
         if not isinstance(candidates, list):
             return [], "AI JSON laukam candidates nav saraksta tips."
+        cleaned_candidates = []
         for c in candidates:
             if isinstance(c, dict):
                 c["family"] = family
-        return [c for c in candidates if isinstance(c, dict)], ""
+                if not candidate_is_too_vague(c):
+                    cleaned_candidates.append(c)
+        return cleaned_candidates, ""
     except Exception as e:
         return [], str(e)
 
@@ -606,9 +656,9 @@ def candidate_to_export_row(c: Dict[str, Any], idx: int, pdf_name: str, discipli
     if not markup:
         markup = "highlight" if placement == "exact" and target_text != "MANUAL_PLACEMENT_REQUIRED" else "page_note"
     problem = clean_text(c.get("problem"))
-    why = clean_text(c.get("why_important"))
     evidence = clean_text(c.get("evidence"))
-    comparison_evidence = "\n".join([x for x in [problem, why, evidence] if x])
+    # PDF/Excel piezīmei izmantojam īsu konstatējumu. Neiekļaujam sekas/riskus/risinājumu.
+    comparison_evidence = problem or evidence
     page = clean_text(c.get("target_page"))
     if not page:
         page = "1"
@@ -620,7 +670,7 @@ def candidate_to_export_row(c: Dict[str, Any], idx: int, pdf_name: str, discipli
         "target_page": page,
         "target_area": clean_text(c.get("target_area") or c.get("where")),
         "target_text": target_text,
-        "comment_text": clean_text(c.get("designer_note") or c.get("comment_text")),
+        "comment_text": clean_text(c.get("designer_note") or c.get("comment_text") or comparison_evidence),
         "issue_type": clean_text(c.get("issue_type") or c.get("family")),
         "severity": clean_text(c.get("severity")) or "medium",
         "comparison_files": "",
@@ -641,7 +691,7 @@ def candidate_to_rejected_row(c: Dict[str, Any], idx: int, pdf_name: str, reason
         "target_page": clean_text(c.get("target_page")),
         "target_area": clean_text(c.get("target_area") or c.get("where")),
         "target_text": clean_text(c.get("target_text")),
-        "comment_text": clean_text(c.get("designer_note") or c.get("comment_text")),
+        "comment_text": clean_text(c.get("designer_note") or c.get("comment_text") or comparison_evidence),
         "issue_type": clean_text(c.get("issue_type")),
         "reject_reason": reason,
         "do_not_show_similar": bool(do_not_show),
@@ -653,13 +703,32 @@ def candidate_to_rejected_row(c: Dict[str, Any], idx: int, pdf_name: str, reason
 
 
 def make_pdf_comment(row: Dict[str, Any]) -> str:
-    problem = clean_text(row.get("comparison_evidence"))
-    suggestion = clean_text(row.get("comment_text"))
+    problem = clean_text(row.get("comparison_evidence")) or clean_text(row.get("comment_text"))
     if not problem:
-        problem = suggestion or "Piezīme auditā."
-    if not suggestion:
-        suggestion = "Precizēt projektā."
-    return f"Komentārs:\n{problem}\n\nIeteikums:\n{suggestion}"
+        problem = "Piezīme auditā."
+    problem = shorten_pdf_comment(problem)
+    return f"Komentārs:\n{problem}"
+
+
+def shorten_pdf_comment(text: str, max_chars: int = 520) -> str:
+    text = clean_text(text)
+    # Izmet tipiskus vispārīgus seku/riska teikumus, lai PDF komentārs paliek īss.
+    stop_phrases = [
+        "var radīt", "var izraisīt", "var ietekmēt", "apgrūtina",
+        "lai nodrošinātu", "nepieciešams", "lūdzu pārbaudīt", "lūdzu saskaņot",
+        "būvniecības procesā", "projekta izpildē", "dokumentu pārvaldībā",
+    ]
+    sentences = re.split(r"(?<=[.!?])\s+", text)
+    kept = []
+    for sent in sentences:
+        low = sent.lower()
+        if any(p in low for p in stop_phrases) and kept:
+            continue
+        kept.append(sent.strip())
+    result = " ".join([x for x in kept if x]).strip() or text
+    if len(result) > max_chars:
+        result = result[:max_chars].rstrip() + "…"
+    return result
 
 
 def safe_int_page(value: Any, page_count: int) -> int:
@@ -1151,11 +1220,9 @@ def main():
                 st.markdown(f"**Statuss:** {clean_text(c.get('status'))}")
                 st.markdown("**Problēma:**")
                 st.write(clean_text(c.get("problem")))
-                st.markdown("**Kāpēc tas ir svarīgi:**")
-                st.write(clean_text(c.get("why_important")))
-                st.markdown("**Piezīme projektētājam:**")
+                st.markdown("**PDF komentārs:**")
                 edited_note = st.text_area(
-                    "Labot piezīmi projektētājam",
+                    "Labot īso komentāru",
                     value=clean_text(c.get("designer_note") or c.get("comment_text")),
                     key=f"designer_note_{idx}",
                     height=90,
