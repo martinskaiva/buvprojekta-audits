@@ -33,7 +33,7 @@ except Exception:
     HttpError = Exception
 
 
-APP_VERSION = "v0.6.3.1"
+APP_VERSION = "v0.6.3.2"
 APP_TITLE = f"BP AI Audit Copilot {APP_VERSION}"
 
 REQUIRED_EXPORT_COLUMNS = [
@@ -370,37 +370,63 @@ def normalize_index_df(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def load_audit_examples_index(service, memory_folder_id: str) -> Tuple[pd.DataFrame, Optional[Dict[str, Any]], List[str]]:
-    messages = []
-    index_file = find_latest_index_file(service, memory_folder_id)
-    if not index_file:
-        return pd.DataFrame(), None, [f"Nav atrasts .xlsx fails mapē 03_Memory/{INDEX_FOLDER_NAME}."]
-    data = drive_download_bytes(service, index_file["id"])
+    """Droši atrod, lejupielādē un nolasa jaunāko audita piemēru indeksu."""
+    messages: List[str] = []
+    index_file: Optional[Dict[str, Any]] = None
     try:
+        index_file = find_latest_index_file(service, memory_folder_id)
+        if not index_file:
+            return pd.DataFrame(), None, [f"Nav atrasts .xlsx fails mapē 03_Memory/{INDEX_FOLDER_NAME}."]
+
+        data = drive_download_bytes(service, index_file["id"])
+        if not data:
+            return pd.DataFrame(), index_file, [f"Indeksa fails {index_file.get('name')} ir tukšs vai netika lejupielādēts."]
+
         df = read_excel_sheet_from_bytes(data, ["1_examples_index", "examples_index"])
         df = normalize_index_df(df)
+        if df.empty:
+            messages.append(f"Indekss {index_file.get('name')} tika nolasīts, bet tajā nav izmantojamu piemēru.")
         return df, index_file, messages
     except Exception as e:
-        return pd.DataFrame(), index_file, [f"Neizdevās nolasīt indeksu {index_file.get('name')}: {e}"]
+        name = clean_text(index_file.get("name")) if index_file else "audit_examples_index"
+        return pd.DataFrame(), index_file, [f"Neizdevās nolasīt indeksu {name}: {e}"]
 
 
-def load_feedback(service, memory_folder_id: str) -> pd.DataFrame:
-    feedback_folder = drive_find_child_folder(service, memory_folder_id, FEEDBACK_FOLDER_NAME)
-    if not feedback_folder:
-        return pd.DataFrame()
-    files = drive_list_recursive(service, feedback_folder["id"], (".xlsx", ".xlsm"), prefix=FEEDBACK_FOLDER_NAME, max_files=200)
-    files = [f for f in files if "rejected" in f.get("name", "").lower() and not f.get("name", "").startswith("~$")]
-    if not files:
-        return pd.DataFrame()
-    latest = sorted(files, key=lambda x: x.get("modifiedTime", ""), reverse=True)[0]
+def load_feedback(service, memory_folder_id: str) -> Tuple[pd.DataFrame, List[str]]:
+    """Nolasa jaunāko negatīvās atmiņas failu; kļūda nedrīkst apturēt lietotni."""
+    messages: List[str] = []
     try:
+        feedback_folder = drive_find_child_folder(service, memory_folder_id, FEEDBACK_FOLDER_NAME)
+        if not feedback_folder:
+            return pd.DataFrame(), [f"Mape 03_Memory/{FEEDBACK_FOLDER_NAME} nav atrasta. Turpinu bez negatīvās atmiņas."]
+
+        files = drive_list_recursive(
+            service,
+            feedback_folder["id"],
+            (".xlsx", ".xlsm"),
+            prefix=FEEDBACK_FOLDER_NAME,
+            max_files=200,
+        )
+        files = [
+            f for f in files
+            if "rejected" in clean_text(f.get("name")).lower()
+            and not clean_text(f.get("name")).startswith("~$")
+        ]
+        if not files:
+            return pd.DataFrame(), []
+
+        latest = sorted(files, key=lambda x: x.get("modifiedTime", ""), reverse=True)[0]
         data = drive_download_bytes(service, latest["id"])
+        if not data:
+            return pd.DataFrame(), [f"Feedback fails {latest.get('name')} ir tukšs. Turpinu bez negatīvās atmiņas."]
+
         df = pd.read_excel(io.BytesIO(data), dtype=object)
         df.columns = [clean_text(c) for c in df.columns]
         for col in df.columns:
             df[col] = df[col].map(clean_text)
-        return df
-    except Exception:
-        return pd.DataFrame()
+        return df, messages
+    except Exception as e:
+        return pd.DataFrame(), [f"Feedback nolasīšana neizdevās: {e}. Turpinu bez negatīvās atmiņas."]
 
 
 def extract_pdf_text(pdf_bytes: bytes, max_chars: int) -> Tuple[str, List[Dict[str, Any]], str]:
@@ -1056,55 +1082,100 @@ def main():
         selected_families = st.multiselect("Iekšēji palaistās ģimenes", options=family_options, default=family_options)
         st.caption("Lietotājam ikdienā šo var paslēpt. Testā atstājam kontrolei.")
 
-    st.header("1. Datu nolasīšana")
-    c1, c2 = st.columns(2)
-    with c1:
-        if st.button("Nolasīt PDF failus no 01_Input", type="primary"):
-            if not input_folder_id.strip():
-                st.error("Nav norādīts 01_Input folder ID.")
-            else:
-                try:
-                    with st.spinner("Nolasu PDF failus..."):
-                        st.session_state.pdf_files = drive_list_recursive(service, input_folder_id.strip(), (".pdf",), prefix="", max_files=1000)
-                    st.success(f"Atrasti PDF faili: {len(st.session_state.pdf_files)}")
-                    if len(st.session_state.pdf_files) == 0:
-                        st.warning("01_Input mapē vai tās apakšmapēs netika atrasts neviens PDF. Pārbaudi folder ID un service account piekļuvi.")
-                    if st.session_state.get("drive_list_warnings"):
-                        with st.expander("Drive nolasīšanas brīdinājumi"):
-                            for w in st.session_state.get("drive_list_warnings", []):
-                                st.warning(w)
-                except Exception as e:
-                    st.session_state.pdf_files = []
-                    st.error("Neizdevās nolasīt PDF failus no 01_Input. Rīks neapstājās; zemāk ir tehniskā kļūda.")
-                    st.code(str(e))
-                    with st.expander("Pilns tehniskais traceback"):
-                        st.code(traceback.format_exc())
+    st.header("1. Zināšanu bāzes nolasīšana")
+    st.caption("Vispirms nolasi audit_examples_index un negatīvo atmiņu. Bez indeksa AI analīzi nevar sākt.")
 
-    with c2:
-        if st.button("Nolasīt audit_examples_index un feedback"):
-            if not memory_folder_id.strip():
-                st.error("Nav norādīts 03_Memory folder ID.")
-            else:
-                with st.spinner("Nolasu audit_examples_index/audit_feedback..."):
-                    df, index_file, messages = load_audit_examples_index(service, memory_folder_id.strip())
-                    st.session_state.index_df = df
-                    st.session_state.index_file = index_file
-                    st.session_state.feedback_df = load_feedback(service, memory_folder_id.strip())
-                if messages:
-                    for msg in messages:
-                        st.warning(msg)
+    if st.button(
+        "Nolasīt audit_examples_index un feedback",
+        type="primary",
+        use_container_width=True,
+    ):
+        if not memory_folder_id.strip():
+            st.error("Nav norādīts 03_Memory folder ID.")
+        else:
+            try:
+                with st.spinner("Nolasu audit_examples_index..."):
+                    df, index_file, index_messages = load_audit_examples_index(service, memory_folder_id.strip())
+
+                # Saglabājam indeksu tikai pēc kontrolētas nolasīšanas.
+                st.session_state.index_df = df
+                st.session_state.index_file = index_file
+
+                with st.spinner("Nolasu audit_feedback..."):
+                    feedback_df, feedback_messages = load_feedback(service, memory_folder_id.strip())
+                st.session_state.feedback_df = feedback_df
+
+                for msg in index_messages:
+                    st.warning(msg)
+                for msg in feedback_messages:
+                    st.warning(msg)
+
                 if not df.empty:
-                    st.success(f"Nolasīts indekss: {index_file.get('name')} — {len(df)} piemēri")
+                    index_name = clean_text(index_file.get("name")) if index_file else ""
+                    st.success(
+                        f"Zināšanu bāze nolasīta: {index_name} — {len(df)} piemēri; "
+                        f"feedback rindas: {len(feedback_df)}."
+                    )
                 else:
-                    st.error("Indekss nav nolasīts.")
+                    st.error("Indekss nav nolasīts. PDF failu solis paliek bloķēts.")
+            except Exception as e:
+                # Pēdējais drošības slānis, lai Streamlit nerādītu tikai vispārīgo “Oh no”.
+                st.session_state.index_df = pd.DataFrame()
+                st.session_state.index_file = None
+                st.session_state.feedback_df = pd.DataFrame()
+                st.error("Zināšanu bāzes nolasīšana neizdevās, bet lietotne turpina darboties.")
+                st.code(str(e))
+                with st.expander("Pilns tehniskais traceback"):
+                    st.code(traceback.format_exc())
 
     if st.session_state.index_file:
         idx = st.session_state.index_file
-        st.info(f"Aktīvais audit_examples_index: {idx.get('name')} | Modified: {idx.get('modifiedTime', '')}")
+        st.info(
+            f"Aktīvais audit_examples_index: {idx.get('name')} | "
+            f"Modified: {idx.get('modifiedTime', '')} | "
+            f"Piemēri: {len(st.session_state.index_df)} | "
+            f"Feedback: {len(st.session_state.feedback_df)}"
+        )
+
+    st.header("2. PDF failu saraksta nolasīšana")
+    index_ready = not st.session_state.index_df.empty
+    if not index_ready:
+        st.caption("Vispirms pabeidz 1. soli — nolasi audit_examples_index.")
+
+    if st.button(
+        "Nolasīt PDF failus no 01_Input",
+        disabled=not index_ready,
+        use_container_width=True,
+    ):
+        if not input_folder_id.strip():
+            st.error("Nav norādīts 01_Input folder ID.")
+        else:
+            try:
+                with st.spinner("Nolasu PDF failu sarakstu..."):
+                    st.session_state.pdf_files = drive_list_recursive(
+                        service,
+                        input_folder_id.strip(),
+                        (".pdf",),
+                        prefix="",
+                        max_files=1000,
+                    )
+                st.success(f"Atrasti PDF faili: {len(st.session_state.pdf_files)}")
+                if len(st.session_state.pdf_files) == 0:
+                    st.warning("01_Input mapē vai tās apakšmapēs netika atrasts neviens PDF. Pārbaudi folder ID un service account piekļuvi.")
+                if st.session_state.get("drive_list_warnings"):
+                    with st.expander("Drive nolasīšanas brīdinājumi"):
+                        for w in st.session_state.get("drive_list_warnings", []):
+                            st.warning(w)
+            except Exception as e:
+                st.session_state.pdf_files = []
+                st.error("Neizdevās nolasīt PDF failus no 01_Input. Lietotne turpina darboties.")
+                st.code(str(e))
+                with st.expander("Pilns tehniskais traceback"):
+                    st.code(traceback.format_exc())
 
     pdf_files = st.session_state.pdf_files
     if pdf_files:
-        st.subheader("2. Izvēlies auditējamos PDF")
+        st.subheader("3. Izvēlies un nolasi auditējamos PDF")
         st.caption("PDF faili tiek rādīti pa 01_Input apakšmapēm. Var atzīmēt vairākus failus; izvēle ir vertikālā sarakstā, lai redzams pilns nosaukums.")
 
         def _pdf_folder(rel_path: str) -> str:
@@ -1171,7 +1242,7 @@ def main():
                     for f in selected_pdf_files:
                         st.write(f.get("rel_path", f.get("name", "")))
 
-                if st.button("Lejupielādēt un nolasīt izvēlētos PDF tekstus"):
+                if st.button("Nolasīt izvēlēto PDF saturu", type="primary", use_container_width=True):
                     loaded_items: List[Dict[str, Any]] = []
                     errors: List[str] = []
                     progress = st.progress(0)
@@ -1233,7 +1304,7 @@ def main():
             fam_summary.columns = ["normalized_family", "count"]
             st.dataframe(fam_summary, use_container_width=True)
 
-    st.header("3. AI piezīmju ģenerēšana")
+    st.header("4. AI piezīmju ģenerēšana")
     selected_pdf_items = st.session_state.get("selected_pdf_items", [])
     ready = bool(selected_pdf_items) and not st.session_state.index_df.empty
     if not ready:
@@ -1301,7 +1372,7 @@ def main():
 
     candidates = st.session_state.candidates
     if candidates:
-        st.header("4. Piezīmju pārskatīšana")
+        st.header("5. Piezīmju pārskatīšana")
         st.caption("Noklusēti piezīme ir iekļauta Excel/markup. Ja noraidi, ieraksti iemeslu; vari atzīmēt arī 'turpmāk līdzīgas nerādīt'.")
         accepted_rows = []
         rejected_rows = []
@@ -1355,7 +1426,7 @@ def main():
                 if reject:
                     rejected_rows.append(candidate_to_rejected_row(c, idx, source_pdf_for_row, reject_reason, do_not_show))
 
-        st.header("5. Eksports")
+        st.header("6. Eksports")
         accepted_df = pd.DataFrame(accepted_rows, columns=REQUIRED_EXPORT_COLUMNS)
         rejected_df = pd.DataFrame(rejected_rows)
         review_df = pd.DataFrame(review_rows)
