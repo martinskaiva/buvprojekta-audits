@@ -33,7 +33,7 @@ except Exception:
     HttpError = Exception
 
 
-APP_VERSION = "v0.3.1"
+APP_VERSION = "v0.5.1"
 APP_TITLE = f"BP AI Audit Copilot {APP_VERSION}"
 
 REQUIRED_EXPORT_COLUMNS = [
@@ -542,12 +542,12 @@ def call_ai_for_family(
 ) -> Tuple[List[Dict[str, Any]], str]:
     instr = FAMILY_INSTRUCTIONS.get(family, {"name": family, "look_for": "", "report_if": "", "do_not_report": ""})
     system = (
-        "Tu esi būvprojekta audita asistents. Ģenerē tikai pierādāmas kandidātpiezīmes. "
+        "Tu esi būvprojekta audita asistents. Ģenerē tikai pierādāmas piezīmes. "
         "Neizdomā faktus. Ja nav pietiekama pierādījuma, atgriez tukšu candidates sarakstu. "
         "Atbildi tikai derīgā JSON formātā."
     )
     user = {
-        "task": "Analizē vienu PDF dokumentu un atrodi kandidātpiezīmes konkrētajā kļūdu ģimenē.",
+        "task": "Analizē vienu PDF dokumentu un atrodi piezīmes konkrētajā kļūdu ģimenē.",
         "pdf_file": pdf_name,
         "family": family,
         "family_instruction": instr,
@@ -558,7 +558,7 @@ def call_ai_for_family(
         "required_json_schema": {
             "candidates": [
                 {
-                    "title": "īss kandidātpiezīmes virsraksts",
+                    "title": "īss piezīmes virsraksts",
                     "where": "lapa un zona/tabula/teksts",
                     "target_page": 1,
                     "target_area": "zona, tabula vai vieta dokumentā",
@@ -650,7 +650,126 @@ def candidate_to_rejected_row(c: Dict[str, Any], idx: int, pdf_name: str, reason
     }
 
 
-def make_zip(accepted_df: pd.DataFrame, rejected_df: pd.DataFrame, review_df: pd.DataFrame, base_name: str) -> bytes:
+
+
+def make_pdf_comment(row: Dict[str, Any]) -> str:
+    problem = clean_text(row.get("comparison_evidence"))
+    suggestion = clean_text(row.get("comment_text"))
+    if not problem:
+        problem = suggestion or "Piezīme auditā."
+    if not suggestion:
+        suggestion = "Precizēt projektā."
+    return f"Komentārs:\n{problem}\n\nIeteikums:\n{suggestion}"
+
+
+def safe_int_page(value: Any, page_count: int) -> int:
+    txt = clean_text(value)
+    m = re.search(r"\d+", txt)
+    if not m:
+        return 0
+    page = int(m.group(0)) - 1
+    if page < 0:
+        page = 0
+    if page >= page_count:
+        page = page_count - 1
+    return page
+
+
+def add_page_note(page: Any, row: Dict[str, Any], comment: str) -> None:
+    try:
+        rect = page.rect
+        point = fitz.Point(rect.x1 - 36, rect.y0 + 36)
+        annot = page.add_text_annot(point, comment)
+        annot.set_info(title="AI būvprojekta audits", content=comment)
+        annot.update()
+    except Exception:
+        pass
+
+
+def annotate_pdf_bytes(pdf_bytes: bytes, accepted_df: pd.DataFrame) -> Tuple[Optional[bytes], List[Dict[str, Any]]]:
+    """Create an annotated PDF from accepted candidate rows.
+
+    The PDF is an aid for review: exact text matches are highlighted; otherwise a page note is added.
+    """
+    report: List[Dict[str, Any]] = []
+    if fitz is None:
+        return None, [{"status": "error", "message": "PyMuPDF/fitz nav pieejams Streamlit vidē."}]
+    if accepted_df is None or accepted_df.empty:
+        return pdf_bytes, []
+
+    try:
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    except Exception as e:
+        return None, [{"status": "error", "message": f"PDF nevar atvērt anotēšanai: {e}"}]
+
+    for _, row_s in accepted_df.iterrows():
+        row = {str(k): v for k, v in row_s.to_dict().items()}
+        note_id = clean_text(row.get("note_id"))
+        target_text = clean_text(row.get("target_text"))
+        markup_type = clean_text(row.get("markup_type")).lower()
+        placement = clean_text(row.get("placement_confidence")).lower()
+        page_index = safe_int_page(row.get("target_page"), len(doc))
+        page = doc[page_index]
+        comment = make_pdf_comment(row)
+
+        status = "page_note"
+        matches_count = 0
+        try:
+            can_search = bool(target_text) and target_text != "MANUAL_PLACEMENT_REQUIRED" and markup_type not in {"page_note", "sticky_note"}
+            if can_search:
+                matches = page.search_for(target_text, quads=True)
+                matches_count = len(matches)
+                if matches:
+                    # Avoid very broad accidental highlights for tiny targets like "7" or "19".
+                    if len(target_text) <= 3:
+                        matches = matches[:1]
+                    annot = page.add_highlight_annot(matches)
+                    annot.set_info(title="AI būvprojekta audits", content=comment)
+                    annot.update()
+                    status = "highlight_exact" if placement == "exact" else "highlight_found"
+                else:
+                    add_page_note(page, row, comment)
+                    status = "text_not_found_page_note"
+            else:
+                add_page_note(page, row, comment)
+                status = "page_note_manual"
+        except Exception as e:
+            try:
+                add_page_note(page, row, comment)
+                status = "annotation_error_page_note"
+            except Exception:
+                status = "annotation_error"
+            report.append({
+                "note_id": note_id,
+                "target_page": page_index + 1,
+                "target_text": target_text,
+                "status": status,
+                "matches": matches_count,
+                "error": str(e),
+            })
+            continue
+
+        report.append({
+            "note_id": note_id,
+            "target_page": page_index + 1,
+            "target_text": target_text,
+            "status": status,
+            "matches": matches_count,
+            "error": "",
+        })
+
+    out = io.BytesIO()
+    try:
+        doc.save(out, garbage=4, deflate=True)
+    except Exception:
+        out = io.BytesIO()
+        doc.save(out)
+    finally:
+        doc.close()
+    return out.getvalue(), report
+
+
+def make_zip(accepted_df: pd.DataFrame, rejected_df: pd.DataFrame, review_df: pd.DataFrame, base_name: str, pdf_bytes: Optional[bytes] = None) -> bytes:
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     bio = io.BytesIO()
     with zipfile.ZipFile(bio, "w", zipfile.ZIP_DEFLATED) as zf:
@@ -659,16 +778,28 @@ def make_zip(accepted_df: pd.DataFrame, rejected_df: pd.DataFrame, review_df: pd
             accepted_df.to_excel(writer, sheet_name="accepted_candidates", index=False)
         zf.writestr(f"accepted_candidates_{base_name}_{ts}.xlsx", acc_b.getvalue())
 
-        rej_b = io.BytesIO()
-        with pd.ExcelWriter(rej_b, engine="openpyxl") as writer:
-            rejected_df.to_excel(writer, sheet_name="rejected_patterns", index=False)
-        zf.writestr(f"rejected_patterns_{base_name}_{ts}.xlsx", rej_b.getvalue())
-        zf.writestr(f"rejected_patterns_{base_name}_{ts}.json", rejected_df.to_json(orient="records", force_ascii=False, indent=2))
+        # Rejected feedback files are only useful when the user actually rejects at least one candidate.
+        # Do not create empty rejected_patterns files. They add noise and can confuse the workflow.
+        if rejected_df is not None and not rejected_df.empty:
+            rej_b = io.BytesIO()
+            with pd.ExcelWriter(rej_b, engine="openpyxl") as writer:
+                rejected_df.to_excel(writer, sheet_name="rejected_patterns", index=False)
+            zf.writestr(f"rejected_patterns_{base_name}_{ts}.xlsx", rej_b.getvalue())
+            zf.writestr(f"rejected_patterns_{base_name}_{ts}.json", rejected_df.to_json(orient="records", force_ascii=False, indent=2))
 
         rev_b = io.BytesIO()
         with pd.ExcelWriter(rev_b, engine="openpyxl") as writer:
             review_df.to_excel(writer, sheet_name="all_ai_candidates_review", index=False)
         zf.writestr(f"all_ai_candidates_review_{base_name}_{ts}.xlsx", rev_b.getvalue())
+
+        if pdf_bytes and accepted_df is not None and not accepted_df.empty:
+            annotated_pdf, pdf_report = annotate_pdf_bytes(pdf_bytes, accepted_df)
+            if annotated_pdf:
+                zf.writestr(f"annotated_pdf_{base_name}_{ts}.pdf", annotated_pdf)
+            rep_b = io.BytesIO()
+            with pd.ExcelWriter(rep_b, engine="openpyxl") as writer:
+                pd.DataFrame(pdf_report).to_excel(writer, sheet_name="pdf_markup_report", index=False)
+            zf.writestr(f"pdf_markup_report_{base_name}_{ts}.xlsx", rep_b.getvalue())
     return bio.getvalue()
 
 
@@ -695,7 +826,7 @@ def main():
     init_state()
 
     st.title(APP_TITLE)
-    st.caption("AI ģenerē kandidātpiezīmes no viena indeksēta audit_examples Excel. Cilvēks akceptē vai noraida. Tikai akceptētās piezīmes iet uz markup Excel.")
+    st.caption("AI ģenerē piezīmes no viena indeksēta audit_examples Excel. Cilvēks akceptē vai noraida. Akceptētās piezīmes eksportējas uz Excel un anotētu PDF.")
 
     service = get_drive_service()
     if service is None:
@@ -712,7 +843,7 @@ def main():
         model = st.text_input("OpenAI modelis", value=get_secret("OPENAI_MODEL", default="gpt-4.1-mini") or "gpt-4.1-mini")
         max_context_chars = st.slider("PDF konteksta garums", 5000, 60000, 25000, 5000)
         max_examples_per_family = st.slider("Piemēri vienai ģimenei", 1, 12, 5, 1)
-        max_candidates_per_family = st.slider("Max kandidāti vienai ģimenei", 0, 5, 1, 1)
+        max_candidates_per_family = st.slider("Max piezīmes vienai ģimenei", 0, 5, 1, 1)
         st.caption("0 nozīmē: ģimeni šoreiz nepalaist.")
 
         index_df = st.session_state.get("index_df", pd.DataFrame())
@@ -774,21 +905,73 @@ def main():
     pdf_files = st.session_state.pdf_files
     if pdf_files:
         st.subheader("2. Izvēlies auditējamo PDF")
-        label_map = {f"{f.get('rel_path', f.get('name'))}": f for f in pdf_files}
-        selected_label = st.selectbox("PDF", options=list(label_map.keys()))
-        selected_pdf = label_map[selected_label]
-        if st.button("Lejupielādēt un nolasīt PDF tekstu"):
-            with st.spinner("Lejupielādēju un nolasu PDF..."):
-                pdf_bytes = drive_download_bytes(service, selected_pdf["id"])
-                text, pages, err = extract_pdf_text(pdf_bytes, max_context_chars)
-                if err:
-                    st.error(err)
-                else:
-                    st.session_state.selected_pdf_bytes = pdf_bytes
-                    st.session_state.selected_pdf_name = selected_pdf.get("name", "audit.pdf")
-                    st.session_state.pdf_text = text
-                    st.session_state.pdf_pages = pages
-                    st.success(f"Nolasīts: {selected_pdf.get('name')} | lapas: {len(pages)} | teksts: {len(text)} zīmes")
+        st.caption("PDF faili tiek rādīti pa 01_Input apakšmapēm, nevis vienā kopējā sarakstā.")
+
+        def _pdf_folder(rel_path: str) -> str:
+            rel_path = clean_text(rel_path)
+            if "/" not in rel_path:
+                return "01_Input sakne"
+            return rel_path.rsplit("/", 1)[0]
+
+        def _pdf_name(rel_path: str) -> str:
+            rel_path = clean_text(rel_path)
+            return rel_path.rsplit("/", 1)[-1]
+
+        for f in pdf_files:
+            f["folder_path"] = _pdf_folder(f.get("rel_path", f.get("name", "")))
+            f["display_name"] = _pdf_name(f.get("rel_path", f.get("name", "")))
+
+        folders = sorted(set(f.get("folder_path", "01_Input sakne") for f in pdf_files))
+        folder_counts = {folder: sum(1 for f in pdf_files if f.get("folder_path") == folder) for folder in folders}
+        folder_options = ["Visas mapes"] + [f"{folder} ({folder_counts.get(folder, 0)})" for folder in folders]
+        folder_value = st.selectbox("Mape", options=folder_options, index=0)
+
+        selected_folder = None
+        if folder_value != "Visas mapes":
+            selected_folder = folder_value.rsplit(" (", 1)[0]
+
+        search_value = st.text_input("Meklēt PDF pēc nosaukuma vai ceļa", value="", placeholder="piem., GENERAL DATA, UKT, RA_11100")
+        search_norm = clean_text(search_value).lower()
+
+        filtered_pdf_files = pdf_files
+        if selected_folder:
+            filtered_pdf_files = [f for f in filtered_pdf_files if f.get("folder_path") == selected_folder]
+        if search_norm:
+            filtered_pdf_files = [
+                f for f in filtered_pdf_files
+                if search_norm in clean_text(f.get("rel_path", f.get("name", ""))).lower()
+            ]
+
+        st.caption(f"Atrasti PDF izvēlē: {len(filtered_pdf_files)} no {len(pdf_files)}")
+
+        if not filtered_pdf_files:
+            st.warning("Šajā mapē / meklējumā PDF faili nav atrasti.")
+            selected_pdf = None
+        else:
+            label_map = {}
+            for f in filtered_pdf_files:
+                label = f"{f.get('display_name', f.get('name'))}  —  {f.get('folder_path', '')}"
+                label_map[label] = f
+            selected_label = st.selectbox("PDF", options=list(label_map.keys()))
+            selected_pdf = label_map[selected_label]
+
+        if selected_pdf:
+            with st.expander("Izvēlētā PDF ceļš"):
+                st.write(selected_pdf.get("rel_path", selected_pdf.get("name", "")))
+
+            if st.button("Lejupielādēt un nolasīt PDF tekstu"):
+                with st.spinner("Lejupielādēju un nolasu PDF..."):
+                    pdf_bytes = drive_download_bytes(service, selected_pdf["id"])
+                    text, pages, err = extract_pdf_text(pdf_bytes, max_context_chars)
+                    if err:
+                        st.error(err)
+                    else:
+                        st.session_state.selected_pdf_bytes = pdf_bytes
+                        st.session_state.selected_pdf_name = selected_pdf.get("name", "audit.pdf")
+                        st.session_state.selected_pdf_rel_path = selected_pdf.get("rel_path", selected_pdf.get("name", "audit.pdf"))
+                        st.session_state.pdf_text = text
+                        st.session_state.pdf_pages = pages
+                        st.success(f"Nolasīts: {selected_pdf.get('name')} | lapas: {len(pages)} | teksts: {len(text)} zīmes")
 
     if st.session_state.pdf_text:
         with st.expander("PDF teksta priekšskatījums"):
@@ -806,7 +989,7 @@ def main():
             fam_summary.columns = ["normalized_family", "count"]
             st.dataframe(fam_summary, use_container_width=True)
 
-    st.header("3. AI kandidātpiezīmju ģenerēšana")
+    st.header("3. AI piezīmju ģenerēšana")
     ready = bool(st.session_state.pdf_text) and not st.session_state.index_df.empty
     if not ready:
         st.caption("Vispirms jānolasa PDF un audit_examples_index.")
@@ -851,7 +1034,7 @@ def main():
             st.session_state.candidates = all_candidates
             st.session_state.ai_errors = errors
             status.write("AI analīze pabeigta.")
-            st.success(f"Ģenerētas kandidātpiezīmes: {len(all_candidates)}")
+            st.success(f"Ģenerētas piezīmes: {len(all_candidates)}")
 
     if st.session_state.ai_errors:
         with st.expander("AI batch kļūdas"):
@@ -859,14 +1042,14 @@ def main():
 
     candidates = st.session_state.candidates
     if candidates:
-        st.header("4. Kandidātu pārskatīšana")
-        st.caption("Noklusēti kandidāts ir iekļauts Excel/markup. Ja noraidi, ieraksti iemeslu; vari atzīmēt arī 'turpmāk līdzīgas nerādīt'.")
+        st.header("4. Piezīmju pārskatīšana")
+        st.caption("Noklusēti piezīme ir iekļauta Excel/markup. Ja noraidi, ieraksti iemeslu; vari atzīmēt arī 'turpmāk līdzīgas nerādīt'.")
         accepted_rows = []
         rejected_rows = []
         review_rows = []
         discipline = infer_discipline_from_filename(st.session_state.selected_pdf_name)
         for idx, c in enumerate(candidates, start=1):
-            title = clean_text(c.get("title")) or f"Kandidāts {idx}"
+            title = clean_text(c.get("title")) or f"Piezīme {idx}"
             family = clean_text(c.get("family"))
             with st.container(border=True):
                 st.markdown(f"### {idx}. {title}")
@@ -885,13 +1068,18 @@ def main():
                     height=90,
                 )
                 c["designer_note"] = edited_note
-                col_a, col_b = st.columns(2)
-                include = col_a.checkbox("Iekļaut Excel / markup", value=True, key=f"include_{idx}")
-                reject = col_b.checkbox("Noraidīt", value=False, key=f"reject_{idx}")
+                decision = st.radio(
+                    "Lēmums par piezīmi",
+                    options=["Iekļaut Excel / markup", "Noraidīt"],
+                    index=0,
+                    horizontal=True,
+                    key=f"decision_{idx}",
+                )
+                include = decision == "Iekļaut Excel / markup"
+                reject = decision == "Noraidīt"
                 reject_reason = ""
                 do_not_show = False
                 if reject:
-                    include = False
                     reject_reason = st.text_input("Noraidīšanas iemesls", key=f"reject_reason_{idx}")
                     do_not_show = st.checkbox("Turpmāk līdzīgas piezīmes nerādīt", key=f"do_not_show_{idx}")
                 row_review = dict(c)
@@ -912,11 +1100,12 @@ def main():
         c1, c2, c3 = st.columns(3)
         c1.metric("Akceptētas", len(accepted_df))
         c2.metric("Noraidītas", len(rejected_df))
-        c3.metric("Kopā kandidāti", len(review_df))
+        c3.metric("Kopā piezīmes", len(review_df))
+        st.caption("ZIP satur accepted/review Excel. Rejected faili tiek pievienoti tikai tad, ja ir noraidītas piezīmes. Ja ir akceptētas piezīmes un PDF ir nolasīts, ZIP satur arī annotated_pdf_*.pdf un pdf_markup_report_*.xlsx.")
         base = re.sub(r"[^A-Za-z0-9_\-]+", "_", os.path.splitext(st.session_state.selected_pdf_name)[0])[:80]
-        zip_bytes = make_zip(accepted_df, rejected_df, review_df, base)
+        zip_bytes = make_zip(accepted_df, rejected_df, review_df, base, st.session_state.selected_pdf_bytes)
         st.download_button(
-            "Lejupielādēt ZIP ar accepted/rejected/review Excel",
+            "Lejupielādēt ZIP ar PDF + Excel",
             data=zip_bytes,
             file_name=f"bp_ai_audit_copilot_{base}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip",
             mime="application/zip",
