@@ -43,7 +43,7 @@ except Exception:
     HttpError = Exception
 
 
-APP_VERSION = "v0.6.4.2"
+APP_VERSION = "v0.6.4.4"
 APP_TITLE = f"BP AI Audit Copilot {APP_VERSION}"
 
 REQUIRED_EXPORT_COLUMNS = [
@@ -211,173 +211,61 @@ def get_secret(*names: str, default: Optional[str] = None) -> Optional[str]:
 OAUTH_SCOPES = ["https://www.googleapis.com/auth/drive"]
 
 
-def normalize_oauth_redirect_uri(value: str) -> str:
-    """Normalize Streamlit root callback URL to its canonical trailing-slash form."""
-    uri = clean_text(value).strip()
-    if not uri:
-        return ""
-    uri = uri.split("?", 1)[0].split("#", 1)[0].rstrip("/") + "/"
-    return uri
-
-
 def get_google_oauth_config() -> Optional[Dict[str, str]]:
+    """Read long-lived OAuth credentials from Streamlit Secrets.
+
+    This version uses a refresh token and does not rely on a browser callback.
+    """
     try:
         section = st.secrets.get("google_oauth")
         if section:
             config = {
                 "client_id": clean_text(section.get("client_id")),
                 "client_secret": clean_text(section.get("client_secret")),
-                "redirect_uri": normalize_oauth_redirect_uri(section.get("redirect_uri")),
+                "refresh_token": clean_text(section.get("refresh_token")),
             }
             if all(config.values()):
                 return config
     except Exception:
         pass
+
     config = {
         "client_id": clean_text(get_secret("GOOGLE_OAUTH_CLIENT_ID", default="")),
         "client_secret": clean_text(get_secret("GOOGLE_OAUTH_CLIENT_SECRET", default="")),
-        "redirect_uri": normalize_oauth_redirect_uri(get_secret("GOOGLE_OAUTH_REDIRECT_URI", default="")),
+        "refresh_token": clean_text(get_secret("GOOGLE_OAUTH_REFRESH_TOKEN", default="")),
     }
     return config if all(config.values()) else None
 
 
-def oauth_client_config(config: Dict[str, str]) -> Dict[str, Any]:
-    return {"web": {
-        "client_id": config["client_id"],
-        "client_secret": config["client_secret"],
-        "auth_uri": "https://accounts.google.com/o/oauth2/auth",
-        "token_uri": "https://oauth2.googleapis.com/token",
-        "redirect_uris": [config["redirect_uri"]],
-    }}
+def get_oauth_drive_service(config: Optional[Dict[str, str]] = None):
+    """Build a Drive service from a stored OAuth refresh token."""
+    if UserCredentials is None or GoogleAuthRequest is None or build is None:
+        raise RuntimeError("Nav pieejamas Google OAuth bibliotēkas.")
 
-
-def create_oauth_state(client_secret: str) -> str:
-    timestamp = str(int(time.time()))
-    nonce = secrets.token_urlsafe(18)
-    payload = f"{timestamp}.{nonce}"
-    signature = hmac.new(client_secret.encode(), payload.encode(), hashlib.sha256).hexdigest()
-    return f"{payload}.{signature}"
-
-
-def validate_oauth_state(state: str, client_secret: str, max_age_seconds: int = 900) -> bool:
-    parts = clean_text(state).split(".")
-    if len(parts) != 3 or not parts[0].isdigit() or not parts[1]:
-        return False
-    timestamp, nonce, signature = parts
-    if abs(int(time.time()) - int(timestamp)) > max_age_seconds:
-        return False
-    payload = f"{timestamp}.{nonce}"
-    expected = hmac.new(client_secret.encode(), payload.encode(), hashlib.sha256).hexdigest()
-    return hmac.compare_digest(signature, expected)
-
-
-def build_oauth_flow(config: Dict[str, str], state: str = ""):
-    if Flow is None:
-        raise RuntimeError("Nav instalēta google-auth-oauthlib bibliotēka. Pievieno to requirements.txt.")
-    flow = Flow.from_client_config(
-        oauth_client_config(config),
-        scopes=OAUTH_SCOPES,
-        state=state or None,
-    )
-    flow.redirect_uri = config["redirect_uri"]
-    return flow
-
-
-def oauth_credentials_to_dict(credentials) -> Dict[str, Any]:
-    return {
-        "token": credentials.token,
-        "refresh_token": credentials.refresh_token,
-        "token_uri": credentials.token_uri,
-        "client_id": credentials.client_id,
-        "client_secret": credentials.client_secret,
-        "scopes": list(credentials.scopes or OAUTH_SCOPES),
-        "expiry": credentials.expiry.isoformat() if credentials.expiry else None,
-    }
-
-
-def oauth_credentials_from_dict(data: Dict[str, Any]):
-    if UserCredentials is None:
-        raise RuntimeError("Nav pieejama google.oauth2.credentials bibliotēka.")
-    expiry = None
-    if clean_text(data.get("expiry")):
-        try:
-            expiry = datetime.fromisoformat(clean_text(data.get("expiry")))
-        except Exception:
-            pass
-    return UserCredentials(
-        token=clean_text(data.get("token")) or None,
-        refresh_token=clean_text(data.get("refresh_token")) or None,
-        token_uri=clean_text(data.get("token_uri")) or "https://oauth2.googleapis.com/token",
-        client_id=clean_text(data.get("client_id")) or None,
-        client_secret=clean_text(data.get("client_secret")) or None,
-        scopes=data.get("scopes") or OAUTH_SCOPES,
-        expiry=expiry,
-    )
-
-
-def get_oauth_drive_service():
-    data = st.session_state.get("oauth_credentials")
-    if not isinstance(data, dict) or not data:
+    config = config or get_google_oauth_config()
+    if not config:
         return None
-    credentials = oauth_credentials_from_dict(data)
-    if credentials.expired and credentials.refresh_token:
-        credentials.refresh(GoogleAuthRequest())
-        st.session_state.oauth_credentials = oauth_credentials_to_dict(credentials)
+
+    credentials = UserCredentials(
+        token=None,
+        refresh_token=config["refresh_token"],
+        token_uri="https://oauth2.googleapis.com/token",
+        client_id=config["client_id"],
+        client_secret=config["client_secret"],
+        scopes=OAUTH_SCOPES,
+    )
+    credentials.refresh(GoogleAuthRequest())
     return build("drive", "v3", credentials=credentials, cache_discovery=False)
 
 
-def get_oauth_authorization_url(config: Dict[str, str]) -> str:
-    state = create_oauth_state(config["client_secret"])
-    flow = build_oauth_flow(config, state=state)
-    url, _ = flow.authorization_url(
-        access_type="offline",
-        include_granted_scopes="true",
-        prompt="consent",
-        state=state,
-    )
-    return url
+def get_oauth_user(service) -> Dict[str, str]:
+    about = service.about().get(fields="user(displayName,emailAddress)").execute()
+    user = about.get("user") or {}
+    return {
+        "email": clean_text(user.get("emailAddress")),
+        "name": clean_text(user.get("displayName")),
+    }
 
-
-def process_oauth_callback(config: Optional[Dict[str, str]]) -> None:
-    error = clean_text(st.query_params.get("error"))
-    error_description = clean_text(st.query_params.get("error_description"))
-    code = clean_text(st.query_params.get("code"))
-    state = clean_text(st.query_params.get("state"))
-    if error:
-        details = f": {error_description}" if error_description else ""
-        st.session_state.oauth_error = f"Google OAuth kļūda: {error}{details}"
-        st.query_params.clear()
-        return
-    if not code:
-        return
-    if not config:
-        st.session_state.oauth_error = "Google atgrieza kodu, bet [google_oauth] secrets nav pilnīgi."
-        return
-    if not validate_oauth_state(state, config["client_secret"]):
-        st.session_state.oauth_error = "OAuth state pārbaude neizdevās vai saite ir novecojusi."
-        st.query_params.clear()
-        return
-    try:
-        flow = build_oauth_flow(config, state=state)
-        flow.fetch_token(code=code)
-        credentials = flow.credentials
-        st.session_state.oauth_credentials = oauth_credentials_to_dict(credentials)
-        oauth_service = build("drive", "v3", credentials=credentials, cache_discovery=False)
-        about = oauth_service.about().get(fields="user(displayName,emailAddress)").execute()
-        user = about.get("user") or {}
-        st.session_state.oauth_user_email = clean_text(user.get("emailAddress"))
-        st.session_state.oauth_user_name = clean_text(user.get("displayName"))
-        st.session_state.oauth_error = ""
-        st.query_params.clear()
-        st.rerun()
-    except Exception as exc:
-        st.session_state.oauth_error = f"OAuth tokena saņemšana neizdevās: {exc}"
-        st.query_params.clear()
-
-
-def disconnect_google_oauth() -> None:
-    for key in ["oauth_credentials", "oauth_user_email", "oauth_user_name", "oauth_error", "drive_write_test_result", "drive_write_test_error"]:
-        st.session_state.pop(key, None)
 
 def get_service_account_info() -> Optional[Dict[str, Any]]:
     raw = get_secret("GOOGLE_SERVICE_ACCOUNT_JSON", "google_service_account_json")
@@ -1794,7 +1682,6 @@ def init_state():
         "audit_run_id": "",
         "drive_write_test_result": None,
         "drive_write_test_error": "",
-        "oauth_credentials": None,
         "oauth_user_email": "",
         "oauth_user_name": "",
         "oauth_error": "",
@@ -1812,7 +1699,6 @@ def main():
     st.caption("AI ģenerē piezīmes no viena indeksēta audit_examples Excel. Cilvēks akceptē vai noraida. Akceptētās piezīmes eksportējas uz Excel un anotētu PDF.")
 
     oauth_config = get_google_oauth_config()
-    process_oauth_callback(oauth_config)
 
     service = get_drive_service()
     if service is None:
@@ -1831,28 +1717,25 @@ def main():
         st.header("Iestatījumi")
 
         st.subheader("Google Drive OAuth")
-        if oauth_config:
-            st.caption(f"OAuth callback: {oauth_config['redirect_uri']}")
         if not oauth_config:
-            st.error("Nav atrasti [google_oauth] secrets: client_id, client_secret, redirect_uri.")
-        elif st.session_state.get("oauth_credentials"):
-            oauth_user = clean_text(st.session_state.get("oauth_user_email")) or clean_text(st.session_state.get("oauth_user_name")) or "Google lietotājs"
-            st.success(f"Savienots: {oauth_user}")
-            if st.button("Atvienot Google Drive", key="disconnect_google_oauth", use_container_width=True):
-                disconnect_google_oauth()
-                st.rerun()
+            st.error(
+                "Nav atrasti [google_oauth] secrets: client_id, "
+                "client_secret un refresh_token."
+            )
+            st.caption("Šī versija neizmanto redirect URI vai pārlūka callback.")
         else:
             try:
-                authorization_url = get_oauth_authorization_url(oauth_config)
-                st.link_button("Savienot Google Drive", authorization_url, use_container_width=True)
-                st.caption("Savieno pirms audita, lai pēc Google pāradresācijas nebūtu jāatkārto piezīmju ģenerēšana.")
+                sidebar_oauth_service = get_oauth_drive_service(oauth_config)
+                oauth_user = get_oauth_user(sidebar_oauth_service)
+                st.session_state.oauth_user_email = oauth_user.get("email", "")
+                st.session_state.oauth_user_name = oauth_user.get("name", "")
+                oauth_label = oauth_user.get("email") or oauth_user.get("name") or "Google lietotājs"
+                st.success(f"Drive OAuth aktīvs: {oauth_label}")
+                st.caption("Piekļuve tiek atjaunota automātiski ar refresh token.")
             except Exception as exc:
-                st.error(f"OAuth saites izveide neizdevās: {exc}")
-
-        oauth_error = clean_text(st.session_state.get("oauth_error"))
-        if oauth_error:
-            st.error(oauth_error)
-            st.caption("Ja Google pāradresācija neizdodas, pārbaudi, ka Google Cloud un Streamlit Secrets abās vietās redirect URI beidzas ar /.")
+                st.session_state.oauth_error = str(exc)
+                st.error("Drive OAuth refresh token nedarbojas.")
+                st.code(str(exc))
 
         input_folder_id = st.text_input("01_Input folder ID", value=input_folder_id)
         memory_folder_id = st.text_input("03_Memory folder ID", value=memory_folder_id)
@@ -2688,7 +2571,7 @@ def main():
 
         st.subheader("Saglabāšana Google Drive")
         st.caption(
-            "Rakstīšana notiek tava Google konta vārdā ar OAuth. "
+            "Rakstīšana notiek tava Google konta vārdā ar OAuth refresh token. "
             "Pašreiz tests izveido tikai nelielu TXT failu; pilna audita "
             "automātiska saglabāšana tiks pievienota nākamajā posmā."
         )
@@ -2696,7 +2579,7 @@ def main():
         oauth_service = None
         oauth_service_error = ""
         try:
-            oauth_service = get_oauth_drive_service()
+            oauth_service = get_oauth_drive_service(oauth_config)
         except Exception as exc:
             oauth_service_error = str(exc)
 
@@ -2705,9 +2588,8 @@ def main():
 
         if oauth_service is None:
             st.warning(
-                "Google Drive nav savienots. Sānjoslā nospied "
-                "“Savienot Google Drive”, pabeidz Google autorizāciju un "
-                "pēc atgriešanās palaid auditu."
+                "Google Drive OAuth nav konfigurēts. Streamlit Secrets sadaļā "
+                "pievieno client_id, client_secret un refresh_token."
             )
         else:
             oauth_user = (
@@ -2747,7 +2629,7 @@ def main():
             st.error("OAuth Drive rakstīšanas tests neizdevās.")
             st.code(write_test_error)
             st.caption(
-                "Pārbaudi OAuth redirect URI, Google testa lietotāju, "
+                "Pārbaudi refresh_token, OAuth klienta datus, "
                 "Drive scope un 02_Results folder ID."
             )
 
