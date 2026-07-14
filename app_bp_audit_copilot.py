@@ -211,6 +211,15 @@ def get_secret(*names: str, default: Optional[str] = None) -> Optional[str]:
 OAUTH_SCOPES = ["https://www.googleapis.com/auth/drive"]
 
 
+def normalize_oauth_redirect_uri(value: str) -> str:
+    """Normalize Streamlit root callback URL to its canonical trailing-slash form."""
+    uri = clean_text(value).strip()
+    if not uri:
+        return ""
+    uri = uri.split("?", 1)[0].split("#", 1)[0].rstrip("/") + "/"
+    return uri
+
+
 def get_google_oauth_config() -> Optional[Dict[str, str]]:
     try:
         section = st.secrets.get("google_oauth")
@@ -218,7 +227,7 @@ def get_google_oauth_config() -> Optional[Dict[str, str]]:
             config = {
                 "client_id": clean_text(section.get("client_id")),
                 "client_secret": clean_text(section.get("client_secret")),
-                "redirect_uri": clean_text(section.get("redirect_uri")),
+                "redirect_uri": normalize_oauth_redirect_uri(section.get("redirect_uri")),
             }
             if all(config.values()):
                 return config
@@ -227,7 +236,7 @@ def get_google_oauth_config() -> Optional[Dict[str, str]]:
     config = {
         "client_id": clean_text(get_secret("GOOGLE_OAUTH_CLIENT_ID", default="")),
         "client_secret": clean_text(get_secret("GOOGLE_OAUTH_CLIENT_SECRET", default="")),
-        "redirect_uri": clean_text(get_secret("GOOGLE_OAUTH_REDIRECT_URI", default="")),
+        "redirect_uri": normalize_oauth_redirect_uri(get_secret("GOOGLE_OAUTH_REDIRECT_URI", default="")),
     }
     return config if all(config.values()) else None
 
@@ -265,14 +274,13 @@ def validate_oauth_state(state: str, client_secret: str, max_age_seconds: int = 
 def build_oauth_flow(config: Dict[str, str], state: str = ""):
     if Flow is None:
         raise RuntimeError("Nav instalēta google-auth-oauthlib bibliotēka. Pievieno to requirements.txt.")
-    kwargs = {
-        "client_config": oauth_client_config(config),
-        "scopes": OAUTH_SCOPES,
-        "redirect_uri": config["redirect_uri"],
-    }
-    if state:
-        kwargs["state"] = state
-    return Flow.from_client_config(**kwargs)
+    flow = Flow.from_client_config(
+        oauth_client_config(config),
+        scopes=OAUTH_SCOPES,
+        state=state or None,
+    )
+    flow.redirect_uri = config["redirect_uri"]
+    return flow
 
 
 def oauth_credentials_to_dict(credentials) -> Dict[str, Any]:
@@ -332,10 +340,12 @@ def get_oauth_authorization_url(config: Dict[str, str]) -> str:
 
 def process_oauth_callback(config: Optional[Dict[str, str]]) -> None:
     error = clean_text(st.query_params.get("error"))
+    error_description = clean_text(st.query_params.get("error_description"))
     code = clean_text(st.query_params.get("code"))
     state = clean_text(st.query_params.get("state"))
     if error:
-        st.session_state.oauth_error = f"Google OAuth kļūda: {error}"
+        details = f": {error_description}" if error_description else ""
+        st.session_state.oauth_error = f"Google OAuth kļūda: {error}{details}"
         st.query_params.clear()
         return
     if not code:
@@ -1821,6 +1831,8 @@ def main():
         st.header("Iestatījumi")
 
         st.subheader("Google Drive OAuth")
+        if oauth_config:
+            st.caption(f"OAuth callback: {oauth_config['redirect_uri']}")
         if not oauth_config:
             st.error("Nav atrasti [google_oauth] secrets: client_id, client_secret, redirect_uri.")
         elif st.session_state.get("oauth_credentials"):
@@ -1840,6 +1852,7 @@ def main():
         oauth_error = clean_text(st.session_state.get("oauth_error"))
         if oauth_error:
             st.error(oauth_error)
+            st.caption("Ja Google pāradresācija neizdodas, pārbaudi, ka Google Cloud un Streamlit Secrets abās vietās redirect URI beidzas ar /.")
 
         input_folder_id = st.text_input("01_Input folder ID", value=input_folder_id)
         memory_folder_id = st.text_input("03_Memory folder ID", value=memory_folder_id)
