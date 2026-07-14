@@ -35,7 +35,7 @@ except Exception:
     HttpError = Exception
 
 
-APP_VERSION = "v0.6.4.0"
+APP_VERSION = "v0.6.4.1"
 APP_TITLE = f"BP AI Audit Copilot {APP_VERSION}"
 
 REQUIRED_EXPORT_COLUMNS = [
@@ -703,53 +703,129 @@ def infer_document_role(name: str) -> str:
     return "unknown"
 
 
-def score_example(row: pd.Series, pdf_name: str, pdf_text_sample: str, family: str, doc_role: str, discipline: str, project_code: str) -> int:
+def score_example(
+    row: pd.Series,
+    pdf_name: str,
+    pdf_text_sample: str,
+    family: str,
+    doc_role: str,
+    discipline: str,
+    project_code: str,
+) -> int:
+    """Novērtē globālā indeksa piemēra atbilstību konkrētajam auditam.
+
+    Project_code nekad nav filtrs. Citu projektu zelta piemēri vienmēr ir
+    pieejami. Tā paša projekta piemēram ir tikai neliels izšķirošais bonuss.
+    """
     score = 0
     if clean_text(row.get("normalized_family")) == family:
         score += 100
-    row_project = normalize_project_code(clean_text(row.get("project_code")))
-    wanted_project = normalize_project_code(project_code)
-    if wanted_project and row_project == wanted_project:
-        score += 30
+
     if doc_role and clean_text(row.get("document_role")) == doc_role:
-        score += 15
-    if discipline and clean_text(row.get("discipline")) == discipline:
-        score += 15
+        score += 25
+
+    row_discipline = clean_text(
+        row.get("discipline_final") or row.get("discipline")
+    )
+    if discipline and row_discipline.lower() == discipline.lower():
+        score += 20
+
     tf = clean_text(row.get("target_file")).lower()
     if discipline and discipline.lower() in tf:
         score += 5
+
     txt = clean_text(row.get("target_text"))
     if txt and len(txt) > 3 and txt.lower() in pdf_text_sample.lower():
         score += 20
+
+    # Izcelsmes projekts ir tikai vājš prioritātes bonuss, nevis robeža.
+    row_project = normalize_project_code(clean_text(row.get("project_code")))
+    wanted_project = normalize_project_code(project_code)
+    if wanted_project and row_project == wanted_project:
+        score += 5
+
     return score
 
 
-def select_examples(index_df: pd.DataFrame, family: str, pdf_name: str, pdf_text: str, max_examples: int, project_code: str = "") -> List[Dict[str, str]]:
-    if index_df.empty:
+def select_examples(
+    index_df: pd.DataFrame,
+    family: str,
+    pdf_name: str,
+    pdf_text: str,
+    max_examples: int,
+    project_code: str = "",
+) -> List[Dict[str, str]]:
+    """Atlasa piemērus no visa globālā indeksa.
+
+    Atlase nekad netiek ierobežota ar auditējamo projektu. Ja indeksā ir
+    piemēri no vairākiem projektiem, priekšroka tiek dota kvalitatīvi
+    atbilstošiem un vienlaikus dažādu projektu piemēriem.
+    """
+    if index_df.empty or max_examples <= 0:
         return []
+
     doc_role = infer_document_role(pdf_name)
     discipline = infer_discipline_from_filename(pdf_name)
     fam_df = index_df[index_df["normalized_family"].eq(family)].copy()
     if fam_df.empty:
         return []
+
     sample = pdf_text[:10000]
     fam_df["_score"] = fam_df.apply(
-        lambda r: score_example(r, pdf_name, sample, family, doc_role, discipline, project_code),
+        lambda r: score_example(
+            r,
+            pdf_name,
+            sample,
+            family,
+            doc_role,
+            discipline,
+            project_code,
+        ),
         axis=1,
     )
-    fam_df = fam_df.sort_values("_score", ascending=False).head(max_examples)
-    examples = []
-    for _, r in fam_df.iterrows():
+    fam_df["_project_key"] = fam_df["project_code"].map(
+        lambda value: normalize_project_code(clean_text(value)) or "GLOBAL"
+    )
+    fam_df = fam_df.sort_values(
+        ["_score", "_project_key", "note_id"],
+        ascending=[False, True, True],
+    )
+
+    # Vispirms paņemam labāko piemēru no katra pieejamā projekta.
+    selected_indices: List[Any] = []
+    for _, group in fam_df.groupby("_project_key", sort=False):
+        if len(selected_indices) >= max_examples:
+            break
+        selected_indices.append(group.index[0])
+
+    # Atlikušās vietas aizpildām ar kopumā labākajiem piemēriem.
+    if len(selected_indices) < max_examples:
+        for row_index in fam_df.index:
+            if row_index in selected_indices:
+                continue
+            selected_indices.append(row_index)
+            if len(selected_indices) >= max_examples:
+                break
+
+    selected_df = fam_df.loc[selected_indices].sort_values(
+        "_score", ascending=False
+    )
+
+    examples: List[Dict[str, str]] = []
+    for _, row in selected_df.iterrows():
         examples.append({
-            "note_id": clean_text(r.get("note_id")),
-            "family": clean_text(r.get("normalized_family")),
-            "scenario": clean_text(r.get("normalized_scenario")),
-            "target_area": clean_text(r.get("target_area")),
-            "target_text": clean_text(r.get("target_text")),
-            "comment_text": clean_text(r.get("comment_text")),
-            "issue_type": clean_text(r.get("issue_type")),
-            "comparison_evidence": clean_text(r.get("comparison_evidence")),
-            "project_code": clean_text(r.get("project_code")),
+            "note_id": clean_text(row.get("note_id")),
+            "family": clean_text(row.get("normalized_family")),
+            "scenario": clean_text(row.get("normalized_scenario")),
+            "target_area": clean_text(row.get("target_area")),
+            "target_text": clean_text(row.get("target_text")),
+            "comment_text": clean_text(row.get("comment_text")),
+            "issue_type": clean_text(row.get("issue_type")),
+            "comparison_evidence": clean_text(
+                row.get("comparison_evidence")
+            ),
+            "project_code": clean_text(row.get("project_code")),
+            "source_path": clean_text(row.get("source_path")),
         })
     return examples
 
@@ -1038,8 +1114,8 @@ def call_ai_for_family(
     instr = FAMILY_INSTRUCTIONS.get(family, {"name": family, "look_for": "", "report_if": "", "do_not_report": ""})
     system = (
         "Tu esi būvprojekta audita asistents. Ģenerē tikai pierādāmas piezīmes. "
-        "Neizdomā faktus. Līdzīgie audit_examples piemēri ir tikai FORMULĒJUMA un kļūdu tipa paraugi — "
-        "nekad nepārnes no tiem konkrētus faktus, diametrus, materiālus, failu nosaukumus vai dokumentu atsauces uz jaunu piezīmi. "
+        "Neizdomā faktus. Līdzīgie audit_examples piemēri ir globāli zelta paraugi no dažādiem projektiem un ir izmantojami jebkura projekta auditā tikai FORMULĒJUMAM un kļūdu tipa izpratnei — "
+        "nekad nepārnes no tiem konkrētus faktus, diametrus, materiālus, failu nosaukumus, projektu kodus vai dokumentu atsauces uz jaunu piezīmi. "
         "Piezīmi drīkst ģenerēt tikai tad, ja auditējamā PDF tekstā ir konkrēts pierādījums. "
         "Ja piezīme salīdzina divas vērtības, skaidri nosauc abas vērtības un to avotus. "
         "Nedrīkst rakstīt vispārīgi: 'var neatbilst', 'dažādos dokumentos', 'jāsaskaņo ar citiem dokumentiem', "
@@ -1593,68 +1669,8 @@ def main():
         selected_families = st.multiselect("Iekšēji palaistās ģimenes", options=family_options, default=family_options)
         st.caption("Lietotājam ikdienā šo var paslēpt. Testā atstājam kontrolei.")
 
-    with st.expander("Google Drive rakstīšanas pārbaude", expanded=False):
-        st.caption(
-            "Tests izveido vienu nelielu TXT failu mapē 02_Results. "
-            "Pilni audita rezultāti vēl netiek automātiski saglabāti."
-        )
-        write_test_col, _ = st.columns([1, 4])
-        with write_test_col:
-            test_drive_write_clicked = st.button(
-                "Testēt Drive rakstīšanu",
-                use_container_width=True,
-                key="test_drive_write_button",
-            )
-
-        if test_drive_write_clicked:
-            st.session_state.drive_write_test_result = None
-            st.session_state.drive_write_test_error = ""
-            if not input_folder_id.strip():
-                st.session_state.drive_write_test_error = (
-                    "Nav norādīts 01_Input folder ID."
-                )
-            else:
-                try:
-                    with st.spinner("Izveidoju testa failu 02_Results mapē..."):
-                        result = run_drive_write_test(
-                            service,
-                            input_folder_id=input_folder_id.strip(),
-                            results_folder_id=results_folder_id.strip(),
-                        )
-                    st.session_state.drive_write_test_result = result
-                except Exception as exc:
-                    st.session_state.drive_write_test_error = str(exc)
-
-        write_test_error = clean_text(
-            st.session_state.get("drive_write_test_error")
-        )
-        if write_test_error:
-            st.error("Drive rakstīšanas tests neizdevās.")
-            st.code(write_test_error)
-            st.caption(
-                "Pārbaudi, vai service account ir Editor tiesības uz "
-                "02_Results un lietotne pēc scope maiņas ir pilnībā pārstartēta."
-            )
-
-        write_test_result = st.session_state.get("drive_write_test_result")
-        if isinstance(write_test_result, dict) and write_test_result.get("ok"):
-            uploaded = write_test_result.get("file") or {}
-            target = write_test_result.get("target") or {}
-            st.success(
-                f"Rakstīšanas tests veiksmīgs. Izveidots fails "
-                f"{clean_text(uploaded.get('name'))} mapē "
-                f"{clean_text(target.get('name'))}."
-            )
-            web_link = clean_text(uploaded.get("webViewLink"))
-            if web_link:
-                st.markdown(f"[Atvērt testa failu Google Drive]({web_link})")
-            st.caption(
-                f"Drive file ID: {clean_text(uploaded.get('id'))} | "
-                f"Mapes noteikšana: {clean_text(target.get('source'))}"
-            )
-
     st.header("1. Zināšanu bāzes nolasīšana")
-    st.caption("Vispirms nolasi globālo audit_examples indeksu. Projekta feedback tiks nolasīts pēc projekta izvēles.")
+    st.caption("Nolasi globālo zelta piemēru indeksu. Visi indeksa piemēri ir izmantojami jebkura projekta auditā; projekta kods nosaka tikai izcelsmi un nelielu atlases prioritāti. Projekta feedback tiks nolasīts pēc projekta izvēles.")
 
     kb_btn_col, _ = st.columns([1, 4])
     with kb_btn_col:
@@ -2442,7 +2458,7 @@ def main():
         c1.metric("Akceptētas", len(accepted_df))
         c2.metric("Noraidītas", len(rejected_df))
         c3.metric("Kopā piezīmes", len(review_df))
-        st.caption("ZIP satur accepted/review Excel. Rejected faili tiek pievienoti tikai tad, ja ir noraidītas piezīmes. Ja ir akceptētas piezīmes un PDF ir nolasīts, ZIP satur arī annotated_pdf_*.pdf un pdf_markup_report_*.xlsx.")
+        st.caption("ZIP satur accepted/review Excel. Rejected faili tiek pievienoti tikai tad, ja ir noraidītas piezīmes. Ja ir akceptētas piezīmes un PDF ir nolasīts, ZIP satur arī annotated_pdf_*.pdf un pdf_markup_report_*.xlsx. Zemāk vari pārbaudīt rakstīšanu uz Google Drive 02_Results.")
         selected_pdf_items = st.session_state.get("selected_pdf_items", [])
         if len(selected_pdf_items) == 1:
             base_source = selected_pdf_items[0].get("name", st.session_state.selected_pdf_name)
@@ -2457,6 +2473,71 @@ def main():
             mime="application/zip",
             type="primary",
         )
+
+
+        st.subheader("Saglabāšana Google Drive")
+        st.caption(
+            "Vispirms pārbaudi rakstīšanas tiesības uz 02_Results. "
+            "Šis tests izveido tikai nelielu TXT failu; pilna audita "
+            "automātiska saglabāšana vēl nav ieslēgta."
+        )
+
+        drive_test_col, _ = st.columns([1, 4])
+        with drive_test_col:
+            test_drive_write_clicked = st.button(
+                "Testēt rakstīšanu 02_Results",
+                use_container_width=True,
+                key=f"test_drive_write_button_{audit_run_id}",
+            )
+
+        if test_drive_write_clicked:
+            st.session_state.drive_write_test_result = None
+            st.session_state.drive_write_test_error = ""
+            if not input_folder_id.strip():
+                st.session_state.drive_write_test_error = (
+                    "Nav norādīts 01_Input folder ID."
+                )
+            else:
+                try:
+                    with st.spinner(
+                        "Izveidoju testa failu 02_Results mapē..."
+                    ):
+                        result = run_drive_write_test(
+                            service,
+                            input_folder_id=input_folder_id.strip(),
+                            results_folder_id=results_folder_id.strip(),
+                        )
+                    st.session_state.drive_write_test_result = result
+                except Exception as exc:
+                    st.session_state.drive_write_test_error = str(exc)
+
+        write_test_error = clean_text(
+            st.session_state.get("drive_write_test_error")
+        )
+        if write_test_error:
+            st.error("Drive rakstīšanas tests neizdevās.")
+            st.code(write_test_error)
+            st.caption(
+                "Pārbaudi, vai service account ir Editor tiesības uz "
+                "02_Results un vai Drive scope nav drive.readonly."
+            )
+
+        write_test_result = st.session_state.get(
+            "drive_write_test_result"
+        )
+        if isinstance(write_test_result, dict) and write_test_result:
+            test_file = write_test_result.get("file") or {}
+            results_folder = write_test_result.get("results_folder") or {}
+            st.success(
+                f"Drive rakstīšanas tests izdevās: "
+                f"{clean_text(test_file.get('name'))}"
+            )
+            file_link = clean_text(test_file.get("webViewLink"))
+            folder_link = clean_text(results_folder.get("webViewLink"))
+            if file_link:
+                st.markdown(f"[Atvērt testa failu Google Drive]({file_link})")
+            if folder_link:
+                st.markdown(f"[Atvērt 02_Results mapi]({folder_link})")
 
 
 if __name__ == "__main__":
