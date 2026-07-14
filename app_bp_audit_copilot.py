@@ -25,16 +25,17 @@ except Exception:
 try:
     from google.oauth2 import service_account
     from googleapiclient.discovery import build
-    from googleapiclient.http import MediaIoBaseDownload
+    from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
     from googleapiclient.errors import HttpError
 except Exception:
     service_account = None
     build = None
     MediaIoBaseDownload = None
+    MediaIoBaseUpload = None
     HttpError = Exception
 
 
-APP_VERSION = "v0.6.3.9"
+APP_VERSION = "v0.6.4.0"
 APP_TITLE = f"BP AI Audit Copilot {APP_VERSION}"
 
 REQUIRED_EXPORT_COLUMNS = [
@@ -225,7 +226,8 @@ def get_drive_service_cached(sa_json: str):
     if service_account is None or build is None:
         raise RuntimeError("Nav pieejamas google-api-python-client bibliotēkas.")
     info = json.loads(sa_json)
-    scopes = ["https://www.googleapis.com/auth/drive.readonly"]
+    # Nepieciešams gan lasīšanai, gan audita rezultātu rakstīšanai Drive.
+    scopes = ["https://www.googleapis.com/auth/drive"]
     creds = service_account.Credentials.from_service_account_info(info, scopes=scopes)
     return build("drive", "v3", credentials=creds, cache_discovery=False)
 
@@ -313,6 +315,125 @@ def resolve_input_root(service, configured_folder_id: str, wanted_name: str = "0
             f"Neizdevās atrast vecākmapi ar nosaukumu {wanted_name}. "
             "Tiek izmantota konfigurētā mape."
         ),
+    }
+
+
+def resolve_results_folder(
+    service,
+    input_folder_id: str,
+    explicit_results_folder_id: str = "",
+) -> Dict[str, Any]:
+    """Atrod 02_Results mapi.
+
+    Prioritāte:
+    1) explicit_results_folder_id no secrets/UI;
+    2) 02_Results kā 01_Input māsas mape zem BP_Audits_tests.
+    """
+    explicit_id = clean_text(explicit_results_folder_id)
+    if explicit_id:
+        meta = drive_get_file_metadata(service, explicit_id)
+        if clean_text(meta.get("mimeType")) != "application/vnd.google-apps.folder":
+            raise RuntimeError("Norādītais 02_Results ID nav Google Drive mape.")
+        return {
+            "id": clean_text(meta.get("id")),
+            "name": clean_text(meta.get("name")),
+            "source": "explicit",
+            "parent_id": clean_text((meta.get("parents") or [""])[0]),
+        }
+
+    input_root = resolve_input_root(service, input_folder_id, wanted_name="01_Input")
+    input_root_id = clean_text(input_root.get("id"))
+    if not input_root_id:
+        raise RuntimeError("Neizdevās noteikt 01_Input mapi.")
+
+    input_meta = drive_get_file_metadata(service, input_root_id)
+    parents = input_meta.get("parents") or []
+    if not parents:
+        raise RuntimeError("01_Input mapei nav atrodama vecākmape BP_Audits_tests.")
+
+    bp_root_id = clean_text(parents[0])
+    results_folder = drive_find_child_folder(service, bp_root_id, "02_Results")
+    if not results_folder:
+        raise RuntimeError(
+            "Zem BP_Audits_tests netika atrasta mape 02_Results. "
+            "Norādi tās ID sānjoslā."
+        )
+
+    return {
+        "id": clean_text(results_folder.get("id")),
+        "name": clean_text(results_folder.get("name")),
+        "source": "sibling_of_01_Input",
+        "parent_id": bp_root_id,
+    }
+
+
+def drive_upload_bytes(
+    service,
+    folder_id: str,
+    file_name: str,
+    data: bytes,
+    mime_type: str,
+) -> Dict[str, Any]:
+    """Augšupielādē baita saturu konkrētā Google Drive mapē."""
+    if MediaIoBaseUpload is None:
+        raise RuntimeError("Nav pieejama MediaIoBaseUpload bibliotēka.")
+    if not clean_text(folder_id):
+        raise ValueError("Nav norādīts mērķa Drive mapes ID.")
+    if not clean_text(file_name):
+        raise ValueError("Nav norādīts augšupielādējamā faila nosaukums.")
+
+    media = MediaIoBaseUpload(
+        io.BytesIO(data),
+        mimetype=mime_type,
+        resumable=False,
+    )
+    metadata = {
+        "name": clean_text(file_name),
+        "parents": [clean_text(folder_id)],
+    }
+    return service.files().create(
+        body=metadata,
+        media_body=media,
+        fields="id,name,mimeType,size,createdTime,webViewLink,parents",
+        supportsAllDrives=True,
+    ).execute()
+
+
+def run_drive_write_test(
+    service,
+    input_folder_id: str,
+    results_folder_id: str = "",
+) -> Dict[str, Any]:
+    """Izveido nelielu testa TXT failu 02_Results mapē."""
+    target = resolve_results_folder(
+        service,
+        input_folder_id=input_folder_id,
+        explicit_results_folder_id=results_folder_id,
+    )
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    suffix = hashlib.sha1(
+        f"{timestamp}|{time.time_ns()}".encode("utf-8")
+    ).hexdigest()[:6]
+    file_name = f"drive_write_test_{timestamp}_{suffix}.txt"
+    content = (
+        "BP AI Audit Copilot Google Drive rakstīšanas tests\n"
+        f"App version: {APP_VERSION}\n"
+        f"Created at: {datetime.now().isoformat(timespec='seconds')}\n"
+        f"Target folder: {target.get('name')}\n"
+        "Ja šis fails ir redzams 02_Results mapē, rakstīšanas tiesības darbojas.\n"
+    ).encode("utf-8")
+    uploaded = drive_upload_bytes(
+        service,
+        folder_id=target["id"],
+        file_name=file_name,
+        data=content,
+        mime_type="text/plain",
+    )
+    return {
+        "ok": True,
+        "target": target,
+        "file": uploaded,
+        "created_at": datetime.now().isoformat(timespec="seconds"),
     }
 
 
@@ -1416,6 +1537,8 @@ def init_state():
         "input_root_info": None,
         "project_folders": [],
         "audit_run_id": "",
+        "drive_write_test_result": None,
+        "drive_write_test_error": "",
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -1436,11 +1559,24 @@ def main():
 
     input_folder_id = get_secret("GOOGLE_DRIVE_INPUT_FOLDER_ID", "DRIVE_INPUT_FOLDER_ID", default="") or ""
     memory_folder_id = get_secret("GOOGLE_DRIVE_MEMORY_FOLDER_ID", "DRIVE_MEMORY_FOLDER_ID", default="") or ""
+    results_folder_id = get_secret(
+        "GOOGLE_DRIVE_RESULTS_FOLDER_ID",
+        "DRIVE_RESULTS_FOLDER_ID",
+        default="",
+    ) or ""
 
     with st.sidebar:
         st.header("Iestatījumi")
         input_folder_id = st.text_input("01_Input folder ID", value=input_folder_id)
         memory_folder_id = st.text_input("03_Memory folder ID", value=memory_folder_id)
+        results_folder_id = st.text_input(
+            "02_Results folder ID (nav obligāts)",
+            value=results_folder_id,
+            help=(
+                "Ja lauks ir tukšs, rīks mēģina atrast 02_Results kā "
+                "01_Input māsas mapi zem BP_Audits_tests."
+            ),
+        )
         model = st.text_input("OpenAI modelis", value=get_secret("OPENAI_MODEL", default="gpt-4.1-mini") or "gpt-4.1-mini")
         max_context_chars = st.slider("PDF konteksta garums", 5000, 60000, 25000, 5000)
         max_examples_per_family = st.slider("Piemēri vienai ģimenei", 1, 12, 5, 1)
@@ -1456,6 +1592,66 @@ def main():
             family_options = DEFAULT_FAMILIES
         selected_families = st.multiselect("Iekšēji palaistās ģimenes", options=family_options, default=family_options)
         st.caption("Lietotājam ikdienā šo var paslēpt. Testā atstājam kontrolei.")
+
+    with st.expander("Google Drive rakstīšanas pārbaude", expanded=False):
+        st.caption(
+            "Tests izveido vienu nelielu TXT failu mapē 02_Results. "
+            "Pilni audita rezultāti vēl netiek automātiski saglabāti."
+        )
+        write_test_col, _ = st.columns([1, 4])
+        with write_test_col:
+            test_drive_write_clicked = st.button(
+                "Testēt Drive rakstīšanu",
+                use_container_width=True,
+                key="test_drive_write_button",
+            )
+
+        if test_drive_write_clicked:
+            st.session_state.drive_write_test_result = None
+            st.session_state.drive_write_test_error = ""
+            if not input_folder_id.strip():
+                st.session_state.drive_write_test_error = (
+                    "Nav norādīts 01_Input folder ID."
+                )
+            else:
+                try:
+                    with st.spinner("Izveidoju testa failu 02_Results mapē..."):
+                        result = run_drive_write_test(
+                            service,
+                            input_folder_id=input_folder_id.strip(),
+                            results_folder_id=results_folder_id.strip(),
+                        )
+                    st.session_state.drive_write_test_result = result
+                except Exception as exc:
+                    st.session_state.drive_write_test_error = str(exc)
+
+        write_test_error = clean_text(
+            st.session_state.get("drive_write_test_error")
+        )
+        if write_test_error:
+            st.error("Drive rakstīšanas tests neizdevās.")
+            st.code(write_test_error)
+            st.caption(
+                "Pārbaudi, vai service account ir Editor tiesības uz "
+                "02_Results un lietotne pēc scope maiņas ir pilnībā pārstartēta."
+            )
+
+        write_test_result = st.session_state.get("drive_write_test_result")
+        if isinstance(write_test_result, dict) and write_test_result.get("ok"):
+            uploaded = write_test_result.get("file") or {}
+            target = write_test_result.get("target") or {}
+            st.success(
+                f"Rakstīšanas tests veiksmīgs. Izveidots fails "
+                f"{clean_text(uploaded.get('name'))} mapē "
+                f"{clean_text(target.get('name'))}."
+            )
+            web_link = clean_text(uploaded.get("webViewLink"))
+            if web_link:
+                st.markdown(f"[Atvērt testa failu Google Drive]({web_link})")
+            st.caption(
+                f"Drive file ID: {clean_text(uploaded.get('id'))} | "
+                f"Mapes noteikšana: {clean_text(target.get('source'))}"
+            )
 
     st.header("1. Zināšanu bāzes nolasīšana")
     st.caption("Vispirms nolasi globālo audit_examples indeksu. Projekta feedback tiks nolasīts pēc projekta izvēles.")
