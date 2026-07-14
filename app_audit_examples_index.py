@@ -1,15 +1,16 @@
 # app_audit_examples_index.py
 # ------------------------------------------------------------
-# BP audit_examples indeksētājs v1.6
+# BP audit_examples indeksētājs v1.7
 #
 # Mērķis:
-# - nolasa 03_Memory/audit_examples mapē esošos 16 kolonnu audit_examples Excel failus;
+# - nolasa 03_Memory/01_Audit_examples mapē esošos 16 kolonnu audit_examples Excel failus;
 # - apvieno vienā indeksā;
 # - pārbauda struktūru un datu kvalitāti;
 # - automātiski piedāvā kļūdu ģimeni un scenāriju;
 # - izveido review_needed lapu klasifikācijas pārskatīšanai;
 # - ļauj lejupielādēt audit_examples_index.xlsx;
 # - v1.5: pievieno pēdējos Z_unclassified issue_type mappingus.
+# - v1.7: atbalsta numurēto Memory struktūru un pievieno project_folder_name/project_code.
 #
 # Streamlit secrets piemērs:
 # [google_service_account]
@@ -46,7 +47,7 @@ from googleapiclient.errors import HttpError
 from googleapiclient.http import MediaIoBaseDownload
 
 
-APP_TITLE = "BP audit_examples indeksētājs v1.6"
+APP_TITLE = "BP audit_examples indeksētājs v1.7"
 SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
 
 REQUIRED_COLUMNS = [
@@ -82,6 +83,9 @@ CORE_REQUIRED_FOR_MARKUP = [
 
 MIME_FOLDER = "application/vnd.google-apps.folder"
 MIME_XLSX = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+
+EXAMPLES_FOLDER_NAME = "01_Audit_examples"
+INDEX_FOLDER_NAME = "02_Audit_examples_index"
 
 
 @dataclass
@@ -180,7 +184,7 @@ def find_child_folder(service, parent_id: str, folder_name: str) -> Optional[Dri
     return None
 
 
-def recursively_list_excel_files(service, root_id: str, root_path: str = "audit_examples") -> List[DriveItem]:
+def recursively_list_excel_files(service, root_id: str, root_path: str = EXAMPLES_FOLDER_NAME) -> List[DriveItem]:
     found: List[DriveItem] = []
 
     def walk(folder_id: str, current_path: str):
@@ -518,30 +522,84 @@ def infer_family_and_scenario(row: pd.Series) -> Tuple[str, str, str]:
     return "Z_unclassified", "SC-Z99_unclassified", "Neklasificēts / jāpārskata"
 
 
+def normalize_project_code(folder_name: str) -> str:
+    """Normalizē projekta mapes nosaukumu, saglabājot projekta identitāti.
+
+    Piemēri:
+    01_C2-3 -> C2-3
+    02_Cits_projekts -> Cits_projekts
+    02_Cits projekts -> Cits_projekts
+    """
+    value = clean_string(folder_name)
+    value = re.sub(r"^\d+[\s_-]*", "", value)
+    value = re.sub(r"\s+", "_", value)
+    value = re.sub(r"_+", "_", value).strip("_")
+    return value
+
+
+def derive_path_metadata(path: str) -> Tuple[str, str, str, str]:
+    """Atgriež projekta mapi, projekta kodu, grupu un apakšgrupu.
+
+    Sagaidāmais ceļš:
+    01_Audit_examples/01_C2-3/09_UKT/UK/example.xlsx
+
+    project_folder_name = 01_C2-3
+    project_code = C2-3
+    audit_examples_group = 09_UKT
+    audit_examples_subgroup = UK
+    """
+    parts = [clean_string(p) for p in clean_string(path).split("/") if clean_string(p)]
+    project_folder_name = ""
+    project_code = ""
+    group = ""
+    subgroup = ""
+
+    try:
+        idx = parts.index(EXAMPLES_FOLDER_NAME)
+    except ValueError:
+        # Atpakaļsaderība veciem ceļiem.
+        try:
+            idx = parts.index("audit_examples")
+        except ValueError:
+            return project_folder_name, project_code, group, subgroup
+
+    relative = parts[idx + 1:]
+    if relative:
+        project_folder_name = relative[0]
+        project_code = normalize_project_code(project_folder_name)
+
+    folders_after_project = [
+        p for p in relative[1:]
+        if not p.lower().endswith((".xlsx", ".xlsm"))
+    ]
+    if folders_after_project:
+        group = folders_after_project[0]
+    if len(folders_after_project) > 1:
+        subgroup = folders_after_project[1]
+
+    return project_folder_name, project_code, group, subgroup
+
+
 def infer_discipline_from_path_or_row(row: pd.Series) -> str:
     disc = clean_string(row.get("discipline", ""))
     if disc:
         return disc
-    path = clean_string(row.get("source_path", ""))
-    m = re.search(r"audit_examples/([^/]+)/", path)
-    if m:
-        return m.group(1)
+
+    group = clean_string(row.get("audit_examples_group", ""))
+    subgroup = clean_string(row.get("audit_examples_subgroup", ""))
+
+    # Ja pirmā mape pēc projekta ir disciplīnas mape, izmantojam tās
+    # nosaukumu bez kārtas numura. Pretējā gadījumā mēģinām apakšgrupu.
+    for candidate in [group, subgroup]:
+        normalized = re.sub(r"^\d+[\s_-]*", "", candidate)
+        normalized = clean_string(normalized)
+        if normalized:
+            return normalized
     return ""
 
 
 def derive_group_subgroup_from_path(path: str) -> Tuple[str, str]:
-    parts = path.split("/")
-    # audit_examples/18_UK/UK/file.xlsx
-    group = ""
-    subgroup = ""
-    try:
-        idx = parts.index("audit_examples")
-        if len(parts) > idx + 1:
-            group = parts[idx + 1]
-        if len(parts) > idx + 2 and not parts[idx + 2].lower().endswith(".xlsx"):
-            subgroup = parts[idx + 2]
-    except ValueError:
-        pass
+    _, _, group, subgroup = derive_path_metadata(path)
     return group, subgroup
 
 
@@ -549,10 +607,20 @@ def enrich_index(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return df
     out = df.copy()
-    out["discipline_final"] = out.apply(infer_discipline_from_path_or_row, axis=1)
-    out[["audit_examples_group", "audit_examples_subgroup"]] = out["source_path"].apply(
-        lambda p: pd.Series(derive_group_subgroup_from_path(clean_string(p)))
+    path_meta = out["source_path"].apply(
+        lambda p: pd.Series(
+            derive_path_metadata(clean_string(p)),
+            index=[
+                "project_folder_name",
+                "project_code",
+                "audit_examples_group",
+                "audit_examples_subgroup",
+            ],
+        )
     )
+    for col in path_meta.columns:
+        out[col] = path_meta[col]
+    out["discipline_final"] = out.apply(infer_discipline_from_path_or_row, axis=1)
     out["document_role"] = out.apply(infer_document_role, axis=1)
     fams = out.apply(infer_family_and_scenario, axis=1)
     out["normalized_family"] = [x[0] for x in fams]
@@ -689,7 +757,8 @@ def build_review_needed(df: pd.DataFrame, quality_df: pd.DataFrame) -> pd.DataFr
         return pd.DataFrame()
 
     cols = [
-        "note_id", "audit_examples_group", "audit_examples_subgroup", "discipline_final",
+        "note_id", "project_folder_name", "project_code",
+        "audit_examples_group", "audit_examples_subgroup", "discipline_final",
         "document_role", "normalized_family", "normalized_scenario", "scenario_label",
         "issue_type", "target_file", "target_page", "target_area", "target_text",
         "comment_text", "comparison_evidence", "source_path",
@@ -847,7 +916,7 @@ def main():
     st.set_page_config(page_title=APP_TITLE, layout="wide")
     st.title(APP_TITLE)
     st.caption(
-        "Indeksē 03_Memory/audit_examples mapē uzkrātos 16 kolonnu Excel piemērus, "
+        "Indeksē 03_Memory/01_Audit_examples mapē uzkrātos 16 kolonnu Excel piemērus, "
         "piedāvā kļūdu ģimenes un sagatavo audit_examples_index.xlsx."
     )
 
@@ -863,13 +932,13 @@ def main():
 
     with st.expander("1. Konfigurācija", expanded=True):
         memory_folder_id = st.text_input("03_Memory folder ID", value=default_memory_id)
-        st.caption("Norādi 03_Memory mapes ID. Rīks pats meklēs apakšmapi audit_examples.")
+        st.caption(f"Norādi 03_Memory mapes ID. Rīks pats meklēs apakšmapi {EXAMPLES_FOLDER_NAME}.")
 
     if not memory_folder_id:
         st.warning("Norādi 03_Memory folder ID.")
         return
 
-    if st.button("1) Nolasīt audit_examples Excel failus", type="primary"):
+    if st.button("1) Nolasīt zelta piemēru Excel failus", type="primary"):
         st.session_state.pop("examples_df", None)
         st.session_state.pop("file_catalog_df", None)
         st.session_state.pop("quality_df", None)
@@ -877,18 +946,18 @@ def main():
         st.session_state.pop("excel_bytes", None)
 
         try:
-            audit_examples_folder = find_child_folder(service, memory_folder_id, "audit_examples")
+            audit_examples_folder = find_child_folder(service, memory_folder_id, EXAMPLES_FOLDER_NAME)
             if audit_examples_folder is None:
-                st.error("03_Memory mapē netika atrasta apakšmape audit_examples.")
+                st.error(f"03_Memory mapē netika atrasta apakšmape {EXAMPLES_FOLDER_NAME}.")
                 return
 
-            with st.spinner("Meklēju Excel failus audit_examples mapē..."):
+            with st.spinner(f"Meklēju Excel failus {EXAMPLES_FOLDER_NAME} mapē..."):
                 excel_items = recursively_list_excel_files(
-                    service, audit_examples_folder.id, root_path="audit_examples"
+                    service, audit_examples_folder.id, root_path=EXAMPLES_FOLDER_NAME
                 )
 
             if not excel_items:
-                st.warning("audit_examples mapē netika atrasti .xlsx faili.")
+                st.warning(f"{EXAMPLES_FOLDER_NAME} mapē netika atrasti .xlsx faili.")
                 return
 
             st.info(f"Atrasti {len(excel_items)} Excel faili. Sāku ielasi...")
@@ -936,13 +1005,17 @@ def main():
                 "2_family_summary": summary_count(examples_df, ["normalized_family", "scenario_label"]),
                 "3_issue_type_summary": summary_count(examples_df, ["issue_type", "normalized_family", "normalized_scenario"]),
                 "4_document_role_summary": summary_count(examples_df, ["document_role", "normalized_family"]),
-                "5_discipline_summary": summary_count(examples_df, ["audit_examples_group", "audit_examples_subgroup", "discipline_final"]),
-                "6_scenario_catalog": scenario_catalog_df,
-                "7_family_catalog": family_catalog_df,
-                "8_quality_check": quality_df,
-                "9_review_needed": review_needed_df,
-                "10_file_catalog": file_catalog_df,
-                "11_manual_family_mapping": manual_family_mapping_df,
+                "5_project_summary": summary_count(examples_df, ["project_folder_name", "project_code"]),
+                "6_discipline_summary": summary_count(
+                    examples_df,
+                    ["project_code", "audit_examples_group", "audit_examples_subgroup", "discipline_final"],
+                ),
+                "7_scenario_catalog": scenario_catalog_df,
+                "8_family_catalog": family_catalog_df,
+                "9_quality_check": quality_df,
+                "10_review_needed": review_needed_df,
+                "11_file_catalog": file_catalog_df,
+                "12_manual_family_mapping": manual_family_mapping_df,
             }
             excel_bytes = to_excel_bytes(sheets)
 
@@ -976,12 +1049,13 @@ def main():
     manual_family_mapping_df: pd.DataFrame = st.session_state.get("manual_family_mapping_df", pd.DataFrame())
 
     st.header("2. Kopsavilkums")
-    c1, c2, c3, c4, c5 = st.columns(5)
+    c1, c2, c3, c4, c5, c6 = st.columns(6)
     c1.metric("Piezīmju rindas", len(examples_df))
     c2.metric("Excel faili", len(file_catalog_df))
-    c3.metric("Kļūdu ģimenes", examples_df["normalized_family"].nunique() if not examples_df.empty else 0)
-    c4.metric("Scenāriji", examples_df["normalized_scenario"].nunique() if not examples_df.empty else 0)
-    c5.metric("Pārskatāmās rindas", len(review_needed_df))
+    c3.metric("Projekti", examples_df["project_code"].nunique() if not examples_df.empty else 0)
+    c4.metric("Kļūdu ģimenes", examples_df["normalized_family"].nunique() if not examples_df.empty else 0)
+    c5.metric("Scenāriji", examples_df["normalized_scenario"].nunique() if not examples_df.empty else 0)
+    c6.metric("Pārskatāmās rindas", len(review_needed_df))
 
     st.subheader("Kļūdu ģimeņu kopsavilkums")
     st.dataframe(summary_count(examples_df, ["normalized_family", "scenario_label"]), use_container_width=True)
@@ -1005,6 +1079,8 @@ def main():
     with st.expander("Piezīmju indekss", expanded=False):
         show_cols = [
             "note_id",
+            "project_folder_name",
+            "project_code",
             "audit_examples_group",
             "audit_examples_subgroup",
             "discipline_final",
@@ -1051,8 +1127,8 @@ def main():
     )
 
     st.caption(
-        "Nākamais solis: pārskatīt 9_review_needed un 11_manual_family_mapping lapas. "
-        "11_manual_family_mapping palīdz ātri sakārtot Z_unclassified issue_type; pēc tam precizē 6_scenario_catalog laukus: "
+        "Nākamais solis: pārskatīt 10_review_needed un 12_manual_family_mapping lapas. "
+        "12_manual_family_mapping palīdz ātri sakārtot Z_unclassified issue_type; pēc tam precizē 7_scenario_catalog laukus: "
         "required_evidence, target_text_strategy, good_comment_pattern, do_not_report_when."
     )
 
