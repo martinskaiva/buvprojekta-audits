@@ -34,7 +34,7 @@ except Exception:
     HttpError = Exception
 
 
-APP_VERSION = "v0.6.3.8"
+APP_VERSION = "v0.6.3.9"
 APP_TITLE = f"BP AI Audit Copilot {APP_VERSION}"
 
 REQUIRED_EXPORT_COLUMNS = [
@@ -56,8 +56,10 @@ REQUIRED_EXPORT_COLUMNS = [
     "status",
 ]
 
-INDEX_FOLDER_NAME = "audit_examples_index"
-FEEDBACK_FOLDER_NAME = "audit_feedback"
+INDEX_FOLDER_NAME = "02_Audit_examples_index"
+FEEDBACK_FOLDER_NAME = "03_Audit_feedback"
+FEEDBACK_INDEX_FOLDER_NAME = "04_Audit_feedback_index"
+PENDING_FOLDER_NAME = "05_Audit_examples_pending"
 
 DEFAULT_FAMILIES = [
     "A_text_language",
@@ -384,6 +386,30 @@ def drive_download_bytes(service, file_id: str) -> bytes:
     return fh.getvalue()
 
 
+def normalize_project_code(folder_name: str) -> str:
+    """Normalizē numurētu projekta mapes nosaukumu vienotam sasaistes kodam."""
+    value = clean_text(folder_name)
+    value = re.sub(r"^\d+[\s_-]*", "", value)
+    value = re.sub(r"\s+", "_", value)
+    value = re.sub(r"_+", "_", value).strip("_")
+    return value
+
+
+def find_project_folder(service, parent_folder_id: str, project_code: str) -> Optional[Dict[str, Any]]:
+    """Atrod projekta mapi pēc normalizēta koda, nevis precīza nosaukuma."""
+    wanted = normalize_project_code(project_code).lower()
+    if not wanted:
+        return None
+    folders = drive_list_children(service, parent_folder_id, "application/vnd.google-apps.folder")
+    matches = [
+        folder for folder in folders
+        if normalize_project_code(clean_text(folder.get("name"))).lower() == wanted
+    ]
+    if not matches:
+        return None
+    return sorted(matches, key=lambda item: clean_text(item.get("name")).lower())[0]
+
+
 def find_latest_index_file(service, memory_folder_id: str) -> Optional[Dict[str, Any]]:
     index_folder = drive_find_child_folder(service, memory_folder_id, INDEX_FOLDER_NAME)
     if not index_folder:
@@ -417,7 +443,11 @@ def normalize_index_df(df: pd.DataFrame) -> pd.DataFrame:
     for col in REQUIRED_EXPORT_COLUMNS:
         if col not in df.columns:
             df[col] = ""
-    for col in ["normalized_family", "normalized_scenario", "scenario_label", "document_role", "source_path", "source_file"]:
+    for col in [
+        "normalized_family", "normalized_scenario", "scenario_label",
+        "document_role", "source_path", "source_file",
+        "project_folder_name", "project_code",
+    ]:
         if col not in df.columns:
             df[col] = ""
     for col in df.columns:
@@ -449,41 +479,59 @@ def load_audit_examples_index(service, memory_folder_id: str) -> Tuple[pd.DataFr
         return pd.DataFrame(), index_file, [f"Neizdevās nolasīt indeksu {name}: {e}"]
 
 
-def load_feedback(service, memory_folder_id: str) -> Tuple[pd.DataFrame, List[str]]:
-    """Nolasa jaunāko negatīvās atmiņas failu; kļūda nedrīkst apturēt lietotni."""
+def load_feedback(
+    service,
+    memory_folder_id: str,
+    project_code: str,
+) -> Tuple[pd.DataFrame, List[str]]:
+    """Nolasa visas konkrētā projekta noraidītās piezīmes."""
     messages: List[str] = []
+    project_code = normalize_project_code(project_code)
+    if not project_code:
+        return pd.DataFrame(), ["Feedback netika nolasīts, jo nav izvēlēts auditējamais projekts."]
     try:
-        feedback_folder = drive_find_child_folder(service, memory_folder_id, FEEDBACK_FOLDER_NAME)
-        if not feedback_folder:
+        feedback_root = drive_find_child_folder(service, memory_folder_id, FEEDBACK_FOLDER_NAME)
+        if not feedback_root:
             return pd.DataFrame(), [f"Mape 03_Memory/{FEEDBACK_FOLDER_NAME} nav atrasta. Turpinu bez negatīvās atmiņas."]
-
+        project_folder = find_project_folder(service, feedback_root["id"], project_code)
+        if not project_folder:
+            return pd.DataFrame(), [f"Projektam {project_code} nav feedback mapes zem 03_Memory/{FEEDBACK_FOLDER_NAME}. Turpinu bez negatīvās atmiņas."]
         files = drive_list_recursive(
             service,
-            feedback_folder["id"],
+            project_folder["id"],
             (".xlsx", ".xlsm"),
-            prefix=FEEDBACK_FOLDER_NAME,
-            max_files=200,
+            prefix=f"{FEEDBACK_FOLDER_NAME}/{clean_text(project_folder.get('name'))}",
+            max_files=1000,
         )
-        files = [
-            f for f in files
-            if "rejected" in clean_text(f.get("name")).lower()
-            and not clean_text(f.get("name")).startswith("~$")
-        ]
+        files = [item for item in files if not clean_text(item.get("name")).startswith("~$")]
         if not files:
             return pd.DataFrame(), []
+        frames: List[pd.DataFrame] = []
+        for item in sorted(files, key=lambda x: x.get("modifiedTime", "")):
+            try:
+                data = drive_download_bytes(service, item["id"])
+                if not data:
+                    messages.append(f"Izlaists tukšs feedback fails: {item.get('name')}")
+                    continue
+                frame = pd.read_excel(io.BytesIO(data), dtype=object)
+                frame.columns = [clean_text(col) for col in frame.columns]
+                for col in frame.columns:
+                    frame[col] = frame[col].map(clean_text)
+                frame["feedback_source_file"] = clean_text(item.get("name"))
+                frame["feedback_project_code"] = project_code
+                frames.append(frame)
+            except Exception as exc:
+                messages.append(f"Neizdevās nolasīt feedback failu {item.get('name')}: {exc}")
+        if not frames:
+            return pd.DataFrame(), messages
+        combined = pd.concat(frames, ignore_index=True, sort=False)
+        dedupe_cols = [col for col in ["note_id", "source_file", "target_page", "comment_text", "reject_reason"] if col in combined.columns]
+        if dedupe_cols:
+            combined = combined.drop_duplicates(subset=dedupe_cols, keep="last")
+        return combined.reset_index(drop=True), messages
+    except Exception as exc:
+        return pd.DataFrame(), [f"Feedback nolasīšana projektam {project_code} neizdevās: {exc}. Turpinu bez negatīvās atmiņas."]
 
-        latest = sorted(files, key=lambda x: x.get("modifiedTime", ""), reverse=True)[0]
-        data = drive_download_bytes(service, latest["id"])
-        if not data:
-            return pd.DataFrame(), [f"Feedback fails {latest.get('name')} ir tukšs. Turpinu bez negatīvās atmiņas."]
-
-        df = pd.read_excel(io.BytesIO(data), dtype=object)
-        df.columns = [clean_text(c) for c in df.columns]
-        for col in df.columns:
-            df[col] = df[col].map(clean_text)
-        return df, messages
-    except Exception as e:
-        return pd.DataFrame(), [f"Feedback nolasīšana neizdevās: {e}. Turpinu bez negatīvās atmiņas."]
 
 
 def extract_pdf_text(pdf_bytes: bytes, max_chars: int) -> Tuple[str, List[Dict[str, Any]], str]:
@@ -534,10 +582,14 @@ def infer_document_role(name: str) -> str:
     return "unknown"
 
 
-def score_example(row: pd.Series, pdf_name: str, pdf_text_sample: str, family: str, doc_role: str, discipline: str) -> int:
+def score_example(row: pd.Series, pdf_name: str, pdf_text_sample: str, family: str, doc_role: str, discipline: str, project_code: str) -> int:
     score = 0
     if clean_text(row.get("normalized_family")) == family:
         score += 100
+    row_project = normalize_project_code(clean_text(row.get("project_code")))
+    wanted_project = normalize_project_code(project_code)
+    if wanted_project and row_project == wanted_project:
+        score += 30
     if doc_role and clean_text(row.get("document_role")) == doc_role:
         score += 15
     if discipline and clean_text(row.get("discipline")) == discipline:
@@ -551,7 +603,7 @@ def score_example(row: pd.Series, pdf_name: str, pdf_text_sample: str, family: s
     return score
 
 
-def select_examples(index_df: pd.DataFrame, family: str, pdf_name: str, pdf_text: str, max_examples: int) -> List[Dict[str, str]]:
+def select_examples(index_df: pd.DataFrame, family: str, pdf_name: str, pdf_text: str, max_examples: int, project_code: str = "") -> List[Dict[str, str]]:
     if index_df.empty:
         return []
     doc_role = infer_document_role(pdf_name)
@@ -560,7 +612,10 @@ def select_examples(index_df: pd.DataFrame, family: str, pdf_name: str, pdf_text
     if fam_df.empty:
         return []
     sample = pdf_text[:10000]
-    fam_df["_score"] = fam_df.apply(lambda r: score_example(r, pdf_name, sample, family, doc_role, discipline), axis=1)
+    fam_df["_score"] = fam_df.apply(
+        lambda r: score_example(r, pdf_name, sample, family, doc_role, discipline, project_code),
+        axis=1,
+    )
     fam_df = fam_df.sort_values("_score", ascending=False).head(max_examples)
     examples = []
     for _, r in fam_df.iterrows():
@@ -573,6 +628,7 @@ def select_examples(index_df: pd.DataFrame, family: str, pdf_name: str, pdf_text
             "comment_text": clean_text(r.get("comment_text")),
             "issue_type": clean_text(r.get("issue_type")),
             "comparison_evidence": clean_text(r.get("comparison_evidence")),
+            "project_code": clean_text(r.get("project_code")),
         })
     return examples
 
@@ -584,9 +640,13 @@ def make_negative_rules(feedback_df: pd.DataFrame, max_rules: int = 20) -> List[
     for _, r in feedback_df.tail(max_rules).iterrows():
         reason = clean_text(r.get("reject_reason") or r.get("reason") or r.get("noraidīšanas iemesls"))
         text = clean_text(r.get("target_text") or r.get("title") or r.get("comment_text"))
-        do_not = clean_text(r.get("do_not_show_similar") or r.get("turpmāk līdzīgas piezīmes nerādīt"))
-        if reason or text:
-            rules.append(f"Nerādīt līdzīgas piezīmes: {text}. Iemesls: {reason}. Do-not-show: {do_not}")
+        do_not = clean_text(
+            r.get("do_not_show_similar")
+            or r.get("turpmāk līdzīgas piezīmes nerādīt")
+        ).lower()
+        is_reusable = do_not in {"true", "1", "yes", "jā", "ja"}
+        if is_reusable and (reason or text):
+            rules.append(f"Nerādīt līdzīgas piezīmes: {text}. Iemesls: {reason}.")
     return rules
 
 
@@ -1336,6 +1396,8 @@ def init_state():
         "index_df": pd.DataFrame(),
         "index_file": None,
         "feedback_df": pd.DataFrame(),
+        "feedback_project_code": "",
+        "feedback_messages": [],
         "selected_pdf_bytes": None,
         "selected_pdf_name": "",
         "selected_pdf_rel_path": "",
@@ -1396,7 +1458,7 @@ def main():
         st.caption("Lietotājam ikdienā šo var paslēpt. Testā atstājam kontrolei.")
 
     st.header("1. Zināšanu bāzes nolasīšana")
-    st.caption("Vispirms nolasi audit_examples_index un negatīvo atmiņu. Bez indeksa AI analīzi nevar sākt.")
+    st.caption("Vispirms nolasi globālo audit_examples indeksu. Projekta feedback tiks nolasīts pēc projekta izvēles.")
 
     kb_btn_col, _ = st.columns([1, 4])
     with kb_btn_col:
@@ -1417,20 +1479,17 @@ def main():
                 st.session_state.index_df = df
                 st.session_state.index_file = index_file
 
-                with st.spinner("Nolasu audit_feedback..."):
-                    feedback_df, feedback_messages = load_feedback(service, memory_folder_id.strip())
-                st.session_state.feedback_df = feedback_df
+                st.session_state.feedback_df = pd.DataFrame()
+                st.session_state.feedback_project_code = ""
+                st.session_state.feedback_messages = []
 
                 for msg in index_messages:
-                    st.warning(msg)
-                for msg in feedback_messages:
                     st.warning(msg)
 
                 if not df.empty:
                     index_name = clean_text(index_file.get("name")) if index_file else ""
                     st.success(
-                        f"Zināšanu bāze nolasīta: {index_name} — {len(df)} piemēri; "
-                        f"feedback rindas: {len(feedback_df)}."
+                        f"Globālais zināšanu indekss nolasīts: {index_name} — {len(df)} piemēri."
                     )
                 else:
                     st.error("Indekss nav nolasīts. PDF failu solis paliek bloķēts.")
@@ -1449,7 +1508,8 @@ def main():
             f"Aktīvais audit_examples_index: {idx.get('name')} | "
             f"Modified: {idx.get('modifiedTime', '')} | "
             f"Piemēri: {len(st.session_state.index_df)} | "
-            f"Feedback: {len(st.session_state.feedback_df)}"
+            f"Feedback projekts: {st.session_state.get('feedback_project_code') or 'vēl nav izvēlēts'} | "
+            f"Feedback rindas: {len(st.session_state.feedback_df)}"
         )
 
     st.header("2. PDF failu saraksta nolasīšana")
@@ -1651,6 +1711,16 @@ def main():
                     st.session_state.applied_pdf_search = ""
                     st.session_state.selected_pdf_ids_ui = []
 
+                active_project_code = normalize_project_code(project_value)
+                if active_project_code and active_project_code != st.session_state.get("feedback_project_code"):
+                    with st.spinner(f"Nolasu projekta {active_project_code} negatīvo atmiņu..."):
+                        feedback_df, feedback_messages = load_feedback(
+                            service, memory_folder_id.strip(), active_project_code
+                        )
+                    st.session_state.feedback_df = feedback_df
+                    st.session_state.feedback_project_code = active_project_code
+                    st.session_state.feedback_messages = feedback_messages
+
                 selected_project_files = [
                     f for f in normalized_pdf_files
                     if clean_text(f.get("project_path")) == project_value
@@ -1751,6 +1821,12 @@ def main():
                 if applied_search:
                     active_filter_text += f" | Meklējums: {applied_search}"
                 st.caption(f"Aktīvais filtrs: {active_filter_text}")
+                st.caption(
+                    f"Projekta kods: {normalize_project_code(applied_project)} | "
+                    f"Negatīvās atmiņas rindas: {len(st.session_state.feedback_df)}"
+                )
+                for feedback_message in st.session_state.get("feedback_messages", []):
+                    st.warning(feedback_message)
                 st.caption(
                     f"Atrasti PDF izvēlē: {len(filtered_pdf_files)} "
                     f"no {len(applied_project_files)} projekta PDF"
@@ -1928,11 +2004,14 @@ def main():
 
     index_df = st.session_state.index_df
     if not index_df.empty:
-        st.subheader("Audit_examples indeksa kopsavilkums")
+        st.subheader("Zināšanu bāzes kopsavilkums")
         c1, c2, c3 = st.columns(3)
         c1.metric("Piemēri indeksā", len(index_df))
         c2.metric("Kļūdu ģimenes", index_df["normalized_family"].nunique())
-        c3.metric("Feedback rindas", len(st.session_state.feedback_df))
+        c3.metric(
+            f"Feedback: {st.session_state.get('feedback_project_code') or '-'}",
+            len(st.session_state.feedback_df),
+        )
         with st.expander("Ģimeņu sadalījums"):
             fam_summary = index_df["normalized_family"].value_counts().reset_index()
             fam_summary.columns = ["normalized_family", "count"]
@@ -2008,6 +2087,9 @@ def main():
                         pdf_name,
                         pdf_text,
                         max_examples_per_family,
+                        project_code=normalize_project_code(
+                            st.session_state.get("applied_project_filter", "")
+                        ),
                     )
                     candidates, err = call_ai_for_family(
                         client=client,
