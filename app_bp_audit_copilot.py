@@ -43,7 +43,7 @@ except Exception:
     HttpError = Exception
 
 
-APP_VERSION = "v0.6.4.4"
+APP_VERSION = "v0.6.4.5"
 APP_TITLE = f"BP AI Audit Copilot {APP_VERSION}"
 
 REQUIRED_EXPORT_COLUMNS = [
@@ -510,6 +510,66 @@ def drive_find_child_folder(service, parent_id: str, folder_name: str) -> Option
         if item.get("name") == folder_name:
             return item
     return None
+
+
+def drive_create_folder(service, parent_id: str, folder_name: str) -> Dict[str, Any]:
+    """Izveido jaunu Google Drive mapi norādītajā vecākmapē."""
+    name = clean_text(folder_name)
+    if not clean_text(parent_id):
+        raise ValueError("Nav norādīts vecākmapes ID.")
+    if not name:
+        raise ValueError("Jaunās mapes nosaukums ir tukšs.")
+    if "/" in name or "\\" in name:
+        raise ValueError("Mapes nosaukumā nedrīkst būt / vai \\.")
+
+    existing = drive_find_child_folder(service, parent_id, name)
+    if existing:
+        return {**existing, "already_existed": True}
+
+    created = service.files().create(
+        body={
+            "name": name,
+            "mimeType": "application/vnd.google-apps.folder",
+            "parents": [clean_text(parent_id)],
+        },
+        fields="id,name,mimeType,parents,webViewLink,createdTime",
+        supportsAllDrives=True,
+    ).execute()
+    created["already_existed"] = False
+    return created
+
+
+def run_drive_write_test_to_folder(
+    service,
+    target_folder_id: str,
+    target_folder_name: str = "",
+) -> Dict[str, Any]:
+    """Izveido testa TXT failu lietotāja izvēlētā Drive mapē."""
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    suffix = hashlib.sha1(
+        f"{timestamp}|{time.time_ns()}".encode("utf-8")
+    ).hexdigest()[:6]
+    file_name = f"drive_write_test_{timestamp}_{suffix}.txt"
+    content = (
+        "BP AI Audit Copilot Google Drive rakstīšanas tests\n"
+        f"App version: {APP_VERSION}\n"
+        f"Created at: {datetime.now().isoformat(timespec='seconds')}\n"
+        f"Target folder: {clean_text(target_folder_name) or target_folder_id}\n"
+        "Ja šis fails ir redzams izvēlētajā mapē, rakstīšanas tiesības darbojas.\n"
+    ).encode("utf-8")
+    uploaded = drive_upload_bytes(
+        service,
+        folder_id=target_folder_id,
+        file_name=file_name,
+        data=content,
+        mime_type="text/plain",
+    )
+    return {
+        "ok": True,
+        "target": {"id": target_folder_id, "name": target_folder_name},
+        "file": uploaded,
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+    }
 
 
 def drive_list_recursive(service, folder_id: str, extensions: Tuple[str, ...], prefix: str = "", max_files: int = 5000) -> List[Dict[str, Any]]:
@@ -1677,6 +1737,12 @@ def init_state():
         "applied_folder_filter": "Viss projekts",
         "applied_pdf_search": "",
         "selected_pdf_ids_ui": [],
+        "selected_subfolder_paths": [],
+        "drive_target_folder_id": "",
+        "drive_target_folder_name": "",
+        "drive_target_folder_path": "",
+        "drive_save_result": None,
+        "drive_save_error": "",
         "input_root_info": None,
         "project_folders": [],
         "audit_run_id": "",
@@ -1913,9 +1979,8 @@ def main():
     if pdf_files or st.session_state.get("project_folders"):
         st.subheader("3. Izvēlies un nolasi auditējamos PDF")
         st.caption(
-            "Izvēloties projekta mapi, tās PDF tiek parādīti uzreiz. "
-            "Apakšmapes un nosaukuma meklēšanas filtrs tiek piemērots pēc pogas nospiešanas. "
-            "Arī tukšas projekta mapes tiek parādītas."
+            "Izvēlies projektu, tad atzīmē vienu vai vairākas apakšmapes vertikālajā sarakstā. "
+            "Zemāk automātiski parādīsies visi PDF no atzīmētajām mapēm."
         )
 
         try:
@@ -1924,9 +1989,7 @@ def main():
 
             def _project_folder(rel_path: str) -> str:
                 parts = _path_parts(rel_path)
-                if len(parts) <= 1:
-                    return "01_Input sakne"
-                return parts[0]
+                return parts[0] if len(parts) > 1 else "01_Input sakne"
 
             def _pdf_folder(rel_path: str) -> str:
                 parts = _path_parts(rel_path)
@@ -1951,37 +2014,22 @@ def main():
                 item["display_name"] = rel_path.rsplit("/", 1)[-1]
                 normalized_pdf_files.append(item)
 
-            if not normalized_pdf_files and not st.session_state.get("project_folders"):
-                st.warning("PDF sarakstā nav derīgu failu ierakstu un nav projektu mapju.")
+            actual_project_folders = [
+                dict(item)
+                for item in st.session_state.get("project_folders", [])
+                if isinstance(item, dict) and clean_text(item.get("name"))
+            ]
+            project_options = sorted({
+                clean_text(item.get("name"))
+                for item in actual_project_folders
+                if clean_text(item.get("name"))
+            })
+            if any(clean_text(f.get("project_path")) == "01_Input sakne" for f in normalized_pdf_files):
+                project_options = ["01_Input sakne"] + project_options
+
+            if not project_options:
+                st.warning("01_Input mapē nav atrasta neviena projekta apakšmape.")
             else:
-                # Projektu izvēle tiek veidota no reālajām mapēm tieši zem
-                # 01_Input, nevis secināta tikai no PDF ceļiem. Tādēļ redzamas
-                # arī tukšas jaunizveidotas projekta mapes.
-                actual_project_folders = [
-                    dict(item)
-                    for item in st.session_state.get("project_folders", [])
-                    if isinstance(item, dict)
-                    and clean_text(item.get("name"))
-                ]
-                project_options = sorted({
-                    clean_text(item.get("name"))
-                    for item in actual_project_folders
-                    if clean_text(item.get("name"))
-                })
-
-                # Ja 01_Input saknē ir PDF bez projekta mapes, saglabā atsevišķu opciju.
-                if any(
-                    clean_text(f.get("project_path")) == "01_Input sakne"
-                    for f in normalized_pdf_files
-                ):
-                    project_options = ["01_Input sakne"] + project_options
-
-                if not project_options:
-                    st.warning(
-                        "01_Input mapē nav atrasta neviena projekta apakšmape."
-                    )
-                    st.stop()
-
                 project_counts = {
                     project: sum(
                         1 for f in normalized_pdf_files
@@ -1989,16 +2037,11 @@ def main():
                     )
                     for project in project_options
                 }
-
-                current_project = clean_text(
-                    st.session_state.get("selected_project_filter")
-                )
+                current_project = clean_text(st.session_state.get("selected_project_filter"))
                 if current_project not in project_options:
                     current_project = project_options[0]
                     st.session_state.selected_project_filter = current_project
 
-                # Projekta izvēle ir ārpus formas. Mainot projektu, Streamlit veic
-                # vienu rerun un uzreiz pārrēķina apakšmapes un redzamos PDF.
                 project_value = st.selectbox(
                     "Auditējamā projekta mape 01_Input mapē",
                     options=project_options,
@@ -2006,20 +2049,16 @@ def main():
                     key="selected_project_filter",
                 )
 
-                previous_applied_project = clean_text(
-                    st.session_state.get("applied_project_filter")
-                )
-                if project_value != previous_applied_project:
+                previous_project = clean_text(st.session_state.get("applied_project_filter"))
+                if project_value != previous_project:
                     st.session_state.applied_project_filter = project_value
-                    st.session_state.selected_folder_filter = "Viss projekts"
-                    st.session_state.applied_folder_filter = "Viss projekts"
-                    st.session_state.pdf_search_value = ""
-                    st.session_state.applied_pdf_search = ""
+                    st.session_state.selected_subfolder_paths = []
                     st.session_state.selected_pdf_ids_ui = []
+                    st.session_state.pdf_search_value = ""
 
                 active_project_code = normalize_project_code(project_value)
                 if active_project_code and active_project_code != st.session_state.get("feedback_project_code"):
-                    with st.spinner(f"Nolasu projekta {active_project_code} negatīvo atmiņu..."):
+                    with st.spinner(f"Automātiski nolasu projekta {active_project_code} problēmu Excel..."):
                         feedback_df, feedback_messages = load_feedback(
                             service, memory_folder_id.strip(), active_project_code
                         )
@@ -2027,127 +2066,86 @@ def main():
                     st.session_state.feedback_project_code = active_project_code
                     st.session_state.feedback_messages = feedback_messages
 
+                st.info(
+                    f"Problēmu Excel ielasīti automātiski: {len(st.session_state.feedback_df)} rindas "
+                    f"projektam {active_project_code or '-'}"
+                )
+                for feedback_message in st.session_state.get("feedback_messages", []):
+                    st.warning(feedback_message)
+
                 selected_project_files = [
                     f for f in normalized_pdf_files
                     if clean_text(f.get("project_path")) == project_value
                 ]
-                selected_project_folders = sorted({
+                folder_paths = sorted({
                     clean_text(f.get("folder_path"))
                     for f in selected_project_files
                     if clean_text(f.get("folder_path"))
                 })
-                dynamic_folder_options = ["Viss projekts"] + selected_project_folders
-                dynamic_folder_counts = {
+                folder_counts = {
                     folder: sum(
                         1 for f in selected_project_files
                         if clean_text(f.get("folder_path")) == folder
                     )
-                    for folder in selected_project_folders
+                    for folder in folder_paths
                 }
 
-                if st.session_state.get("selected_folder_filter") not in dynamic_folder_options:
-                    st.session_state.selected_folder_filter = "Viss projekts"
-
-                # Apakšmape un meklēšana paliek formā, lai rakstīšana meklēšanas
-                # laukā nerenderētu PDF sarakstu pēc katras ievadītās rakstzīmes.
-                with st.form(
-                    f"pdf_folder_filter_form_{hashlib.sha1(project_value.encode('utf-8')).hexdigest()[:10]}",
-                    clear_on_submit=False,
-                ):
-                    folder_value = st.selectbox(
-                        "Apakšmape projektā",
-                        options=dynamic_folder_options,
-                        format_func=lambda x: (
-                            f"Viss projekts ({len(selected_project_files)} PDF)"
-                            if x == "Viss projekts"
-                            else f"{x} ({dynamic_folder_counts.get(x, 0)})"
-                        ),
-                        key="selected_folder_filter",
-                    )
-                    search_value = st.text_input(
-                        "Meklēt PDF pēc nosaukuma vai ceļa",
-                        placeholder="piem., GENERAL DATA, UKT, RA_11100",
-                        key="pdf_search_value",
-                    )
-
-                    filter_btn_col, _ = st.columns([1, 4])
-                    with filter_btn_col:
-                        apply_filter_clicked = st.form_submit_button(
-                            "Piemērot apakšmapes / meklēšanas filtru",
-                            use_container_width=True,
+                st.markdown("**Apakšmapes projektā**")
+                st.caption("Atzīmē vienu vai vairākas mapes. Failu saraksts zemāk atjaunosies automātiski.")
+                previous_selected_folders = set(st.session_state.get("selected_subfolder_paths", []))
+                selected_folders: List[str] = []
+                folder_box = st.container(border=True)
+                with folder_box:
+                    if not folder_paths:
+                        st.caption("Projektā nav atrastas apakšmapes ar PDF failiem.")
+                    for folder in folder_paths:
+                        key_hash = hashlib.sha1(f"{project_value}|{folder}".encode("utf-8")).hexdigest()[:16]
+                        label = folder
+                        prefix = f"{project_value}/"
+                        if label.startswith(prefix):
+                            label = label[len(prefix):]
+                        checked = st.checkbox(
+                            f"{label} ({folder_counts.get(folder, 0)} PDF)",
+                            value=folder in previous_selected_folders,
+                            key=f"subfolder_check_{key_hash}",
                         )
+                        if checked:
+                            selected_folders.append(folder)
+                st.session_state.selected_subfolder_paths = selected_folders
 
-                if apply_filter_clicked:
-                    st.session_state.applied_project_filter = project_value
-                    st.session_state.applied_folder_filter = folder_value
-                    st.session_state.applied_pdf_search = clean_text(search_value)
-                    st.session_state.selected_pdf_ids_ui = []
-
-                applied_project = clean_text(
-                    st.session_state.get("applied_project_filter")
+                search_value = st.text_input(
+                    "Meklēt PDF izvēlētajās mapēs",
+                    placeholder="piem., UKT, explanatory note, RA_11100",
+                    key="pdf_search_value",
                 )
-                if applied_project not in project_options:
-                    applied_project = current_project
-                    st.session_state.applied_project_filter = applied_project
+                search_norm = clean_text(search_value).lower()
 
-                applied_project_files = [
-                    f for f in normalized_pdf_files
-                    if clean_text(f.get("project_path")) == applied_project
+                visible_pdf_files = [
+                    f for f in selected_project_files
+                    if clean_text(f.get("folder_path")) in set(selected_folders)
                 ]
-                valid_applied_folders = ["Viss projekts"] + sorted({
-                    clean_text(f.get("folder_path"))
-                    for f in applied_project_files
-                    if clean_text(f.get("folder_path"))
-                })
-                applied_folder = st.session_state.get(
-                    "applied_folder_filter", "Viss projekts"
-                )
-                if applied_folder not in valid_applied_folders:
-                    applied_folder = "Viss projekts"
-                    st.session_state.applied_folder_filter = applied_folder
-
-                applied_search = clean_text(
-                    st.session_state.get("applied_pdf_search", "")
-                )
-                search_norm = applied_search.lower()
-
-                filtered_pdf_files = applied_project_files
-                if applied_folder != "Viss projekts":
-                    filtered_pdf_files = [
-                        f for f in filtered_pdf_files
-                        if clean_text(f.get("folder_path")) == applied_folder
-                    ]
                 if search_norm:
-                    filtered_pdf_files = [
-                        f for f in filtered_pdf_files
+                    visible_pdf_files = [
+                        f for f in visible_pdf_files
                         if search_norm in clean_text(f.get("rel_path")).lower()
                     ]
 
-                active_filter_text = f"Projekts: {applied_project} | Mape: {applied_folder}"
-                if applied_search:
-                    active_filter_text += f" | Meklējums: {applied_search}"
-                st.caption(f"Aktīvais filtrs: {active_filter_text}")
                 st.caption(
-                    f"Projekta kods: {normalize_project_code(applied_project)} | "
-                    f"Negatīvās atmiņas rindas: {len(st.session_state.feedback_df)}"
-                )
-                for feedback_message in st.session_state.get("feedback_messages", []):
-                    st.warning(feedback_message)
-                st.caption(
-                    f"Atrasti PDF izvēlē: {len(filtered_pdf_files)} "
-                    f"no {len(applied_project_files)} projekta PDF"
+                    f"Atzīmētas mapes: {len(selected_folders)} | "
+                    f"Redzami PDF: {len(visible_pdf_files)}"
                 )
 
-                if not filtered_pdf_files:
-                    st.warning("Šajā projekta mapē vai meklējumā PDF faili nav atrasti.")
+                if not selected_folders:
+                    st.warning("Atzīmē vismaz vienu apakšmapi.")
+                elif not visible_pdf_files:
+                    st.warning("Izvēlētajās mapēs vai pēc meklēšanas PDF faili nav atrasti.")
                 else:
-                    max_selectable = 50
-                    shown_pdf_files = filtered_pdf_files[:max_selectable]
-                    if len(filtered_pdf_files) > max_selectable:
+                    max_selectable = 300
+                    shown_pdf_files = visible_pdf_files[:max_selectable]
+                    if len(visible_pdf_files) > max_selectable:
                         st.warning(
-                            f"Izvēlei parādīti pirmie {max_selectable} no "
-                            f"{len(filtered_pdf_files)} PDF. Izmanto apakšmapi vai meklēšanu, "
-                            "lai sašaurinātu sarakstu."
+                            f"Parādīti pirmie {max_selectable} no {len(visible_pdf_files)} PDF. "
+                            "Izmanto meklēšanu, lai sašaurinātu sarakstu."
                         )
 
                     by_id = {clean_text(f.get("id")): f for f in shown_pdf_files}
@@ -2157,32 +2155,57 @@ def main():
                         if x in active_ids
                     ]
 
+                    select_all_col, clear_all_col, _ = st.columns([1, 1, 3])
+                    select_all = select_all_col.button("Atzīmēt visus redzamos", key="select_all_visible_pdfs")
+                    clear_all = clear_all_col.button("Noņemt visus", key="clear_all_visible_pdfs")
+                    if select_all:
+                        stored_ids = list(by_id.keys())
+                        st.session_state.selected_pdf_ids_ui = stored_ids
+                    if clear_all:
+                        stored_ids = []
+                        st.session_state.selected_pdf_ids_ui = []
+
                     selection_signature = hashlib.sha1(
-                        f"{applied_project}|{applied_folder}|{applied_search}".encode("utf-8")
-                    ).hexdigest()[:10]
-                    with st.form(f"pdf_file_selection_form_{selection_signature}", clear_on_submit=False):
-                        st.markdown("**Atzīmē auditējamos PDF:**")
-                        checked_ids: List[str] = []
-                        for file_id, item in by_id.items():
-                            rel_path = clean_text(item.get("rel_path"))
-                            key_hash = hashlib.sha1(
-                                f"{selection_signature}|{file_id}".encode("utf-8")
-                            ).hexdigest()[:16]
-                            checked = st.checkbox(
-                                rel_path,
-                                value=file_id in stored_ids,
-                                key=f"pdf_check_{key_hash}",
-                            )
-                            if checked:
-                                checked_ids.append(file_id)
+                        f"{project_value}|{'|'.join(selected_folders)}|{search_norm}".encode("utf-8")
+                    ).hexdigest()[:12]
+                    checked_ids: List[str] = []
+                    st.markdown("**Atzīmē auditējamos PDF:**")
+                    for folder in selected_folders:
+                        folder_items = [
+                            f for f in shown_pdf_files
+                            if clean_text(f.get("folder_path")) == folder
+                        ]
+                        if not folder_items:
+                            continue
+                        short_folder = folder
+                        prefix = f"{project_value}/"
+                        if short_folder.startswith(prefix):
+                            short_folder = short_folder[len(prefix):]
+                        with st.expander(f"{short_folder} ({len(folder_items)} PDF)", expanded=True):
+                            for item in folder_items:
+                                file_id = clean_text(item.get("id"))
+                                rel_path = clean_text(item.get("rel_path"))
+                                file_name = clean_text(item.get("display_name")) or rel_path
+                                key_hash = hashlib.sha1(
+                                    f"{selection_signature}|{file_id}".encode("utf-8")
+                                ).hexdigest()[:16]
+                                checked = st.checkbox(
+                                    file_name,
+                                    value=file_id in stored_ids,
+                                    key=f"pdf_check_multi_{key_hash}",
+                                    help=rel_path,
+                                )
+                                if checked:
+                                    checked_ids.append(file_id)
 
-                        select_btn_col, _ = st.columns([1, 4])
-                        with select_btn_col:
-                            apply_pdf_selection = st.form_submit_button(
-                                "Apstiprināt PDF izvēli",
-                                use_container_width=True,
-                            )
-
+                    apply_col, _ = st.columns([1, 4])
+                    with apply_col:
+                        apply_pdf_selection = st.button(
+                            "Apstiprināt PDF izvēli",
+                            type="primary",
+                            use_container_width=True,
+                            key=f"apply_pdf_selection_{selection_signature}",
+                        )
                     if apply_pdf_selection:
                         st.session_state.selected_pdf_ids_ui = checked_ids
 
@@ -2191,7 +2214,7 @@ def main():
                         if x in by_id
                     ]
                     selected_pdf_files = [by_id[x] for x in selected_pdf_ids]
-                    st.caption(f"Atzīmēti PDF: {len(selected_pdf_files)}")
+                    st.caption(f"Apstiprināti PDF: {len(selected_pdf_files)}")
 
                     if selected_pdf_files:
                         with st.expander("Izvēlētie PDF ceļi", expanded=False):
@@ -2212,21 +2235,13 @@ def main():
                             errors: List[str] = []
                             progress = st.progress(0)
                             status = st.empty()
-
-                            for i, selected_pdf in enumerate(
-                                selected_pdf_files, start=1
-                            ):
+                            for i, selected_pdf in enumerate(selected_pdf_files, start=1):
                                 try:
                                     status.write(
-                                        f"Nolasu {i}/{len(selected_pdf_files)}: "
-                                        f"{selected_pdf.get('name')}"
+                                        f"Nolasu {i}/{len(selected_pdf_files)}: {selected_pdf.get('name')}"
                                     )
-                                    pdf_bytes = drive_download_bytes(
-                                        service, selected_pdf["id"]
-                                    )
-                                    pdf_text_value, pages, err = extract_pdf_text(
-                                        pdf_bytes, max_context_chars
-                                    )
+                                    pdf_bytes = drive_download_bytes(service, selected_pdf["id"])
+                                    pdf_text_value, pages, err = extract_pdf_text(pdf_bytes, max_context_chars)
                                     if err:
                                         errors.append(
                                             f"{selected_pdf.get('rel_path', selected_pdf.get('name'))}: {err}"
@@ -2234,94 +2249,47 @@ def main():
                                     else:
                                         loaded_items.append({
                                             "id": selected_pdf.get("id"),
-                                            "name": selected_pdf.get(
-                                                "name", "audit.pdf"
-                                            ),
-                                            "rel_path": selected_pdf.get(
-                                                "rel_path",
-                                                selected_pdf.get(
-                                                    "name", "audit.pdf"
-                                                ),
-                                            ),
+                                            "name": selected_pdf.get("name", "audit.pdf"),
+                                            "rel_path": selected_pdf.get("rel_path", selected_pdf.get("name", "audit.pdf")),
                                             "bytes": pdf_bytes,
                                             "text": pdf_text_value,
                                             "pages": pages,
                                         })
-                                except Exception as e:
+                                except Exception as exc:
                                     errors.append(
-                                        f"{selected_pdf.get('rel_path', selected_pdf.get('name'))}: {e}"
+                                        f"{selected_pdf.get('rel_path', selected_pdf.get('name'))}: {exc}"
                                     )
-                                progress.progress(
-                                    i / max(1, len(selected_pdf_files))
-                                )
-
-                            status.write("PDF nolasīšana pabeigta.")
-                            st.session_state.selected_pdf_items = loaded_items
+                                progress.progress(i / max(1, len(selected_pdf_files)))
+                            status.empty()
+                            progress.empty()
 
                             if loaded_items:
+                                st.session_state.selected_pdf_items = loaded_items
                                 first = loaded_items[0]
-                                st.session_state.selected_pdf_bytes = first.get(
-                                    "bytes"
-                                )
-                                st.session_state.selected_pdf_name = first.get(
-                                    "name", "audit.pdf"
-                                )
-                                st.session_state.selected_pdf_rel_path = first.get(
-                                    "rel_path",
-                                    first.get("name", "audit.pdf"),
-                                )
+                                st.session_state.selected_pdf_bytes = first.get("bytes")
+                                st.session_state.selected_pdf_name = clean_text(first.get("name"))
+                                st.session_state.selected_pdf_rel_path = clean_text(first.get("rel_path"))
                                 st.session_state.pdf_text = "\n\n".join(
-                                    [
-                                        f"===== PDF: {it.get('rel_path')} =====\n"
-                                        f"{it.get('text', '')}"
-                                        for it in loaded_items
-                                    ]
-                                )[:max_context_chars * max(1, len(loaded_items))]
-                                st.session_state.pdf_pages = first.get("pages", [])
-                                st.success(
-                                    f"Nolasīti PDF: {len(loaded_items)} | "
-                                    f"kopā teksts priekšskatījumam: "
-                                    f"{len(st.session_state.pdf_text)} zīmes"
-                                )
-                            else:
-                                st.session_state.selected_pdf_items = []
-                                st.session_state.pdf_text = ""
-                                st.error(
-                                    "Neizdevās nolasīt nevienu izvēlēto PDF."
-                                )
-
+                                    f"===== PDF: {clean_text(item.get('rel_path'))} =====\n{clean_text(item.get('text'))}"
+                                    for item in loaded_items
+                                )[:max_context_chars]
+                                st.session_state.pdf_pages = [
+                                    page
+                                    for item in loaded_items
+                                    for page in item.get("pages", [])
+                                ]
+                                st.session_state.candidates = []
+                                st.session_state.ai_errors = []
+                                st.session_state.audit_run_id = ""
+                                st.success(f"Nolasīti PDF: {len(loaded_items)}")
                             if errors:
-                                with st.expander("PDF nolasīšanas kļūdas"):
-                                    for error_message in errors:
-                                        st.warning(error_message)
-
-        except Exception as e:
-            st.error(
-                "PDF projekta, mapes vai failu izvēles bloku neizdevās attēlot. "
-                "Lietotne turpina darboties."
-            )
-            st.code(str(e))
-            with st.expander("Pilns tehniskais traceback"):
+                                with st.expander(f"PDF nolasīšanas kļūdas ({len(errors)})"):
+                                    for message in errors:
+                                        st.warning(message)
+        except Exception as exc:
+            st.error(f"PDF izvēles sadaļas kļūda: {exc}")
+            with st.expander("PDF izvēles traceback"):
                 st.code(traceback.format_exc())
-
-    if st.session_state.pdf_text:
-        with st.expander("PDF teksta priekšskatījums"):
-            st.text_area("PDF teksts", value=st.session_state.pdf_text[:10000], height=300)
-
-    index_df = st.session_state.index_df
-    if not index_df.empty:
-        st.subheader("Zināšanu bāzes kopsavilkums")
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Piemēri indeksā", len(index_df))
-        c2.metric("Kļūdu ģimenes", index_df["normalized_family"].nunique())
-        c3.metric(
-            f"Feedback: {st.session_state.get('feedback_project_code') or '-'}",
-            len(st.session_state.feedback_df),
-        )
-        with st.expander("Ģimeņu sadalījums"):
-            fam_summary = index_df["normalized_family"].value_counts().reset_index()
-            fam_summary.columns = ["normalized_family", "count"]
-            st.dataframe(fam_summary, use_container_width=True)
 
     st.header("4. AI piezīmju ģenerēšana")
     selected_pdf_items = st.session_state.get("selected_pdf_items", [])
@@ -2571,9 +2539,8 @@ def main():
 
         st.subheader("Saglabāšana Google Drive")
         st.caption(
-            "Rakstīšana notiek tava Google konta vārdā ar OAuth refresh token. "
-            "Pašreiz tests izveido tikai nelielu TXT failu; pilna audita "
-            "automātiska saglabāšana tiks pievienota nākamajā posmā."
+            "Izvēlies esošu 02_Results projekta mapi vai izveido jaunu apakšmapi. "
+            "Pilnais audita ZIP tiks saglabāts tieši izvēlētajā mapē."
         )
 
         oauth_service = None
@@ -2599,52 +2566,206 @@ def main():
             )
             st.success(f"Drive rakstīšana autorizēta kā: {oauth_user}")
 
-            drive_test_col, _ = st.columns([1, 4])
-            with drive_test_col:
-                test_drive_write_clicked = st.button(
-                    "Testēt OAuth rakstīšanu 02_Results",
-                    use_container_width=True,
-                    key=f"test_oauth_drive_write_button_{audit_run_id}",
+            try:
+                results_root = resolve_results_folder(
+                    oauth_service,
+                    input_folder_id=input_folder_id.strip(),
+                    explicit_results_folder_id=results_folder_id.strip(),
                 )
+                results_root_id = clean_text(results_root.get("id"))
+                results_root_name = clean_text(results_root.get("name")) or "02_Results"
+                active_project_name = (
+                    clean_text(st.session_state.get("applied_project_filter"))
+                    or clean_text(st.session_state.get("selected_project_filter"))
+                )
+                active_project_code = normalize_project_code(active_project_name)
 
-            if test_drive_write_clicked:
-                st.session_state.drive_write_test_result = None
-                st.session_state.drive_write_test_error = ""
-                if not input_folder_id.strip():
-                    st.session_state.drive_write_test_error = "Nav norādīts 01_Input folder ID."
-                else:
+                project_result_folder = None
+                if active_project_code:
+                    project_result_folder = find_project_folder(
+                        oauth_service, results_root_id, active_project_code
+                    )
+
+                if not project_result_folder and active_project_name and active_project_name != "01_Input sakne":
+                    st.warning(
+                        f"Mapē {results_root_name} vēl nav atrasta projekta mape "
+                        f"{active_project_name}. Vari to izveidot ar pogu zemāk."
+                    )
+                    create_project_col, _ = st.columns([1, 4])
+                    with create_project_col:
+                        create_project_clicked = st.button(
+                            f"Izveidot {active_project_name}",
+                            use_container_width=True,
+                            key=f"create_results_project_{active_project_code}",
+                        )
+                    if create_project_clicked:
+                        project_result_folder = drive_create_folder(
+                            oauth_service, results_root_id, active_project_name
+                        )
+                        st.success(f"Izveidota rezultātu mape: {active_project_name}")
+                        st.rerun()
+
+                base_folder = project_result_folder or {
+                    "id": results_root_id,
+                    "name": results_root_name,
+                }
+                base_folder_id = clean_text(base_folder.get("id"))
+                base_folder_name = clean_text(base_folder.get("name"))
+
+                child_folders = drive_list_children(
+                    oauth_service,
+                    base_folder_id,
+                    "application/vnd.google-apps.folder",
+                )
+                folder_options: List[Dict[str, str]] = [{
+                    "id": base_folder_id,
+                    "name": base_folder_name,
+                    "path": f"{results_root_name}/{base_folder_name}" if base_folder_id != results_root_id else results_root_name,
+                }]
+                for folder in sorted(child_folders, key=lambda x: clean_text(x.get("name")).lower()):
+                    folder_options.append({
+                        "id": clean_text(folder.get("id")),
+                        "name": clean_text(folder.get("name")),
+                        "path": (
+                            f"{results_root_name}/{base_folder_name}/{clean_text(folder.get('name'))}"
+                            if base_folder_id != results_root_id
+                            else f"{results_root_name}/{clean_text(folder.get('name'))}"
+                        ),
+                    })
+
+                option_by_id = {item["id"]: item for item in folder_options}
+                current_target_id = clean_text(st.session_state.get("drive_target_folder_id"))
+                if current_target_id not in option_by_id:
+                    current_target_id = base_folder_id
+                    st.session_state.drive_target_folder_id = current_target_id
+
+                selected_target_id = st.selectbox(
+                    "Kurā Drive mapē saglabāt audita failus?",
+                    options=[item["id"] for item in folder_options],
+                    format_func=lambda folder_id: option_by_id[folder_id]["path"],
+                    key="drive_target_folder_id",
+                )
+                selected_target = option_by_id[selected_target_id]
+                st.session_state.drive_target_folder_name = selected_target["name"]
+                st.session_state.drive_target_folder_path = selected_target["path"]
+                st.info(f"Izvēlētais galamērķis: {selected_target['path']}")
+
+                with st.expander("+ Izveidot jaunu mapi izvēlētajā vietā", expanded=False):
+                    suggested_name = datetime.now().strftime("%Y-%m-%d_Audits")
+                    new_folder_name = st.text_input(
+                        "Jaunās mapes nosaukums",
+                        value=suggested_name,
+                        key="new_drive_folder_name",
+                    )
+                    st.caption(f"Jaunā mape tiks izveidota zem: {selected_target['path']}")
+                    create_folder_col, _ = st.columns([1, 4])
+                    with create_folder_col:
+                        create_folder_clicked = st.button(
+                            "Izveidot mapi",
+                            type="primary",
+                            use_container_width=True,
+                            key="create_new_drive_target_folder",
+                        )
+                    if create_folder_clicked:
+                        created_folder = drive_create_folder(
+                            oauth_service,
+                            selected_target_id,
+                            new_folder_name,
+                        )
+                        st.session_state.drive_target_folder_id = clean_text(created_folder.get("id"))
+                        st.success(
+                            "Mape jau pastāvēja un tika izvēlēta."
+                            if created_folder.get("already_existed")
+                            else f"Izveidota jauna mape: {clean_text(created_folder.get('name'))}"
+                        )
+                        st.rerun()
+
+                action_col1, action_col2, _ = st.columns([1, 1, 3])
+                with action_col1:
+                    test_drive_write_clicked = st.button(
+                        "Testēt rakstīšanu",
+                        use_container_width=True,
+                        key=f"test_oauth_drive_write_button_{audit_run_id}",
+                    )
+                with action_col2:
+                    save_audit_clicked = st.button(
+                        "Saglabāt audita ZIP Drive",
+                        type="primary",
+                        use_container_width=True,
+                        key=f"save_audit_zip_drive_{audit_run_id}",
+                    )
+
+                if test_drive_write_clicked:
+                    st.session_state.drive_write_test_result = None
+                    st.session_state.drive_write_test_error = ""
                     try:
-                        with st.spinner("Izveidoju OAuth testa failu 02_Results mapē..."):
-                            result = run_drive_write_test(
+                        with st.spinner("Izveidoju testa failu izvēlētajā mapē..."):
+                            result = run_drive_write_test_to_folder(
                                 oauth_service,
-                                input_folder_id=input_folder_id.strip(),
-                                results_folder_id=results_folder_id.strip(),
+                                target_folder_id=selected_target_id,
+                                target_folder_name=selected_target["path"],
                             )
                         st.session_state.drive_write_test_result = result
                     except Exception as exc:
                         st.session_state.drive_write_test_error = str(exc)
 
+                if save_audit_clicked:
+                    st.session_state.drive_save_result = None
+                    st.session_state.drive_save_error = ""
+                    try:
+                        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                        zip_name = f"bp_ai_audit_copilot_{base}_{timestamp}.zip"
+                        with st.spinner("Saglabāju pilno audita ZIP Google Drive..."):
+                            uploaded_zip = drive_upload_bytes(
+                                oauth_service,
+                                folder_id=selected_target_id,
+                                file_name=zip_name,
+                                data=zip_bytes,
+                                mime_type="application/zip",
+                            )
+                        st.session_state.drive_save_result = {
+                            "file": uploaded_zip,
+                            "target": selected_target,
+                        }
+                    except Exception as exc:
+                        st.session_state.drive_save_error = str(exc)
+
+            except Exception as exc:
+                st.error(f"Neizdevās sagatavot Drive mapju izvēli: {exc}")
+                with st.expander("Drive mapju izvēles traceback"):
+                    st.code(traceback.format_exc())
+
         write_test_error = clean_text(st.session_state.get("drive_write_test_error"))
         if write_test_error:
             st.error("OAuth Drive rakstīšanas tests neizdevās.")
             st.code(write_test_error)
-            st.caption(
-                "Pārbaudi refresh_token, OAuth klienta datus, "
-                "Drive scope un 02_Results folder ID."
-            )
 
         write_test_result = st.session_state.get("drive_write_test_result")
         if isinstance(write_test_result, dict) and write_test_result:
             test_file = write_test_result.get("file") or {}
             target = write_test_result.get("target") or {}
-            st.success(
-                f"OAuth Drive rakstīšanas tests izdevās: "
-                f"{clean_text(test_file.get('name'))}"
-            )
+            st.success(f"Drive rakstīšanas tests izdevās: {clean_text(test_file.get('name'))}")
             file_link = clean_text(test_file.get("webViewLink"))
             if file_link:
                 st.markdown(f"[Atvērt testa failu Google Drive]({file_link})")
-            st.caption(f"Mērķa mape: {clean_text(target.get('name')) or '02_Results'}")
+            st.caption(f"Mērķa mape: {clean_text(target.get('name'))}")
+
+        save_error = clean_text(st.session_state.get("drive_save_error"))
+        if save_error:
+            st.error("Audita ZIP saglabāšana Google Drive neizdevās.")
+            st.code(save_error)
+
+        save_result = st.session_state.get("drive_save_result")
+        if isinstance(save_result, dict) and save_result:
+            saved_file = save_result.get("file") or {}
+            target = save_result.get("target") or {}
+            st.success(
+                f"Audita ZIP saglabāts: {clean_text(saved_file.get('name'))}"
+            )
+            saved_link = clean_text(saved_file.get("webViewLink"))
+            if saved_link:
+                st.markdown(f"[Atvērt saglabāto auditu Google Drive]({saved_link})")
+            st.caption(f"Mērķa mape: {clean_text(target.get('path'))}")
 
 
 if __name__ == "__main__":
