@@ -43,7 +43,7 @@ except Exception:
     HttpError = Exception
 
 
-APP_VERSION = "v0.6.4.5"
+APP_VERSION = "v0.6.4.6"
 APP_TITLE = f"BP AI Audit Copilot {APP_VERSION}"
 
 REQUIRED_EXPORT_COLUMNS = [
@@ -2634,10 +2634,35 @@ def main():
                     })
 
                 option_by_id = {item["id"]: item for item in folder_options}
+                # Streamlit neļauj mainīt widgeta session_state vērtību pēc tam,
+                # kad widgets ar šo key jau ir izveidots tajā pašā izpildes ciklā.
+                # Ja tikko izveidota jauna mape, tās ID vispirms glabājam atsevišķā
+                # pending atslēgā un piemērojam pirms selectbox izveides nākamajā rerun.
+                pending_target_id = clean_text(
+                    st.session_state.pop("pending_drive_target_folder_id", "")
+                )
+                if pending_target_id:
+                    # Ja jaunā mape ir izveidota zem pašlaik izvēlētās mapes,
+                    # pievienojam to opcijām arī tad, ja tā nav base mapes tiešais bērns.
+                    pending_target_name = clean_text(
+                        st.session_state.pop("pending_drive_target_folder_name", "")
+                    )
+                    pending_target_path = clean_text(
+                        st.session_state.pop("pending_drive_target_folder_path", "")
+                    )
+                    if pending_target_id not in option_by_id:
+                        pending_item = {
+                            "id": pending_target_id,
+                            "name": pending_target_name or "Jaunā mape",
+                            "path": pending_target_path or pending_target_name or "Jaunā mape",
+                        }
+                        folder_options.append(pending_item)
+                        option_by_id[pending_target_id] = pending_item
+                    st.session_state["drive_target_folder_id"] = pending_target_id
+
                 current_target_id = clean_text(st.session_state.get("drive_target_folder_id"))
                 if current_target_id not in option_by_id:
-                    current_target_id = base_folder_id
-                    st.session_state.drive_target_folder_id = current_target_id
+                    st.session_state["drive_target_folder_id"] = base_folder_id
 
                 selected_target_id = st.selectbox(
                     "Kurā Drive mapē saglabāt audita failus?",
@@ -2672,7 +2697,12 @@ def main():
                             selected_target_id,
                             new_folder_name,
                         )
-                        st.session_state.drive_target_folder_id = clean_text(created_folder.get("id"))
+                        created_folder_id = clean_text(created_folder.get("id"))
+                        created_folder_name = clean_text(created_folder.get("name"))
+                        created_folder_path = f"{selected_target['path']}/{created_folder_name}"
+                        st.session_state["pending_drive_target_folder_id"] = created_folder_id
+                        st.session_state["pending_drive_target_folder_name"] = created_folder_name
+                        st.session_state["pending_drive_target_folder_path"] = created_folder_path
                         st.success(
                             "Mape jau pastāvēja un tika izvēlēta."
                             if created_folder.get("already_existed")
