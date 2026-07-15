@@ -43,7 +43,7 @@ except Exception:
     HttpError = Exception
 
 
-APP_VERSION = "v0.7.2"
+APP_VERSION = "v0.7.3"
 APP_TITLE = f"BP AI Audit Copilot {APP_VERSION}"
 
 REQUIRED_EXPORT_COLUMNS = [
@@ -619,7 +619,7 @@ def build_annotated_pdf_exports(
             "audit_status": audit_status,
             "accepted_count": int(len(rows)),
             "banner_verified": any(
-                clean_text(r.get("status")) == "no_findings_banner_verified"
+                clean_text(r.get("status")) == "no_findings_note_verified"
                 for r in report or [] if isinstance(r, dict)
             ),
         })
@@ -2331,31 +2331,16 @@ def add_page_note(page: Any, row: Dict[str, Any], comment: str) -> None:
 
 
 
-def _find_pdf_unicode_font() -> str:
-    """Atrod Streamlit vidē pieejamu Unicode fontu PDF statusa tekstam."""
-    candidates = [
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-        "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
-        "/usr/share/fonts/opentype/noto/NotoSans-Regular.ttf",
-        "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
-        "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
-    ]
-    for path in candidates:
-        if os.path.isfile(path):
-            return path
-    return ""
+def add_no_findings_banner(
+    pdf_bytes: bytes,
+) -> Tuple[Optional[bytes], List[Dict[str, Any]]]:
+    """Pievieno parastu dzeltenu PDF piezīmes ikonu failam bez neatbilstībām.
 
-
-def add_no_findings_banner(pdf_bytes: bytes) -> Tuple[Optional[bytes], List[Dict[str, Any]]]:
-    """Ieraksta nelielu, horizontālu statusa bloku redzamās lapas augšējā labajā stūrī.
-
-    PyMuPDF zīmēšanas koordinātas ir nesašķiebtas lapas koordinātas, bet
-    ``page.rect`` atspoguļo lapas rotāciju. Tāpēc bloka redzamā vieta vispirms
-    tiek noteikta pagrieztajā skatā un pēc tam pārveidota ar derotation_matrix.
-    Tas novērš lielo vertikālo zaļo taisnstūri uz 90°/270° pagrieztiem rasējumiem.
+    Statuss netiek zīmēts kā liels krāsains bloks. Tā vietā redzamās pirmās
+    lapas augšējā labajā stūrī tiek ievietota standarta sticky-note anotācija.
+    Uz tās uzspiežot, atveras pilns audita rezultāta teksts.
     """
-    message = "Audita rezultātā neatbilstības nav konstatētas."
-    ascii_message = "Audita rezultata neatbilstibas nav konstatetas."
+    message = "Audita rezultātā piezīmes nav konstatētas."
 
     if fitz is None:
         return None, [{
@@ -2374,85 +2359,38 @@ def add_no_findings_banner(pdf_bytes: bytes) -> Tuple[Optional[bytes], List[Dict
 
         page = doc[0]
         page_rotation = int(page.rotation)
-
-        # Redzamās lapas koordinātas, ņemot vērā /Rotate.
         visual_rect = page.rect
-        short_side = min(visual_rect.width, visual_rect.height)
 
-        margin = max(10.0, min(26.0, short_side * 0.012))
-        box_width = min(
-            visual_rect.width * 0.34,
-            max(250.0, visual_rect.width * 0.24),
+        # Izvēlamies punktu redzamās lapas augšējā labajā stūrī.
+        margin = max(
+            18.0,
+            min(42.0, min(visual_rect.width, visual_rect.height) * 0.02),
         )
-        box_height = max(
-            54.0,
-            min(88.0, visual_rect.height * 0.075),
-        )
-        font_size = max(
-            10.0,
-            min(18.0, short_side * 0.011),
-        )
-
-        visual_box = fitz.Rect(
-            visual_rect.x1 - box_width - margin,
-            visual_rect.y0 + margin,
+        visual_point = fitz.Point(
             visual_rect.x1 - margin,
-            visual_rect.y0 + margin + box_height,
+            visual_rect.y0 + margin,
         )
 
-        # Pārvērš redzamā skata koordinātas PDF nesašķiebtajās koordinātās.
-        box = visual_box * page.derotation_matrix
+        # PyMuPDF anotāciju koordinātas ir nesašķiebtās lapas koordinātās.
+        point = visual_point * page.derotation_matrix
 
-        font_path = _find_pdf_unicode_font()
-        font_name = "helv"
-        visible_message = ascii_message
-
-        if font_path:
-            font_name = "AuditSans"
-            page.insert_font(
-                fontname=font_name,
-                fontfile=font_path,
+        annot = page.add_text_annot(
+            point,
+            message,
+            icon="Note",
+        )
+        annot.set_info(
+            title="AI būvprojekta audits",
+            subject="Audita rezultāts",
+            content=message,
+        )
+        try:
+            annot.set_colors(
+                stroke=(1.0, 0.82, 0.0),
             )
-            visible_message = message
-
-        border_width = max(1.2, font_size * 0.075)
-        page.draw_rect(
-            box,
-            color=(0.04, 0.32, 0.08),
-            fill=(0.91, 1.00, 0.92),
-            width=border_width,
-            overlay=True,
-        )
-
-        padding = max(6.0, font_size * 0.55)
-        inner = fitz.Rect(
-            box.x0 + padding,
-            box.y0 + padding,
-            box.x1 - padding,
-            box.y1 - padding,
-        )
-
-        spare = page.insert_textbox(
-            inner,
-            visible_message,
-            fontsize=font_size,
-            fontname=font_name,
-            color=(0.00, 0.20, 0.03),
-            align=1,
-            overlay=True,
-        )
-
-        # Ja konkrētajā PDF teksts neietilpst, samazina fontu, nevis palielina bloku.
-        if spare < 0:
-            page.insert_textbox(
-                inner,
-                visible_message,
-                fontsize=max(8.0, font_size * 0.78),
-                fontname=font_name,
-                color=(0.00, 0.20, 0.03),
-                align=1,
-                overlay=True,
-            )
+        except Exception:
+            pass
+        annot.update()
 
         out = io.BytesIO()
         doc.save(out, garbage=4, deflate=True)
@@ -2462,29 +2400,31 @@ def add_no_findings_banner(pdf_bytes: bytes) -> Tuple[Optional[bytes], List[Dict
         verified = False
         verification_error = ""
         try:
-            check = fitz.open(stream=result, filetype="pdf")
-            extracted = clean_text(check[0].get_text("text")).casefold()
-            verified = clean_text(visible_message).casefold() in extracted
-            check.close()
+            check_doc = fitz.open(stream=result, filetype="pdf")
+            check_page = check_doc[0]
+            for check_annot in check_page.annots() or []:
+                info = check_annot.info or {}
+                content = clean_text(info.get("content"))
+                title = clean_text(info.get("title"))
+                if (
+                    content == message
+                    and title == "AI būvprojekta audits"
+                ):
+                    verified = True
+                    break
+            check_doc.close()
         except Exception as exc:
             verification_error = str(exc)
 
         return result, [{
             "status": (
-                "no_findings_banner_verified"
+                "no_findings_note_verified"
                 if verified
-                else "no_findings_banner_unverified"
+                else "no_findings_note_unverified"
             ),
             "target_page": 1,
-            "message": visible_message,
-            "font_size": round(font_size, 1),
+            "message": message,
             "page_rotation": page_rotation,
-            "visual_box": [
-                round(visual_box.x0, 1),
-                round(visual_box.y0, 1),
-                round(visual_box.x1, 1),
-                round(visual_box.y1, 1),
-            ],
             "verification_error": verification_error,
         }]
 
@@ -2492,8 +2432,8 @@ def add_no_findings_banner(pdf_bytes: bytes) -> Tuple[Optional[bytes], List[Dict
         return None, [{
             "status": "error",
             "message": (
-                "Neizdevās pievienot audita rezultāta "
-                f"paziņojumu: {exc}"
+                "Neizdevās pievienot audita rezultāta piezīmi: "
+                f"{exc}"
             ),
         }]
 
@@ -3969,12 +3909,12 @@ def main():
                     if banner_verified:
                         st.success(
                             f"{source} — 0 akceptētas piezīmes — "
-                            "statusa bloks PDF saturā ir pievienots un pārbaudīts."
+                            "dzeltenā PDF piezīmes ikona ir pievienota un pārbaudīta."
                         )
                     else:
                         st.warning(
                             f"{source} — 0 akceptētas piezīmes — "
-                            "statusa bloks izveidots, bet automātiskā teksta pārbaude to neapstiprināja."
+                            "PDF piezīmes ikona izveidota, bet automātiskā anotācijas pārbaude to neapstiprināja."
                         )
                 else:
                     st.info(f"{source} — akceptētas piezīmes: {accepted_count}.")
