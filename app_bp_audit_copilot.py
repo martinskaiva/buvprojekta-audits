@@ -43,7 +43,7 @@ except Exception:
     HttpError = Exception
 
 
-APP_VERSION = "v0.6.4.7"
+APP_VERSION = "v0.6.4.8"
 APP_TITLE = f"BP AI Audit Copilot {APP_VERSION}"
 
 REQUIRED_EXPORT_COLUMNS = [
@@ -499,36 +499,50 @@ def build_annotated_pdf_exports(
     pdf_items: List[Dict[str, Any]],
     timestamp: str,
 ) -> List[Dict[str, Any]]:
-    """Sagatavo katru koriģēto PDF kā atsevišķu Drive augšupielādes failu."""
+    """Sagatavo rezultāta PDF katram auditētajam dokumentam.
+
+    Ja dokumentam ir akceptētas piezīmes, tas tiek anotēts. Ja akceptētu
+    neatbilstību nav, pirmajā lapā tiek pievienots paziņojums, ka neatbilstības
+    nav konstatētas. Tādējādi rezultātu PDF skaits sakrīt ar auditēto PDF skaitu.
+    """
     exports: List[Dict[str, Any]] = []
-    if accepted_df is None or accepted_df.empty:
-        return exports
+    target_series = pd.Series(dtype=str)
+    if accepted_df is not None and not accepted_df.empty and "target_file" in accepted_df.columns:
+        target_series = accepted_df["target_file"].astype(str).map(clean_text)
+
     for item in pdf_items or []:
         pdf_name = clean_text(item.get("name"))
         pdf_rel_path = clean_text(item.get("rel_path")) or pdf_name
         pdf_bytes = item.get("bytes")
         if not pdf_name or not pdf_bytes:
             continue
-        target_series = accepted_df["target_file"].astype(str).map(clean_text)
-        rows = accepted_df[target_series.eq(pdf_rel_path)].copy()
+
+        rows = pd.DataFrame()
+        if accepted_df is not None and not accepted_df.empty and not target_series.empty:
+            rows = accepted_df[target_series.eq(pdf_rel_path)].copy()
+            if rows.empty:
+                rows = accepted_df[target_series.eq(pdf_name)].copy()
+
         if rows.empty:
-            rows = accepted_df[target_series.eq(pdf_name)].copy()
-        if rows.empty:
-            continue
-        annotated_pdf, report = annotate_pdf_bytes(pdf_bytes, rows)
-        if not annotated_pdf:
+            result_pdf, report = add_no_findings_banner(pdf_bytes)
+            audit_status = "no_findings"
+        else:
+            result_pdf, report = annotate_pdf_bytes(pdf_bytes, rows)
+            audit_status = "findings"
+
+        if not result_pdf:
             continue
         source_stem = os.path.splitext(pdf_name)[0]
         safe_stem = re.sub(r"[^A-Za-z0-9_\-]+", "_", source_stem)[:120]
         exports.append({
             "name": f"annotated_{safe_stem}_{timestamp}.pdf",
-            "data": annotated_pdf,
+            "data": result_pdf,
             "mime_type": "application/pdf",
             "source": pdf_rel_path,
             "report": report,
+            "audit_status": audit_status,
         })
     return exports
-
 
 def upload_audit_files_to_drive(
     service,
@@ -1231,7 +1245,7 @@ def normalize_candidate(c: Dict[str, Any], family: str) -> Dict[str, Any]:
         problem = note
     # Vienots avots abiem laukiem novērš AI lauku savstarpēju sajaukšanu.
     out["problem"] = problem
-    out["designer_note"] = shorten_pdf_comment(problem)
+    out["designer_note"] = clean_text(note or problem)
     if not clean_text(out.get("target_text")):
         out["target_text"] = "MANUAL_PLACEMENT_REQUIRED"
     return out
@@ -1608,57 +1622,28 @@ def candidate_to_rejected_row(c: Dict[str, Any], idx: int, pdf_name: str, reason
 
 
 def shorten_pdf_comment(text: str) -> str:
-    """Atstāj PDF anotācijā tikai konkrēto kļūdu vai nesakritību.
+    """Notīra PDF komentāru, nepārraujot konstatējuma tekstu.
 
-    Garums netiek mehāniski ierobežots: komentārs drīkst būt garāks, ja tas
-    nepieciešams, lai nepārprotami nosauktu abas salīdzinājuma puses un vietas.
+    Netiek lietots simbolu limits un teksts netiek griezts teikuma vidū.
+    Tiek atmestas tikai skaidri nodalītas papildu sadaļas, kas sākas ar
+    pamatojuma, seku vai risinājuma virsrakstu.
     """
-    text = clean_text(text)
-    if not text:
+    original = clean_text(text)
+    if not original:
         return "Piezīme auditā."
 
-    # Ja tekstā parādās atsevišķa pamatojuma, seku vai risinājuma sadaļa,
-    # atmetam šo sadaļu un visu, kas seko aiz tās.
+    cleaned = re.sub(r"(?i)^komentārs\s*:\s*", "", original).strip()
     section_pattern = re.compile(
-        r"(?i)(?:^|\s)(?:kāpēc tas ir svarīgi|ieteikums|risinājums|sekas|riski?|kā novērst)\s*:\s*"
+        r"(?i)(?:^|[\n\r]+|(?<=[.!?])\s+)(?:kāpēc tas ir svarīgi|ieteikums|risinājums|sekas|riski?|kā novērst)\s*:\s*"
     )
-    section_match = section_pattern.search(text)
-    if section_match:
-        text = text[:section_match.start()].strip()
+    match = section_pattern.search(cleaned)
+    if match:
+        candidate = cleaned[:match.start()].strip()
+        # Saglabājam tikai gramatiski pilnu rezultātu; pretējā gadījumā atstājam oriģinālu.
+        if candidate and candidate[-1:] in ".!?)]}”\"'":
+            cleaned = candidate
 
-    # Noņem tikai tehnisku ievada virsrakstu, saglabājot pašu konstatējumu.
-    text = re.sub(r"(?i)^komentārs\s*:\s*", "", text).strip()
-
-    non_factual_markers = [
-        "lūdzu pārbaudīt",
-        "lūdzu saskaņot",
-        "nepieciešams pārbaudīt",
-        "nepieciešams saskaņot",
-        "ieteicams",
-        "lai nodrošinātu",
-        "var radīt",
-        "var izraisīt",
-        "var ietekmēt",
-        "rada risku",
-        "tas ir svarīgi",
-        "būvniecības procesā",
-        "projekta izpildē",
-        "dokumentu pārvaldībā",
-    ]
-
-    kept: List[str] = []
-    for sentence in re.split(r"(?<=[.!?])\s+", text):
-        sentence = clean_text(sentence)
-        if not sentence:
-            continue
-        low = sentence.lower()
-        cut_positions = [low.find(marker) for marker in non_factual_markers if marker in low]
-        if cut_positions:
-            sentence = sentence[:min(cut_positions)].rstrip(" ,;:-")
-        if sentence:
-            kept.append(sentence)
-
-    return " ".join(kept).strip() or text or "Piezīme auditā."
+    return cleaned or original or "Piezīme auditā."
 
 def make_pdf_comment(row: Dict[str, Any]) -> str:
     # Prioritāte ir lietotāja pārskatītajam īsajam comment_text, nevis garajam
@@ -1688,6 +1673,53 @@ def add_page_note(page: Any, row: Dict[str, Any], comment: str) -> None:
         annot.update()
     except Exception:
         pass
+
+
+def add_no_findings_banner(pdf_bytes: bytes) -> Tuple[Optional[bytes], List[Dict[str, Any]]]:
+    """Pirmajā lapā augšējā labajā stūrī pievieno redzamu audita rezultāta paziņojumu."""
+    if fitz is None:
+        return None, [{"status": "error", "message": "PyMuPDF/fitz nav pieejams Streamlit vidē."}]
+    try:
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        if len(doc) == 0:
+            doc.close()
+            return None, [{"status": "error", "message": "PDF nav lapu."}]
+        page = doc[0]
+        page_rect = page.rect
+        width = min(290.0, max(190.0, page_rect.width * 0.34))
+        height = 58.0
+        margin = 18.0
+        box = fitz.Rect(page_rect.x1 - width - margin, page_rect.y0 + margin, page_rect.x1 - margin, page_rect.y0 + margin + height)
+        message = "Audita rezultātā neatbilstības nav konstatētas."
+        try:
+            annot = page.add_freetext_annot(
+                box,
+                message,
+                fontsize=10,
+                fontname="Helv",
+                text_color=(0, 0, 0),
+                fill_color=(1, 1, 1),
+                border_color=(0, 0, 0),
+                align=1,
+            )
+            annot.set_info(title="AI būvprojekta audits", content=message)
+            annot.update()
+        except Exception:
+            page.draw_rect(box, color=(0, 0, 0), fill=(1, 1, 1), width=1)
+            page.insert_textbox(
+                box + (6, 6, -6, -6),
+                message,
+                fontsize=10,
+                fontname="helv",
+                align=1,
+                color=(0, 0, 0),
+            )
+        out = io.BytesIO()
+        doc.save(out, garbage=4, deflate=True)
+        doc.close()
+        return out.getvalue(), [{"status": "no_findings_banner", "target_page": 1, "message": message}]
+    except Exception as exc:
+        return None, [{"status": "error", "message": f"Neizdevās pievienot audita rezultāta paziņojumu: {exc}"}]
 
 
 def annotate_pdf_bytes(pdf_bytes: bytes, accepted_df: pd.DataFrame) -> Tuple[Optional[bytes], List[Dict[str, Any]]]:
@@ -1811,21 +1843,24 @@ def make_zip(
 
         # Annotate each selected PDF separately.
         all_reports: List[Dict[str, Any]] = []
-        if accepted_df is not None and not accepted_df.empty and pdf_items:
+        if pdf_items:
             for item in pdf_items:
                 pdf_name = clean_text(item.get("name"))
                 pdf_bytes = item.get("bytes")
                 if not pdf_name or not pdf_bytes:
                     continue
                 pdf_rel_path = clean_text(item.get("rel_path")) or pdf_name
-                target_series = accepted_df["target_file"].astype(str).map(clean_text)
-                pdf_rows = accepted_df[target_series.eq(pdf_rel_path)].copy()
+                pdf_rows = pd.DataFrame()
+                if accepted_df is not None and not accepted_df.empty and "target_file" in accepted_df.columns:
+                    target_series = accepted_df["target_file"].astype(str).map(clean_text)
+                    pdf_rows = accepted_df[target_series.eq(pdf_rel_path)].copy()
+                    if pdf_rows.empty:
+                        # Atpakaļsaderība vecākiem ierakstiem, kuros target_file bija tikai faila nosaukums.
+                        pdf_rows = accepted_df[target_series.eq(pdf_name)].copy()
                 if pdf_rows.empty:
-                    # Atpakaļsaderība vecākiem ierakstiem, kuros target_file bija tikai faila nosaukums.
-                    pdf_rows = accepted_df[target_series.eq(pdf_name)].copy()
-                if pdf_rows.empty:
-                    continue
-                annotated_pdf, pdf_report = annotate_pdf_bytes(pdf_bytes, pdf_rows)
+                    annotated_pdf, pdf_report = add_no_findings_banner(pdf_bytes)
+                else:
+                    annotated_pdf, pdf_report = annotate_pdf_bytes(pdf_bytes, pdf_rows)
                 safe_pdf_source = os.path.splitext(pdf_rel_path)[0]
                 safe_pdf_base = re.sub(r"[^A-Za-z0-9_\-]+", "_", safe_pdf_source)[:100]
                 if annotated_pdf:
@@ -2603,7 +2638,7 @@ def main():
                     "Labot īso komentāru",
                     value=clean_text(c.get("designer_note") or c.get("problem") or c.get("comment_text")),
                     key=f"designer_note_{audit_run_id}_{candidate_id}",
-                    height=75,
+                    height=140,
                 )
                 c["designer_note"] = edited_note
                 decision = st.radio(
@@ -2649,7 +2684,7 @@ def main():
         c1.metric("Akceptētas", len(accepted_df))
         c2.metric("Noraidītas", len(rejected_df))
         c3.metric("Kopā piezīmes", len(review_df))
-        st.caption("ZIP satur accepted/review Excel. Rejected faili tiek pievienoti tikai tad, ja ir noraidītas piezīmes. Ja ir akceptētas piezīmes un PDF ir nolasīts, ZIP satur arī annotated_pdf_*.pdf un pdf_markup_report_*.xlsx. Zemāk vari pārbaudīt rakstīšanu uz Google Drive 02_Results.")
+        st.caption("ZIP satur accepted/review Excel. Rejected faili tiek pievienoti tikai tad, ja ir noraidītas piezīmes. ZIP satur rezultāta PDF katram auditētajam dokumentam; failiem bez konstatētām neatbilstībām pirmajā lapā ir audita rezultāta paziņojums. Zemāk vari pārbaudīt rakstīšanu uz Google Drive 02_Results.")
         selected_pdf_items = st.session_state.get("selected_pdf_items", [])
         if len(selected_pdf_items) == 1:
             base_source = selected_pdf_items[0].get("name", st.session_state.selected_pdf_name)
@@ -2823,8 +2858,8 @@ def main():
                     st.session_state.drive_save_result = None
                     st.session_state.drive_save_error = ""
                     try:
-                        if accepted_df.empty and rejected_df.empty:
-                            raise RuntimeError("Nav nevienas akceptētas vai noraidītas piezīmes, ko saglabāt.")
+                        if not selected_pdf_items:
+                            raise RuntimeError("Nav izvēlētu auditējamo PDF failu, ko saglabāt.")
                         with st.spinner("Saglabāju PDF un Memory Excel Google Drive..."):
                             result = upload_audit_files_to_drive(
                                 oauth_service,
