@@ -43,7 +43,7 @@ except Exception:
     HttpError = Exception
 
 
-APP_VERSION = "v0.7.1"
+APP_VERSION = "v0.7.2"
 APP_TITLE = f"BP AI Audit Copilot {APP_VERSION}"
 
 REQUIRED_EXPORT_COLUMNS = [
@@ -2331,80 +2331,171 @@ def add_page_note(page: Any, row: Dict[str, Any], comment: str) -> None:
 
 
 
+def _find_pdf_unicode_font() -> str:
+    """Atrod Streamlit vidē pieejamu Unicode fontu PDF statusa tekstam."""
+    candidates = [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
+        "/usr/share/fonts/opentype/noto/NotoSans-Regular.ttf",
+        "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+    ]
+    for path in candidates:
+        if os.path.isfile(path):
+            return path
+    return ""
+
+
 def add_no_findings_banner(pdf_bytes: bytes) -> Tuple[Optional[bytes], List[Dict[str, Any]]]:
+    """Ieraksta nelielu, horizontālu statusa bloku redzamās lapas augšējā labajā stūrī.
+
+    PyMuPDF zīmēšanas koordinātas ir nesašķiebtas lapas koordinātas, bet
+    ``page.rect`` atspoguļo lapas rotāciju. Tāpēc bloka redzamā vieta vispirms
+    tiek noteikta pagrieztajā skatā un pēc tam pārveidota ar derotation_matrix.
+    Tas novērš lielo vertikālo zaļo taisnstūri uz 90°/270° pagrieztiem rasējumiem.
+    """
     message = "Audita rezultātā neatbilstības nav konstatētas."
+    ascii_message = "Audita rezultata neatbilstibas nav konstatetas."
+
     if fitz is None:
-        return None, [{"status": "error", "message": "PyMuPDF/fitz nav pieejams Streamlit vidē."}]
+        return None, [{
+            "status": "error",
+            "message": "PyMuPDF/fitz nav pieejams Streamlit vidē.",
+        }]
+
     try:
         doc = fitz.open(stream=pdf_bytes, filetype="pdf")
         if len(doc) == 0:
             doc.close()
-            return None, [{"status": "error", "message": "PDF nav lapu."}]
+            return None, [{
+                "status": "error",
+                "message": "PDF nav lapu.",
+            }]
+
         page = doc[0]
-        rect = page.rect
-        short_side = min(rect.width, rect.height)
-        font_size = max(13.0, min(30.0, short_side * 0.019))
-        margin = max(18.0, short_side * 0.018)
-        width = min(rect.width * 0.50, max(380.0, rect.width * 0.36))
-        height = max(font_size * 4.0, min(rect.height * 0.12, 145.0))
-        box = fitz.Rect(
-            rect.x1 - width - margin,
-            rect.y0 + margin,
-            rect.x1 - margin,
-            rect.y0 + margin + height,
+        page_rotation = int(page.rotation)
+
+        # Redzamās lapas koordinātas, ņemot vērā /Rotate.
+        visual_rect = page.rect
+        short_side = min(visual_rect.width, visual_rect.height)
+
+        margin = max(10.0, min(26.0, short_side * 0.012))
+        box_width = min(
+            visual_rect.width * 0.34,
+            max(250.0, visual_rect.width * 0.24),
         )
+        box_height = max(
+            54.0,
+            min(88.0, visual_rect.height * 0.075),
+        )
+        font_size = max(
+            10.0,
+            min(18.0, short_side * 0.011),
+        )
+
+        visual_box = fitz.Rect(
+            visual_rect.x1 - box_width - margin,
+            visual_rect.y0 + margin,
+            visual_rect.x1 - margin,
+            visual_rect.y0 + margin + box_height,
+        )
+
+        # Pārvērš redzamā skata koordinātas PDF nesašķiebtajās koordinātās.
+        box = visual_box * page.derotation_matrix
+
+        font_path = _find_pdf_unicode_font()
+        font_name = "helv"
+        visible_message = ascii_message
+
+        if font_path:
+            font_name = "AuditSans"
+            page.insert_font(
+                fontname=font_name,
+                fontfile=font_path,
+            )
+            visible_message = message
+
+        border_width = max(1.2, font_size * 0.075)
         page.draw_rect(
             box,
-            color=(0.05, 0.35, 0.08),
-            fill=(0.86, 1.00, 0.88),
-            width=max(1.5, font_size * 0.085),
+            color=(0.04, 0.32, 0.08),
+            fill=(0.91, 1.00, 0.92),
+            width=border_width,
             overlay=True,
         )
+
+        padding = max(6.0, font_size * 0.55)
         inner = fitz.Rect(
-            box.x0 + font_size * 0.55,
-            box.y0 + font_size * 0.55,
-            box.x1 - font_size * 0.55,
-            box.y1 - font_size * 0.45,
+            box.x0 + padding,
+            box.y0 + padding,
+            box.x1 - padding,
+            box.y1 - padding,
         )
+
         spare = page.insert_textbox(
             inner,
-            message,
+            visible_message,
             fontsize=font_size,
-            fontname="helv",
+            fontname=font_name,
             color=(0.00, 0.20, 0.03),
             align=1,
             overlay=True,
         )
+
+        # Ja konkrētajā PDF teksts neietilpst, samazina fontu, nevis palielina bloku.
         if spare < 0:
-            page.insert_text(
-                fitz.Point(box.x0 + font_size, box.y0 + font_size * 2.2),
-                message,
-                fontsize=max(11.0, font_size * 0.80),
-                fontname="helv",
+            page.insert_textbox(
+                inner,
+                visible_message,
+                fontsize=max(8.0, font_size * 0.78),
+                fontname=font_name,
                 color=(0.00, 0.20, 0.03),
+                align=1,
                 overlay=True,
             )
+
         out = io.BytesIO()
         doc.save(out, garbage=4, deflate=True)
         doc.close()
         result = out.getvalue()
+
         verified = False
         verification_error = ""
         try:
             check = fitz.open(stream=result, filetype="pdf")
-            verified = message.casefold() in clean_text(check[0].get_text("text")).casefold()
+            extracted = clean_text(check[0].get_text("text")).casefold()
+            verified = clean_text(visible_message).casefold() in extracted
             check.close()
         except Exception as exc:
             verification_error = str(exc)
+
         return result, [{
-            "status": "no_findings_banner_verified" if verified else "no_findings_banner_unverified",
+            "status": (
+                "no_findings_banner_verified"
+                if verified
+                else "no_findings_banner_unverified"
+            ),
             "target_page": 1,
-            "message": message,
+            "message": visible_message,
             "font_size": round(font_size, 1),
+            "page_rotation": page_rotation,
+            "visual_box": [
+                round(visual_box.x0, 1),
+                round(visual_box.y0, 1),
+                round(visual_box.x1, 1),
+                round(visual_box.y1, 1),
+            ],
             "verification_error": verification_error,
         }]
+
     except Exception as exc:
-        return None, [{"status": "error", "message": f"Neizdevās pievienot audita rezultāta paziņojumu: {exc}"}]
+        return None, [{
+            "status": "error",
+            "message": (
+                "Neizdevās pievienot audita rezultāta "
+                f"paziņojumu: {exc}"
+            ),
+        }]
 
 def annotate_pdf_bytes(pdf_bytes: bytes, accepted_df: pd.DataFrame) -> Tuple[Optional[bytes], List[Dict[str, Any]]]:
     """Anotē PDF, primāri piesaistot piezīmi konkrētam, atrodamam teksta fragmentam."""
