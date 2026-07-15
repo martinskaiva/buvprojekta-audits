@@ -43,7 +43,7 @@ except Exception:
     HttpError = Exception
 
 
-APP_VERSION = "v0.6.4.9"
+APP_VERSION = "v0.7.0"
 APP_TITLE = f"BP AI Audit Copilot {APP_VERSION}"
 
 REQUIRED_EXPORT_COLUMNS = [
@@ -70,6 +70,10 @@ INDEX_FOLDER_NAME = "02_Audit_examples_index"
 FEEDBACK_FOLDER_NAME = "03_Audit_feedback"
 FEEDBACK_INDEX_FOLDER_NAME = "04_Audit_feedback_index"
 PENDING_FOLDER_NAME = "05_Audit_examples_pending"
+PROJECT_MEMORY_FOLDER_NAME = "06_Project_memory"
+PROJECT_MANIFEST_FILE = "project_manifest.json"
+DOCUMENT_REGISTRY_FILE = "document_registry.xlsx"
+PROJECT_FINDINGS_FILE = "project_findings.xlsx"
 
 DEFAULT_FAMILIES = [
     "A_text_language",
@@ -495,42 +499,60 @@ def ensure_memory_project_folder(
     return drive_create_folder(service, clean_text(section.get("id")), project_folder_name)
 
 
+
+def _canonical_drive_rel_path(value: Any) -> str:
+    value = clean_text(value).replace("\\", "/")
+    value = re.sub(r"/+", "/", value).strip("/")
+    return value.casefold()
+
+
+def _select_rows_for_pdf(
+    accepted_df: pd.DataFrame,
+    pdf_rel_path: str,
+    pdf_name: str,
+    all_pdf_items: List[Dict[str, Any]],
+) -> pd.DataFrame:
+    if accepted_df is None or accepted_df.empty or "target_file" not in accepted_df.columns:
+        return pd.DataFrame()
+    targets = accepted_df["target_file"].astype(str).map(_canonical_drive_rel_path)
+    rel_key = _canonical_drive_rel_path(pdf_rel_path)
+    rows = accepted_df[targets.eq(rel_key)].copy()
+    if not rows.empty:
+        return rows
+    name_key = _canonical_drive_rel_path(pdf_name)
+    same_name_count = sum(
+        1 for item in all_pdf_items or []
+        if _canonical_drive_rel_path(clean_text(item.get("name"))) == name_key
+    )
+    if same_name_count != 1:
+        return pd.DataFrame()
+    basenames = accepted_df["target_file"].astype(str).map(
+        lambda value: _canonical_drive_rel_path(
+            clean_text(value).replace("\\", "/").rsplit("/", 1)[-1]
+        )
+    )
+    return accepted_df[basenames.eq(name_key)].copy()
+
+
 def build_annotated_pdf_exports(
     accepted_df: pd.DataFrame,
     pdf_items: List[Dict[str, Any]],
     timestamp: str,
 ) -> List[Dict[str, Any]]:
-    """Sagatavo rezultāta PDF katram auditētajam dokumentam.
-
-    Ja dokumentam ir akceptētas piezīmes, tas tiek anotēts. Ja akceptētu
-    neatbilstību nav, pirmajā lapā tiek pievienots paziņojums, ka neatbilstības
-    nav konstatētas. Tādējādi rezultātu PDF skaits sakrīt ar auditēto PDF skaitu.
-    """
     exports: List[Dict[str, Any]] = []
-    target_series = pd.Series(dtype=str)
-    if accepted_df is not None and not accepted_df.empty and "target_file" in accepted_df.columns:
-        target_series = accepted_df["target_file"].astype(str).map(clean_text)
-
     for item in pdf_items or []:
         pdf_name = clean_text(item.get("name"))
         pdf_rel_path = clean_text(item.get("rel_path")) or pdf_name
         pdf_bytes = item.get("bytes")
         if not pdf_name or not pdf_bytes:
             continue
-
-        rows = pd.DataFrame()
-        if accepted_df is not None and not accepted_df.empty and not target_series.empty:
-            rows = accepted_df[target_series.eq(pdf_rel_path)].copy()
-            if rows.empty:
-                rows = accepted_df[target_series.eq(pdf_name)].copy()
-
+        rows = _select_rows_for_pdf(accepted_df, pdf_rel_path, pdf_name, pdf_items)
         if rows.empty:
             result_pdf, report = add_no_findings_banner(pdf_bytes)
             audit_status = "no_findings"
         else:
             result_pdf, report = annotate_pdf_bytes(pdf_bytes, rows)
             audit_status = "findings"
-
         if not result_pdf:
             continue
         source_stem = os.path.splitext(pdf_name)[0]
@@ -542,6 +564,11 @@ def build_annotated_pdf_exports(
             "source": pdf_rel_path,
             "report": report,
             "audit_status": audit_status,
+            "accepted_count": int(len(rows)),
+            "banner_verified": any(
+                clean_text(r.get("status")) == "no_findings_banner_verified"
+                for r in report or [] if isinstance(r, dict)
+            ),
         })
     return exports
 
@@ -569,6 +596,11 @@ def upload_audit_files_to_drive(
             mime_type=export["mime_type"],
         )
         uploaded["destination_path"] = clean_text(results_target.get("path"))
+        uploaded["source"] = clean_text(export.get("source"))
+        uploaded["audit_status"] = clean_text(export.get("audit_status"))
+        uploaded["accepted_count"] = int(export.get("accepted_count") or 0)
+        uploaded["banner_verified"] = bool(export.get("banner_verified"))
+        uploaded["annotation_report"] = export.get("report") or []
         uploaded_results.append(uploaded)
 
     project_name = clean_text(project_folder_name) or clean_text(results_target.get("name")) or "Nezinams_projekts"
@@ -608,6 +640,404 @@ def upload_audit_files_to_drive(
         "memory_files": uploaded_memory,
         "target": results_target,
         "timestamp": timestamp,
+    }
+
+
+def drive_find_child_file(service, parent_id: str, file_name: str) -> Optional[Dict[str, Any]]:
+    wanted = clean_text(file_name)
+    for item in drive_list_children(service, parent_id):
+        if (
+            clean_text(item.get("name")) == wanted
+            and clean_text(item.get("mimeType")) != "application/vnd.google-apps.folder"
+        ):
+            return item
+    return None
+
+
+def drive_upsert_bytes(
+    service,
+    folder_id: str,
+    file_name: str,
+    data: bytes,
+    mime_type: str,
+) -> Dict[str, Any]:
+    if MediaIoBaseUpload is None:
+        raise RuntimeError("Nav pieejama MediaIoBaseUpload bibliotēka.")
+    existing = drive_find_child_file(service, folder_id, file_name)
+    media = MediaIoBaseUpload(io.BytesIO(data), mimetype=mime_type, resumable=False)
+    if existing:
+        return service.files().update(
+            fileId=clean_text(existing.get("id")),
+            media_body=media,
+            fields="id,name,mimeType,size,createdTime,modifiedTime,webViewLink,parents",
+            supportsAllDrives=True,
+        ).execute()
+    return drive_upload_bytes(service, folder_id, file_name, data, mime_type)
+
+
+def ensure_project_memory_root(service, memory_folder_id: str) -> Dict[str, Any]:
+    root = drive_find_child_folder(service, memory_folder_id, PROJECT_MEMORY_FOLDER_NAME)
+    return root or drive_create_folder(service, memory_folder_id, PROJECT_MEMORY_FOLDER_NAME)
+
+
+def list_project_memories(service, memory_folder_id: str) -> List[Dict[str, Any]]:
+    if not clean_text(memory_folder_id):
+        return []
+    root = drive_find_child_folder(service, memory_folder_id, PROJECT_MEMORY_FOLDER_NAME)
+    if not root:
+        return []
+    folders = drive_list_children(
+        service,
+        clean_text(root.get("id")),
+        "application/vnd.google-apps.folder",
+    )
+    out = []
+    for folder in folders:
+        item = dict(folder)
+        item["project_code"] = normalize_project_code(clean_text(folder.get("name")))
+        item["path"] = (
+            f"03_Memory/{PROJECT_MEMORY_FOLDER_NAME}/"
+            f"{clean_text(folder.get('name'))}"
+        )
+        out.append(item)
+    return sorted(out, key=lambda x: clean_text(x.get("name")).casefold())
+
+
+def read_json_drive_file(service, folder_id: str, file_name: str) -> Dict[str, Any]:
+    info = drive_find_child_file(service, folder_id, file_name)
+    if not info:
+        return {}
+    try:
+        raw = drive_download_bytes(service, clean_text(info.get("id")))
+        data = json.loads(raw.decode("utf-8-sig"))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def read_project_memory_excel(service, folder_id: str, file_name: str) -> pd.DataFrame:
+    info = drive_find_child_file(service, folder_id, file_name)
+    if not info:
+        return pd.DataFrame()
+    try:
+        raw = drive_download_bytes(service, clean_text(info.get("id")))
+        frame = pd.read_excel(io.BytesIO(raw), dtype=object)
+        frame.columns = [clean_text(col) for col in frame.columns]
+        return frame
+    except Exception:
+        return pd.DataFrame()
+
+
+def write_project_memory_excel(
+    service,
+    folder_id: str,
+    file_name: str,
+    dataframe: pd.DataFrame,
+    sheet_name: str,
+) -> Dict[str, Any]:
+    return drive_upsert_bytes(
+        service,
+        folder_id,
+        file_name,
+        dataframe_to_xlsx_bytes(dataframe, sheet_name),
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+
+
+def infer_document_code(file_name: str) -> str:
+    stem = os.path.splitext(clean_text(file_name))[0]
+    stem = re.sub(r"\s+-\s+.*$", "", stem).strip()
+    match = re.search(r"\b[A-Z0-9]+(?:[-_][A-Z0-9]+){4,}\b", stem, flags=re.I)
+    return clean_text(match.group(0)) if match else stem[:180]
+
+
+def infer_revision_from_text(file_name: str, pdf_text: str) -> str:
+    combined = f"{file_name}\n{pdf_text[:5000]}"
+    for pattern in [
+        r"\b(?:REVISION|REVĪZIJA|REV\.?)\s*[:\-]?\s*([A-Z0-9]{1,8})\b",
+        r"\b(?:VERSION|VERSIJA)\s*[:\-]?\s*([A-Z0-9.]{1,12})\b",
+        r"\bR\s*([0-9]{1,3}[A-Z]?)\b",
+    ]:
+        match = re.search(pattern, combined, flags=re.I)
+        if match:
+            return clean_text(match.group(1))
+    return ""
+
+
+def infer_document_date(pdf_text: str) -> str:
+    sample = clean_text(pdf_text[:10000])
+    for pattern in [
+        r"\b(20\d{2}[-./]\d{1,2}[-./]\d{1,2})\b",
+        r"\b(\d{1,2}[./]\d{1,2}[./]20\d{2})\b",
+    ]:
+        match = re.search(pattern, sample)
+        if match:
+            return clean_text(match.group(1))
+    return ""
+
+
+def make_document_summary(file_name: str, pdf_text: str, max_length: int = 1800) -> str:
+    content = re.sub(r"--- PAGE \d+ ---", " ", clean_text(pdf_text), flags=re.I)
+    content = clean_text(content)
+    return content[:max_length] if content else f"Dokuments: {clean_text(file_name)}. Teksts nav nolasīts."
+
+
+def create_or_activate_project_memory(
+    service,
+    memory_folder_id: str,
+    project_code: str,
+    project_name: str = "",
+) -> Dict[str, Any]:
+    code = normalize_project_code(project_code)
+    if not code:
+        raise ValueError("Projekta kods ir tukšs.")
+    root = ensure_project_memory_root(service, memory_folder_id)
+    folder = find_project_folder(service, clean_text(root.get("id")), code)
+    if not folder:
+        folder = drive_create_folder(service, clean_text(root.get("id")), code)
+    folder_id = clean_text(folder.get("id"))
+    now = datetime.now().isoformat(timespec="seconds")
+    manifest = read_json_drive_file(service, folder_id, PROJECT_MANIFEST_FILE)
+    if not manifest:
+        manifest = {
+            "schema_version": "1.0",
+            "project_code": code,
+            "project_name": clean_text(project_name) or code,
+            "created_at": now,
+            "last_activated_at": now,
+            "last_audited_at": "",
+            "document_count": 0,
+            "audit_count": 0,
+            "disciplines": [],
+        }
+    else:
+        manifest["project_code"] = code
+        manifest["project_name"] = clean_text(manifest.get("project_name")) or clean_text(project_name) or code
+        manifest["last_activated_at"] = now
+
+    drive_upsert_bytes(
+        service,
+        folder_id,
+        PROJECT_MANIFEST_FILE,
+        json.dumps(manifest, ensure_ascii=False, indent=2).encode("utf-8"),
+        "application/json",
+    )
+
+    if not drive_find_child_file(service, folder_id, DOCUMENT_REGISTRY_FILE):
+        registry_columns = [
+            "document_id", "drive_file_id", "file_name", "relative_path",
+            "project_code", "discipline", "document_type", "document_code",
+            "revision", "document_date", "page_count", "content_hash",
+            "first_audited_at", "last_audited_at", "audit_count",
+            "accepted_findings", "rejected_findings", "summary",
+        ]
+        write_project_memory_excel(
+            service, folder_id, DOCUMENT_REGISTRY_FILE,
+            pd.DataFrame(columns=registry_columns), "document_registry",
+        )
+
+    if not drive_find_child_file(service, folder_id, PROJECT_FINDINGS_FILE):
+        finding_columns = [
+            "memory_record_id", "audit_run_id", "created_at", "decision",
+            "project_code", "source_file", "source_file_rel_path",
+            "discipline", "family", "issue_type", "target_page",
+            "target_area", "target_text", "comment_text", "problem",
+            "reject_reason", "do_not_show_similar",
+        ]
+        write_project_memory_excel(
+            service, folder_id, PROJECT_FINDINGS_FILE,
+            pd.DataFrame(columns=finding_columns), "project_findings",
+        )
+
+    return {
+        "id": folder_id,
+        "name": clean_text(folder.get("name")) or code,
+        "project_code": code,
+        "project_name": clean_text(manifest.get("project_name")) or code,
+        "manifest": manifest,
+    }
+
+
+def update_project_memory_after_audit(
+    service,
+    project_folder_id: str,
+    project_code: str,
+    audit_run_id: str,
+    pdf_items: List[Dict[str, Any]],
+    accepted_df: pd.DataFrame,
+    rejected_df: pd.DataFrame,
+) -> Dict[str, Any]:
+    now = datetime.now().isoformat(timespec="seconds")
+    code = normalize_project_code(project_code)
+    registry = read_project_memory_excel(service, project_folder_id, DOCUMENT_REGISTRY_FILE)
+
+    columns = [
+        "document_id", "drive_file_id", "file_name", "relative_path",
+        "project_code", "discipline", "document_type", "document_code",
+        "revision", "document_date", "page_count", "content_hash",
+        "first_audited_at", "last_audited_at", "audit_count",
+        "accepted_findings", "rejected_findings", "summary",
+    ]
+    for col in columns:
+        if col not in registry.columns:
+            registry[col] = ""
+
+    accepted_targets = (
+        accepted_df["target_file"].astype(str).map(_canonical_drive_rel_path)
+        if accepted_df is not None and not accepted_df.empty and "target_file" in accepted_df.columns
+        else pd.Series(dtype=str)
+    )
+    rejected_targets = (
+        rejected_df["source_file"].astype(str).map(_canonical_drive_rel_path)
+        if rejected_df is not None and not rejected_df.empty and "source_file" in rejected_df.columns
+        else pd.Series(dtype=str)
+    )
+
+    for item in pdf_items or []:
+        file_name = clean_text(item.get("name"))
+        rel_path = clean_text(item.get("rel_path")) or file_name
+        pdf_bytes = item.get("bytes") or b""
+        pdf_text = clean_text(item.get("text"))
+        content_hash = hashlib.sha256(pdf_bytes).hexdigest()
+        path_key = _canonical_drive_rel_path(rel_path)
+        name_key = _canonical_drive_rel_path(file_name)
+        accepted_count = int(accepted_targets.isin([path_key, name_key]).sum()) if not accepted_targets.empty else 0
+        rejected_count = int(rejected_targets.isin([path_key, name_key]).sum()) if not rejected_targets.empty else 0
+        document_id = hashlib.sha1(f"{code}|{rel_path}|{content_hash}".encode("utf-8")).hexdigest()[:24]
+
+        match_mask = pd.Series(False, index=registry.index, dtype=bool)
+        if not registry.empty:
+            match_mask = (
+                registry["relative_path"].astype(str).map(_canonical_drive_rel_path).eq(path_key)
+                & registry["content_hash"].astype(str).eq(content_hash)
+            )
+
+        row = {
+            "document_id": document_id,
+            "drive_file_id": clean_text(item.get("id")),
+            "file_name": file_name,
+            "relative_path": rel_path,
+            "project_code": code,
+            "discipline": infer_discipline_from_filename(file_name),
+            "document_type": infer_document_role(file_name),
+            "document_code": infer_document_code(file_name),
+            "revision": infer_revision_from_text(file_name, pdf_text),
+            "document_date": infer_document_date(pdf_text),
+            "page_count": len(item.get("pages") or []),
+            "content_hash": content_hash,
+            "first_audited_at": now,
+            "last_audited_at": now,
+            "audit_count": 1,
+            "accepted_findings": accepted_count,
+            "rejected_findings": rejected_count,
+            "summary": make_document_summary(file_name, pdf_text),
+        }
+
+        if match_mask.any():
+            idx = registry[match_mask].index[0]
+            previous_count = pd.to_numeric(
+                pd.Series([registry.at[idx, "audit_count"]]), errors="coerce"
+            ).fillna(0).iloc[0]
+            row["first_audited_at"] = clean_text(registry.at[idx, "first_audited_at"]) or now
+            row["audit_count"] = int(previous_count) + 1
+            for key, value in row.items():
+                registry.at[idx, key] = value
+        else:
+            registry = pd.concat([registry, pd.DataFrame([row])], ignore_index=True, sort=False)
+
+    registry = registry[columns].copy()
+    registry_file = write_project_memory_excel(
+        service, project_folder_id, DOCUMENT_REGISTRY_FILE,
+        registry, "document_registry",
+    )
+
+    findings = read_project_memory_excel(service, project_folder_id, PROJECT_FINDINGS_FILE)
+    finding_rows = []
+    if accepted_df is not None and not accepted_df.empty:
+        for _, row in accepted_df.iterrows():
+            source = clean_text(row.get("target_file"))
+            finding_rows.append({
+                "memory_record_id": hashlib.sha1(
+                    f"{audit_run_id}|accepted|{source}|{row.get('note_id')}".encode("utf-8")
+                ).hexdigest()[:24],
+                "audit_run_id": audit_run_id,
+                "created_at": now,
+                "decision": "accepted",
+                "project_code": code,
+                "source_file": source.rsplit("/", 1)[-1],
+                "source_file_rel_path": source,
+                "discipline": clean_text(row.get("discipline")),
+                "family": clean_text(row.get("issue_type")),
+                "issue_type": clean_text(row.get("issue_type")),
+                "target_page": clean_text(row.get("target_page")),
+                "target_area": clean_text(row.get("target_area")),
+                "target_text": clean_text(row.get("target_text")),
+                "comment_text": clean_text(row.get("comment_text")),
+                "problem": clean_text(row.get("comparison_evidence")),
+                "reject_reason": "",
+                "do_not_show_similar": False,
+            })
+    if rejected_df is not None and not rejected_df.empty:
+        for _, row in rejected_df.iterrows():
+            source = clean_text(row.get("source_file"))
+            finding_rows.append({
+                "memory_record_id": hashlib.sha1(
+                    f"{audit_run_id}|rejected|{source}|{row.get('candidate_index')}".encode("utf-8")
+                ).hexdigest()[:24],
+                "audit_run_id": audit_run_id,
+                "created_at": now,
+                "decision": "rejected",
+                "project_code": code,
+                "source_file": source.rsplit("/", 1)[-1],
+                "source_file_rel_path": source,
+                "discipline": infer_discipline_from_filename(source),
+                "family": clean_text(row.get("family")),
+                "issue_type": clean_text(row.get("issue_type")),
+                "target_page": clean_text(row.get("target_page")),
+                "target_area": clean_text(row.get("target_area")),
+                "target_text": clean_text(row.get("target_text")),
+                "comment_text": clean_text(row.get("comment_text")),
+                "problem": clean_text(row.get("problem")),
+                "reject_reason": clean_text(row.get("reject_reason")),
+                "do_not_show_similar": clean_text(row.get("do_not_show_similar")),
+            })
+
+    if finding_rows:
+        findings = pd.concat([findings, pd.DataFrame(finding_rows)], ignore_index=True, sort=False)
+        if "memory_record_id" in findings.columns:
+            findings = findings.drop_duplicates(subset=["memory_record_id"], keep="last")
+
+    findings_file = write_project_memory_excel(
+        service, project_folder_id, PROJECT_FINDINGS_FILE,
+        findings, "project_findings",
+    )
+
+    manifest = read_json_drive_file(service, project_folder_id, PROJECT_MANIFEST_FILE)
+    disciplines = sorted({
+        clean_text(v) for v in registry.get("discipline", pd.Series(dtype=str)).tolist()
+        if clean_text(v)
+    })
+    manifest.update({
+        "project_code": code,
+        "last_audited_at": now,
+        "document_count": int(len(registry)),
+        "audit_count": int(pd.to_numeric(
+            registry.get("audit_count", pd.Series(dtype=float)), errors="coerce"
+        ).fillna(0).sum()),
+        "disciplines": disciplines,
+    })
+    manifest_file = drive_upsert_bytes(
+        service, project_folder_id, PROJECT_MANIFEST_FILE,
+        json.dumps(manifest, ensure_ascii=False, indent=2).encode("utf-8"),
+        "application/json",
+    )
+    return {
+        "manifest": manifest,
+        "manifest_file": manifest_file,
+        "registry_file": registry_file,
+        "findings_file": findings_file,
+        "documents": len(registry),
+        "disciplines": disciplines,
     }
 
 def run_drive_write_test(
@@ -1847,8 +2277,9 @@ def add_page_note(page: Any, row: Dict[str, Any], comment: str) -> None:
         pass
 
 
+
 def add_no_findings_banner(pdf_bytes: bytes) -> Tuple[Optional[bytes], List[Dict[str, Any]]]:
-    """Pirmajā lapā ieraksta redzamu audita rezultāta paziņojumu lapas saturā."""
+    message = "Audita rezultātā neatbilstības nav konstatētas."
     if fitz is None:
         return None, [{"status": "error", "message": "PyMuPDF/fitz nav pieejams Streamlit vidē."}]
     try:
@@ -1858,27 +2289,69 @@ def add_no_findings_banner(pdf_bytes: bytes) -> Tuple[Optional[bytes], List[Dict
             return None, [{"status": "error", "message": "PDF nav lapu."}]
         page = doc[0]
         rect = page.rect
-        width = min(320.0, max(220.0, rect.width * 0.32))
-        height = 58.0
-        margin = 16.0
-        box = fitz.Rect(rect.x1 - width - margin, rect.y0 + margin, rect.x1 - margin, rect.y0 + margin + height)
-        message = "Audita rezultātā neatbilstības nav konstatētas."
-        page.draw_rect(box, color=(0.10, 0.45, 0.10), fill=(0.90, 1.00, 0.90), width=1.2, overlay=True)
-        inner = fitz.Rect(box.x0 + 7, box.y0 + 7, box.x1 - 7, box.y1 - 7)
-        rc = page.insert_textbox(inner, message, fontsize=10, fontname="helv", color=(0.00, 0.25, 0.00), align=1, overlay=True)
-        # Ja teksts neietilpst, palielina laukumu un atkārto uzrakstu.
-        if rc < 0:
-            box = fitz.Rect(rect.x1 - width - margin, rect.y0 + margin, rect.x1 - margin, rect.y0 + margin + 78.0)
-            page.draw_rect(box, color=(0.10, 0.45, 0.10), fill=(0.90, 1.00, 0.90), width=1.2, overlay=True)
-            inner = fitz.Rect(box.x0 + 7, box.y0 + 7, box.x1 - 7, box.y1 - 7)
-            page.insert_textbox(inner, message, fontsize=9, fontname="helv", color=(0.00, 0.25, 0.00), align=1, overlay=True)
+        short_side = min(rect.width, rect.height)
+        font_size = max(13.0, min(30.0, short_side * 0.019))
+        margin = max(18.0, short_side * 0.018)
+        width = min(rect.width * 0.50, max(380.0, rect.width * 0.36))
+        height = max(font_size * 4.0, min(rect.height * 0.12, 145.0))
+        box = fitz.Rect(
+            rect.x1 - width - margin,
+            rect.y0 + margin,
+            rect.x1 - margin,
+            rect.y0 + margin + height,
+        )
+        page.draw_rect(
+            box,
+            color=(0.05, 0.35, 0.08),
+            fill=(0.86, 1.00, 0.88),
+            width=max(1.5, font_size * 0.085),
+            overlay=True,
+        )
+        inner = fitz.Rect(
+            box.x0 + font_size * 0.55,
+            box.y0 + font_size * 0.55,
+            box.x1 - font_size * 0.55,
+            box.y1 - font_size * 0.45,
+        )
+        spare = page.insert_textbox(
+            inner,
+            message,
+            fontsize=font_size,
+            fontname="helv",
+            color=(0.00, 0.20, 0.03),
+            align=1,
+            overlay=True,
+        )
+        if spare < 0:
+            page.insert_text(
+                fitz.Point(box.x0 + font_size, box.y0 + font_size * 2.2),
+                message,
+                fontsize=max(11.0, font_size * 0.80),
+                fontname="helv",
+                color=(0.00, 0.20, 0.03),
+                overlay=True,
+            )
         out = io.BytesIO()
         doc.save(out, garbage=4, deflate=True)
         doc.close()
-        return out.getvalue(), [{"status": "no_findings_banner", "target_page": 1, "message": message}]
+        result = out.getvalue()
+        verified = False
+        verification_error = ""
+        try:
+            check = fitz.open(stream=result, filetype="pdf")
+            verified = message.casefold() in clean_text(check[0].get_text("text")).casefold()
+            check.close()
+        except Exception as exc:
+            verification_error = str(exc)
+        return result, [{
+            "status": "no_findings_banner_verified" if verified else "no_findings_banner_unverified",
+            "target_page": 1,
+            "message": message,
+            "font_size": round(font_size, 1),
+            "verification_error": verification_error,
+        }]
     except Exception as exc:
         return None, [{"status": "error", "message": f"Neizdevās pievienot audita rezultāta paziņojumu: {exc}"}]
-
 
 def annotate_pdf_bytes(pdf_bytes: bytes, accepted_df: pd.DataFrame) -> Tuple[Optional[bytes], List[Dict[str, Any]]]:
     """Anotē PDF, primāri piesaistot piezīmi konkrētam, atrodamam teksta fragmentam."""
@@ -2015,6 +2488,38 @@ def make_zip(
     return bio.getvalue()
 
 
+
+def render_pdf_progress_dashboard(
+    placeholder: Any,
+    states: List[Dict[str, Any]],
+    family_count: int,
+) -> None:
+    denominator = max(1, int(family_count or 0))
+    with placeholder.container():
+        st.markdown("#### Auditējamo failu progress")
+        for index, state in enumerate(states, start=1):
+            status_code = clean_text(state.get("status")) or "waiting"
+            labels = {"waiting": "Gaida", "running": "Analizē", "done": "Pabeigts", "error": "Kļūda"}
+            icons = {"waiting": "⏳", "running": "🔎", "done": "✅", "error": "⚠️"}
+            completed = int(state.get("completed") or 0)
+            with st.container(border=True):
+                c1, c2, c3 = st.columns([7, 2, 2])
+                c1.markdown(f"**{index}. {clean_text(state.get('name'))}**")
+                c2.markdown(f"{icons.get(status_code, '•')} **{labels.get(status_code, status_code)}**")
+                c3.markdown(f"**Piezīmes: {int(state.get('candidates') or 0)}**")
+                st.progress(min(1.0, completed / denominator))
+                if status_code == "running":
+                    st.caption(
+                        f"Pārbaudes: {completed}/{family_count} · "
+                        f"Pašlaik: {clean_text(state.get('current_family')) or 'analīze'}"
+                    )
+                elif status_code == "done":
+                    st.caption(f"Pārbaudes pabeigtas: {completed}/{family_count}")
+                elif status_code == "error":
+                    st.caption(clean_text(state.get("error")) or "Faila analīzi neizdevās pabeigt.")
+                else:
+                    st.caption(f"Pārbaudes: {completed}/{family_count}")
+
 def init_state():
     defaults = {
         "pdf_files": [],
@@ -2052,6 +2557,13 @@ def init_state():
         "oauth_user_email": "",
         "oauth_user_name": "",
         "oauth_error": "",
+        "active_project_memory_id": "",
+        "active_project_memory_code": "",
+        "active_project_memory_name": "",
+        "active_project_memory_manifest": {},
+        "project_memory_list": [],
+        "project_memory_error": "",
+        "project_memory_update_result": None,
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -2063,7 +2575,10 @@ def main():
     init_state()
 
     st.title(APP_TITLE)
-    st.caption("AI ģenerē piezīmes no viena indeksēta audit_examples Excel. Cilvēks akceptē vai noraida. Akceptētās piezīmes eksportējas uz Excel un anotētu PDF.")
+    st.caption(
+        "AI ģenerē pierādāmas piezīmes, cilvēks tās pārskata, un "
+        "izskatītie dokumenti papildina aktīvā būvprojekta atmiņu."
+    )
 
     oauth_config = get_google_oauth_config()
 
@@ -2129,6 +2644,136 @@ def main():
             family_options = DEFAULT_FAMILIES
         selected_families = st.multiselect("Iekšēji palaistās ģimenes", options=family_options, default=family_options)
         st.caption("Lietotājam ikdienā šo var paslēpt. Testā atstājam kontrolei.")
+
+
+    st.header("0. Projekta atmiņa")
+    st.caption(
+        "Atmiņa tiek papildināta tikai pēc pārskatīta audita saglabāšanas. "
+        "Aktivizējot citu projektu, iepriekšējā atmiņa paliek saglabāta un "
+        "jebkurā brīdī ir atkārtoti izmantojama."
+    )
+
+    project_memory_service = None
+    project_memory_service_error = ""
+    try:
+        project_memory_service = get_oauth_drive_service(oauth_config)
+    except Exception as exc:
+        project_memory_service_error = str(exc)
+
+    if not memory_folder_id.strip():
+        st.warning("Norādi 03_Memory folder ID, lai izmantotu projekta atmiņu.")
+    elif project_memory_service is None:
+        st.warning("Projekta atmiņai vajadzīgs strādājošs Google Drive OAuth.")
+        if project_memory_service_error:
+            st.code(project_memory_service_error)
+    else:
+        try:
+            memories = list_project_memories(project_memory_service, memory_folder_id.strip())
+            st.session_state.project_memory_list = memories
+            memory_by_id = {clean_text(item.get("id")): item for item in memories}
+            active_id = clean_text(st.session_state.get("active_project_memory_id"))
+            if active_id and active_id not in memory_by_id:
+                st.session_state.active_project_memory_id = ""
+                st.session_state.active_project_memory_code = ""
+                st.session_state.active_project_memory_name = ""
+                st.session_state.active_project_memory_manifest = {}
+                active_id = ""
+
+            if memories:
+                options = [clean_text(item.get("id")) for item in memories]
+                default_index = options.index(active_id) if active_id in options else 0
+                selected_memory_id = st.selectbox(
+                    "Pieejamās projekta atmiņas",
+                    options=options,
+                    index=default_index,
+                    format_func=lambda folder_id: (
+                        f"{normalize_project_code(memory_by_id[folder_id].get('name'))} — "
+                        f"{memory_by_id[folder_id].get('path')}"
+                    ),
+                    key="project_memory_selector",
+                )
+                activate_col, _ = st.columns([1, 4])
+                with activate_col:
+                    activate_clicked = st.button(
+                        "Aktivizēt izvēlēto atmiņu",
+                        type="primary",
+                        use_container_width=True,
+                        key="activate_project_memory",
+                    )
+                if activate_clicked:
+                    activated = create_or_activate_project_memory(
+                        project_memory_service,
+                        memory_folder_id.strip(),
+                        normalize_project_code(memory_by_id[selected_memory_id].get("name")),
+                        normalize_project_code(memory_by_id[selected_memory_id].get("name")),
+                    )
+                    st.session_state.active_project_memory_id = clean_text(activated.get("id"))
+                    st.session_state.active_project_memory_code = normalize_project_code(activated.get("project_code"))
+                    st.session_state.active_project_memory_name = clean_text(activated.get("project_name"))
+                    st.session_state.active_project_memory_manifest = activated.get("manifest") or {}
+                    st.rerun()
+            else:
+                st.info("Vēl nav izveidota neviena projekta atmiņa.")
+
+            with st.expander("+ Izveidot jaunu projekta atmiņu", expanded=not bool(memories)):
+                suggested_code = normalize_project_code(
+                    st.session_state.get("applied_project_filter")
+                    or st.session_state.get("selected_project_filter")
+                )
+                new_code = st.text_input(
+                    "Projekta kods",
+                    value=suggested_code,
+                    placeholder="piem., C2-3",
+                    key="new_project_memory_code",
+                )
+                new_name = st.text_input(
+                    "Projekta nosaukums",
+                    value=suggested_code,
+                    placeholder="piem., Dzīvojamā ēka C2-3",
+                    key="new_project_memory_name",
+                )
+                create_col, _ = st.columns([1, 4])
+                with create_col:
+                    create_clicked = st.button(
+                        "Izveidot un aktivizēt",
+                        type="primary",
+                        use_container_width=True,
+                        key="create_project_memory_button",
+                    )
+                if create_clicked:
+                    created = create_or_activate_project_memory(
+                        project_memory_service,
+                        memory_folder_id.strip(),
+                        new_code,
+                        new_name,
+                    )
+                    st.session_state.active_project_memory_id = clean_text(created.get("id"))
+                    st.session_state.active_project_memory_code = normalize_project_code(created.get("project_code"))
+                    st.session_state.active_project_memory_name = clean_text(created.get("project_name"))
+                    st.session_state.active_project_memory_manifest = created.get("manifest") or {}
+                    st.rerun()
+
+            active_code = clean_text(st.session_state.get("active_project_memory_code"))
+            active_name = clean_text(st.session_state.get("active_project_memory_name"))
+            active_manifest = st.session_state.get("active_project_memory_manifest") or {}
+            if active_code:
+                st.success(
+                    f"Aktīvā projekta atmiņa: {active_code}"
+                    + (f" — {active_name}" if active_name and active_name != active_code else "")
+                )
+                m1, m2, m3 = st.columns(3)
+                m1.metric("Dokumenti atmiņā", int(active_manifest.get("document_count") or 0))
+                m2.metric("Audita reizes", int(active_manifest.get("audit_count") or 0))
+                m3.metric("Disciplīnas", len(active_manifest.get("disciplines") or []))
+            else:
+                st.warning(
+                    "Nav aktīvas projekta atmiņas. Auditu var palaist, "
+                    "bet projekta konteksts netiks papildināts."
+                )
+        except Exception as exc:
+            st.session_state.project_memory_error = str(exc)
+            st.error("Projekta atmiņas sadaļu neizdevās sagatavot.")
+            st.code(str(exc))
 
     st.header("1. Zināšanu bāzes nolasīšana")
     st.caption("Nolasi globālo zelta piemēru indeksu. Visi indeksa piemēri ir izmantojami jebkura projekta auditā; projekta kods nosaka tikai izcelsmi un nelielu atlases prioritāti. Projekta feedback tiks nolasīts pēc projekta izvēles.")
@@ -2357,7 +3002,9 @@ def main():
                     st.session_state.selected_pdf_ids_ui = []
                     st.session_state.pdf_search_value = ""
 
-                active_project_code = normalize_project_code(project_value)
+                active_project_code = normalize_project_code(
+                    st.session_state.get("active_project_memory_code") or project_value
+                )
                 if active_project_code and active_project_code != st.session_state.get("feedback_project_code"):
                     with st.spinner(f"Automātiski nolasu projekta {active_project_code} problēmu Excel..."):
                         feedback_df, feedback_messages = load_feedback(
@@ -2617,10 +3264,13 @@ def main():
             errors: List[Dict[str, Any]] = []
             progress = st.progress(0)
             status = st.empty()
+            pdf_progress_placeholder = st.empty()
+
             selected_family_set = set(selected_families)
             per_pdf_families = [
-                f for f in selected_families
-                if f != "J_cross_document_traceability" and max_candidates_per_family > 0
+                family for family in selected_families
+                if family != "J_cross_document_traceability"
+                and max_candidates_per_family > 0
             ]
             run_cross_document = (
                 "J_cross_document_traceability" in selected_family_set
@@ -2635,26 +3285,68 @@ def main():
             )
             step = 0
 
+            pdf_states: List[Dict[str, Any]] = []
+            state_by_path: Dict[str, Dict[str, Any]] = {}
+            for item in selected_pdf_items:
+                rel_path = clean_text(item.get("rel_path") or item.get("name"))
+                state = {
+                    "name": rel_path,
+                    "status": "waiting",
+                    "completed": 0,
+                    "current_family": "",
+                    "candidates": 0,
+                    "error": "",
+                }
+                pdf_states.append(state)
+                state_by_path[_canonical_drive_rel_path(rel_path)] = state
+
+            render_pdf_progress_dashboard(
+                pdf_progress_placeholder, pdf_states, len(per_pdf_families)
+            )
+
             for pdf_i, pdf_item in enumerate(selected_pdf_items, start=1):
                 pdf_name = clean_text(pdf_item.get("name")) or "audit.pdf"
                 pdf_rel_path = clean_text(pdf_item.get("rel_path")) or pdf_name
                 pdf_text = clean_text(pdf_item.get("text"))
+                pdf_state = state_by_path.get(_canonical_drive_rel_path(pdf_rel_path))
+                if pdf_state is not None:
+                    pdf_state["status"] = "running"
+                    pdf_state["current_family"] = "Sagatavo analīzi"
+                    render_pdf_progress_dashboard(
+                        pdf_progress_placeholder, pdf_states, len(per_pdf_families)
+                    )
+
                 if not pdf_text:
-                    errors.append({"pdf": pdf_rel_path, "family": "", "error": "PDF teksts ir tukšs; AI analīze izlaista."})
+                    error_message = "PDF teksts ir tukšs; AI analīze izlaista."
+                    errors.append({"pdf": pdf_rel_path, "family": "", "error": error_message})
+                    if pdf_state is not None:
+                        pdf_state["status"] = "error"
+                        pdf_state["error"] = error_message
+                        render_pdf_progress_dashboard(
+                            pdf_progress_placeholder, pdf_states, len(per_pdf_families)
+                        )
                     continue
 
-                # Deterministiskās pārbaudes papildina AI un nerada API izmaksas.
                 if "A_text_language" in selected_family_set:
-                    for c in detect_unit_case_candidates(pdf_item):
-                        c["source_pdf"] = pdf_name
-                        c["source_pdf_rel_path"] = pdf_rel_path
-                        all_candidates.append(c)
+                    deterministic = detect_unit_case_candidates(pdf_item)
+                    for candidate in deterministic:
+                        candidate["source_pdf"] = pdf_name
+                        candidate["source_pdf_rel_path"] = pdf_rel_path
+                        all_candidates.append(candidate)
+                    if pdf_state is not None:
+                        pdf_state["candidates"] += len(deterministic)
 
                 for family in per_pdf_families:
                     step += 1
+                    if pdf_state is not None:
+                        pdf_state["status"] = "running"
+                        pdf_state["current_family"] = family
                     status.write(
-                        f"PDF {pdf_i}/{len(selected_pdf_items)} | pārbaude {step}/{total_steps}: "
-                        f"{family} | {pdf_rel_path}"
+                        f"PDF {pdf_i}/{len(selected_pdf_items)} | "
+                        f"pārbaude {step}/{total_steps}: {family} | {pdf_rel_path}"
+                    )
+                    render_pdf_progress_dashboard(
+                        pdf_progress_placeholder, pdf_states, len(per_pdf_families)
                     )
                     examples = select_examples(
                         st.session_state.index_df,
@@ -2663,7 +3355,8 @@ def main():
                         pdf_text,
                         max_examples_per_family,
                         project_code=normalize_project_code(
-                            st.session_state.get("applied_project_filter", "")
+                            st.session_state.get("active_project_memory_code")
+                            or st.session_state.get("applied_project_filter", "")
                         ),
                     )
                     candidates, err = call_ai_for_family(
@@ -2678,22 +3371,45 @@ def main():
                     )
                     if err:
                         errors.append({"pdf": pdf_rel_path, "family": family, "error": err})
-                    for c in candidates:
-                        c["source_pdf"] = pdf_name
-                        c["source_pdf_rel_path"] = pdf_rel_path
-                        all_candidates.append(c)
+                    for candidate in candidates:
+                        candidate["source_pdf"] = pdf_name
+                        candidate["source_pdf_rel_path"] = pdf_rel_path
+                        all_candidates.append(candidate)
+                    if pdf_state is not None:
+                        pdf_state["completed"] += 1
+                        pdf_state["candidates"] += len(candidates)
                     progress.progress(step / total_steps)
+                    render_pdf_progress_dashboard(
+                        pdf_progress_placeholder, pdf_states, len(per_pdf_families)
+                    )
+
+                if pdf_state is not None:
+                    pdf_state["status"] = "done"
+                    pdf_state["current_family"] = ""
+                    render_pdf_progress_dashboard(
+                        pdf_progress_placeholder, pdf_states, len(per_pdf_families)
+                    )
 
             if run_cross_document:
                 step += 1
-                status.write(f"Starpdokumentu pārbaude {step}/{total_steps}: J_cross_document_traceability")
-                combined_text = "\n".join(str(x.get("text") or "")[:5000] for x in selected_pdf_items)
+                status.write(
+                    f"Starpdokumentu pārbaude {step}/{total_steps}: "
+                    "J_cross_document_traceability"
+                )
+                combined_text = "\n".join(
+                    str(item.get("text") or "")[:5000]
+                    for item in selected_pdf_items
+                )
                 examples = select_examples(
                     st.session_state.index_df,
                     "J_cross_document_traceability",
                     "MULTI_PDF",
                     combined_text,
                     max_examples_per_family,
+                    project_code=normalize_project_code(
+                        st.session_state.get("active_project_memory_code")
+                        or st.session_state.get("applied_project_filter", "")
+                    ),
                 )
                 cross_candidates, err = call_ai_for_cross_document_family(
                     client=client,
@@ -2704,40 +3420,68 @@ def main():
                     max_candidates=max_candidates_per_family,
                 )
                 if err:
-                    errors.append({"pdf": "MULTI_PDF", "family": "J_cross_document_traceability", "error": err})
-                for c in cross_candidates:
-                    rel_path = clean_text(c.get("target_file"))
+                    errors.append({
+                        "pdf": "MULTI_PDF",
+                        "family": "J_cross_document_traceability",
+                        "error": err,
+                    })
+                for candidate in cross_candidates:
+                    rel_path = clean_text(candidate.get("target_file"))
                     matched = next(
-                        (x for x in selected_pdf_items if clean_text(x.get("rel_path") or x.get("name")) == rel_path),
+                        (
+                            item for item in selected_pdf_items
+                            if _canonical_drive_rel_path(
+                                clean_text(item.get("rel_path") or item.get("name"))
+                            ) == _canonical_drive_rel_path(rel_path)
+                        ),
                         None,
                     )
-                    c["source_pdf"] = clean_text(matched.get("name")) if matched else rel_path.rsplit("/", 1)[-1]
-                    c["source_pdf_rel_path"] = rel_path
-                    all_candidates.append(c)
+                    candidate["source_pdf"] = (
+                        clean_text(matched.get("name"))
+                        if matched else rel_path.rsplit("/", 1)[-1]
+                    )
+                    candidate["source_pdf_rel_path"] = rel_path
+                    all_candidates.append(candidate)
+                    target_state = state_by_path.get(_canonical_drive_rel_path(rel_path))
+                    if target_state is not None:
+                        target_state["candidates"] += 1
                 progress.progress(step / total_steps)
 
-            # Gala normalizācija, dublikātu izmešana un unikāli kandidātu ID.
             final_candidates: List[Dict[str, Any]] = []
             seen = set()
             for ordinal, raw in enumerate(all_candidates, start=1):
                 family = clean_text(raw.get("family"))
-                c = normalize_candidate(raw, family)
-                if candidate_is_too_vague(c):
+                candidate = normalize_candidate(raw, family)
+                if candidate_is_too_vague(candidate):
                     continue
                 dedupe_key = (
-                    clean_text(c.get("source_pdf_rel_path")),
+                    _canonical_drive_rel_path(candidate.get("source_pdf_rel_path")),
                     family,
-                    clean_text(c.get("target_page")),
-                    clean_text(c.get("target_text")).casefold(),
-                    clean_text(c.get("problem")).casefold(),
+                    clean_text(candidate.get("target_page")),
+                    clean_text(candidate.get("target_text")).casefold(),
+                    clean_text(candidate.get("problem")).casefold(),
                 )
                 if dedupe_key in seen:
                     continue
                 seen.add(dedupe_key)
-                c["candidate_id"] = make_candidate_id(c, audit_run_id, ordinal)
-                c["include_default"] = True
-                c["reject_default"] = False
-                final_candidates.append(c)
+                candidate["candidate_id"] = make_candidate_id(
+                    candidate, audit_run_id, ordinal
+                )
+                candidate["include_default"] = True
+                candidate["reject_default"] = False
+                final_candidates.append(candidate)
+
+            for state in pdf_states:
+                state["candidates"] = 0
+            for candidate in final_candidates:
+                candidate_state = state_by_path.get(
+                    _canonical_drive_rel_path(candidate.get("source_pdf_rel_path"))
+                )
+                if candidate_state is not None:
+                    candidate_state["candidates"] += 1
+            render_pdf_progress_dashboard(
+                pdf_progress_placeholder, pdf_states, len(per_pdf_families)
+            )
 
             st.session_state.candidates = final_candidates
             st.session_state.ai_errors = errors
@@ -3002,10 +3746,34 @@ def main():
                                 oauth_service,
                                 results_target=selected_target,
                                 memory_folder_id=memory_folder_id.strip(),
-                                project_folder_name=selected_target["name"],
+                                project_folder_name=(
+                                    clean_text(st.session_state.get("active_project_memory_code"))
+                                    or selected_target["name"]
+                                ),
                                 accepted_df=accepted_df,
                                 rejected_df=rejected_df,
                                 pdf_items=selected_pdf_items,
+                            )
+                        active_memory_id = clean_text(
+                            st.session_state.get("active_project_memory_id")
+                        )
+                        active_memory_code = normalize_project_code(
+                            st.session_state.get("active_project_memory_code")
+                        )
+                        if active_memory_id and active_memory_code:
+                            memory_update = update_project_memory_after_audit(
+                                oauth_service,
+                                project_folder_id=active_memory_id,
+                                project_code=active_memory_code,
+                                audit_run_id=audit_run_id,
+                                pdf_items=selected_pdf_items,
+                                accepted_df=accepted_df,
+                                rejected_df=rejected_df,
+                            )
+                            result["project_memory"] = memory_update
+                            st.session_state.project_memory_update_result = memory_update
+                            st.session_state.active_project_memory_manifest = (
+                                memory_update.get("manifest") or {}
                             )
                         st.session_state.drive_save_result = result
                     except Exception as exc:
@@ -3041,6 +3809,37 @@ def main():
                 f"Saglabāšana pabeigta: {len(result_files)} PDF rezultātu faili un "
                 f"{len(memory_files)} Memory Excel faili."
             )
+
+            st.markdown("#### PDF eksporta pārbaude")
+            for result_file in result_files:
+                source = clean_text(result_file.get("source")) or clean_text(result_file.get("name"))
+                audit_status = clean_text(result_file.get("audit_status"))
+                accepted_count = int(result_file.get("accepted_count") or 0)
+                banner_verified = bool(result_file.get("banner_verified"))
+                if audit_status == "no_findings":
+                    if banner_verified:
+                        st.success(
+                            f"{source} — 0 akceptētas piezīmes — "
+                            "statusa bloks PDF saturā ir pievienots un pārbaudīts."
+                        )
+                    else:
+                        st.warning(
+                            f"{source} — 0 akceptētas piezīmes — "
+                            "statusa bloks izveidots, bet automātiskā teksta pārbaude to neapstiprināja."
+                        )
+                else:
+                    st.info(f"{source} — akceptētas piezīmes: {accepted_count}.")
+
+            project_memory_result = save_result.get("project_memory") or {}
+            if project_memory_result:
+                st.success(
+                    "Projekta atmiņa papildināta: "
+                    f"{project_memory_result.get('documents', 0)} reģistrēti dokumenti."
+                )
+                disciplines = project_memory_result.get("disciplines") or []
+                if disciplines:
+                    st.caption("Atmiņā reģistrētās disciplīnas: " + ", ".join(disciplines))
+
             for file_info in result_files + memory_files:
                 name = clean_text(file_info.get("name"))
                 path = clean_text(file_info.get("destination_path"))
