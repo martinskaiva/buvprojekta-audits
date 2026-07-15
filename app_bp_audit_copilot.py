@@ -43,7 +43,7 @@ except Exception:
     HttpError = Exception
 
 
-APP_VERSION = "v0.6.4.8"
+APP_VERSION = "v0.6.4.9"
 APP_TITLE = f"BP AI Audit Copilot {APP_VERSION}"
 
 REQUIRED_EXPORT_COLUMNS = [
@@ -54,6 +54,7 @@ REQUIRED_EXPORT_COLUMNS = [
     "target_page",
     "target_area",
     "target_text",
+    "target_text_candidates",
     "comment_text",
     "issue_type",
     "severity",
@@ -1235,19 +1236,177 @@ def _comparison_types_conflict(text: str) -> bool:
     return any(frozenset({a, b}) in incompatible for a in known for b in known if a != b)
 
 
+ANCHOR_CODE_PATTERNS = [
+    r"\b[A-Za-z]{1,5}-[A-Za-z0-9]{1,8}(?:\.[A-Za-z0-9]{1,8})?\b",
+    r"\b(?:EI|REI|EW)\s*-?\s*\d{2,3}\b",
+    r"\b\d{4}\b",
+]
+
+GENERIC_NOTE_PHRASES = [
+    "nav saskaņots starp",
+    "nav saskaņota starp",
+    "nav saskaņoti starp",
+    "ir vienāds, bet",
+    "atšķiras starp dokumentiem",
+    "nav saskaņots ar",
+]
+
+
+def extract_anchor_tokens(text: str) -> List[str]:
+    text = clean_text(text)
+    out: List[str] = []
+    seen = set()
+
+    def add(value: str) -> None:
+        value = clean_text(value)
+        if not value:
+            return
+        value = re.sub(r"\s+", " ", value).strip(" ,;")
+        if len(value) < 2 or len(value) > 160:
+            return
+        key = value.casefold()
+        if key in seen:
+            return
+        seen.add(key)
+        out.append(value)
+
+    for x in re.findall(r'["“”\']([^"“”\']{2,160})["“”\']', text):
+        add(x)
+    for pattern in ANCHOR_CODE_PATTERNS:
+        for x in re.findall(pattern, text, flags=re.I):
+            add(x)
+    return out
+
+
+def infer_target_text_from_candidate(c: Dict[str, Any]) -> str:
+    existing = clean_text(c.get("target_text"))
+    if existing and existing != "MANUAL_PLACEMENT_REQUIRED":
+        return existing
+    pool = " | ".join([
+        clean_text(c.get("target_area")),
+        clean_text(c.get("where")),
+        clean_text(c.get("designer_note")),
+        clean_text(c.get("comment_text")),
+        clean_text(c.get("problem")),
+        clean_text(c.get("evidence")),
+    ])
+    anchors = extract_anchor_tokens(pool)
+    return anchors[0] if anchors else ""
+
+
+def build_target_text_candidates(c: Dict[str, Any]) -> List[str]:
+    seen = set()
+    candidates: List[str] = []
+
+    def add(value: str) -> None:
+        value = clean_text(value)
+        if not value or value == "MANUAL_PLACEMENT_REQUIRED":
+            return
+        value = re.sub(r"\s+", " ", value).strip(" ,;")
+        if len(value) < 2 or len(value) > 160:
+            return
+        key = value.casefold()
+        if key in seen:
+            return
+        seen.add(key)
+        candidates.append(value)
+
+    add(c.get("target_text"))
+    for field in ["target_area", "where", "designer_note", "comment_text", "problem", "evidence"]:
+        txt = clean_text(c.get(field))
+        if not txt:
+            continue
+        for x in re.findall(r'["“”\']([^"“”\']{2,160})["“”\']', txt):
+            add(x)
+        for x in extract_anchor_tokens(txt):
+            add(x)
+    return candidates
+
+
+def note_is_too_generic(text: str) -> bool:
+    text = clean_text(text)
+    if not text:
+        return True
+    low = text.lower()
+    specifics = extract_specific_values(text)
+    quoted = _quoted_values(text)
+    if len(specifics) >= 2 or len(quoted) >= 2:
+        return False
+    return any(p in low for p in GENERIC_NOTE_PHRASES)
+
+
+def choose_best_comment_text(c: Dict[str, Any]) -> str:
+    note = clean_text(c.get("designer_note") or c.get("comment_text"))
+    problem = clean_text(c.get("problem") or c.get("evidence"))
+    if not note:
+        return problem
+    if note_is_too_generic(note) and problem:
+        return problem
+    note_specifics = len(extract_specific_values(note)) + len(_quoted_values(note))
+    prob_specifics = len(extract_specific_values(problem)) + len(_quoted_values(problem))
+    if problem and prob_specifics > note_specifics:
+        return problem
+    return note
+
+
+def row_anchor_candidates(row: Dict[str, Any]) -> List[str]:
+    out: List[str] = []
+    seen = set()
+
+    def add(value: str) -> None:
+        value = clean_text(value)
+        if not value or value == "MANUAL_PLACEMENT_REQUIRED":
+            return
+        value = re.sub(r"\s+", " ", value).strip(" ,;")
+        if len(value) < 2 or len(value) > 160:
+            return
+        key = value.casefold()
+        if key in seen:
+            return
+        seen.add(key)
+        out.append(value)
+
+    raw_candidates = clean_text(row.get("target_text_candidates"))
+    if raw_candidates:
+        for part in raw_candidates.split("||"):
+            add(part)
+    add(row.get("target_text"))
+    add(row.get("target_area"))
+    for field in ["comment_text", "comparison_evidence"]:
+        for x in extract_anchor_tokens(clean_text(row.get(field))):
+            add(x)
+    return out
+
+
+def find_best_anchor_on_page(page: Any, row: Dict[str, Any]) -> Tuple[str, List[Any]]:
+    for candidate in row_anchor_candidates(row):
+        try:
+            matches = page.search_for(candidate, quads=True)
+        except Exception:
+            matches = []
+        if matches:
+            if len(candidate) <= 3:
+                matches = matches[:1]
+            return candidate, matches
+    return "", []
+
+
 def normalize_candidate(c: Dict[str, Any], family: str) -> Dict[str, Any]:
-    """Normalizē kandidātu tā, lai problēma un PDF komentārs aprakstītu vienu kļūdu."""
+    """Normalizē kandidātu un sagatavo konkrētus PDF enkurtekstus."""
     out = dict(c)
     out["family"] = family
     problem = clean_text(out.get("problem") or out.get("evidence"))
     note = clean_text(out.get("designer_note") or out.get("comment_text"))
     if not problem:
         problem = note
-    # Vienots avots abiem laukiem novērš AI lauku savstarpēju sajaukšanu.
     out["problem"] = problem
     out["designer_note"] = clean_text(note or problem)
-    if not clean_text(out.get("target_text")):
+    inferred_target = infer_target_text_from_candidate(out)
+    if inferred_target:
+        out["target_text"] = inferred_target
+    elif not clean_text(out.get("target_text")):
         out["target_text"] = "MANUAL_PLACEMENT_REQUIRED"
+    out["target_text_candidates"] = build_target_text_candidates(out)
     return out
 
 
@@ -1416,6 +1575,10 @@ def call_ai_for_family(
             "designer_note nav cieta zīmju vai teikumu limita; izmanto tikai tik daudz teksta, cik vajadzīgs konkrētās kļūdas vai nesakritības pilnam aprakstam.",
             "designer_note nedrīkst saturēt: Kāpēc tas ir svarīgi, Ieteikums, Risinājums, Lūdzu pārbaudīt, Lūdzu saskaņot, risku vai seku aprakstu.",
             "title, problem, designer_note, target_text un evidence apraksta tikai vienu un to pašu kļūdu.",
+            "target_text obligāti ir precīzs, īss, burtiski auditējamā PDF lapā atrodams teksta fragments; izvēlies elementa kodu, vērtību, datumu vai īsu tabulas tekstu, nevis pārfrāzētu teikumu.",
+            "Ja konkrētu burtiski atrodamu target_text nevar nosaukt, kandidātu neatgriez, izņemot gadījumus, kuros kļūda attiecas uz visu lapu vai trūkstošu saturu.",
+            "Starpdokumentu nesakritībā designer_note obligāti nosauc target faila konkrēto vērtību un salīdzināmā faila konkrēto konfliktējošo vērtību, kā arī abus failus vai vietas.",
+            "Neraksti tikai 'nav saskaņots starp dokumentiem', 'ir vienāds, bet apraksts atšķiras' vai līdzīgu vispārīgu apgalvojumu bez abām precīzajām vērtībām.",
             "Ja abi salīdzinātie teksti vai skaitļi sakrīt, kandidātu neatgriez.",
             "Neizmanto spekulatīvas frāzes: nav skaidrs vai, iespējams, varētu būt.",
             "Salīdzini tikai viena tipa laukus: kodu ar kodu, datumu ar datumu, diametru ar diametru, kadastra numuru ar kadastra numuru.",
@@ -1430,7 +1593,7 @@ def call_ai_for_family(
                     "where": "lapa un zona/tabula/teksts",
                     "target_page": 1,
                     "target_area": "zona, tabula vai vieta dokumentā",
-                    "target_text": "precīzs teksts, ko var mēģināt iezīmēt PDF; ja nav, MANUAL_PLACEMENT_REQUIRED",
+                    "target_text": "obligāts īss, precīzs un burtiski target lapā atrodams teksts, ko iezīmēt PDF; MANUAL_PLACEMENT_REQUIRED tikai visas lapas vai trūkstoša satura kļūdai",
                     "status": "kļūdas tips vai risks",
                     "problem": "precīzi apraksti kļūdu: norādi nepareizo tekstu/vērtību pēdiņās, salīdzināmo pareizo vai konfliktējošo tekstu/vērtību pēdiņās un avotu; bez vispārīgām frāzēm",
                     "why_important": "atstāj tukšu; neraksti sekas vai riska aprakstu",
@@ -1509,6 +1672,10 @@ def call_ai_for_cross_document_family(
         "rules": [
             "Salīdzini tikai vienu un to pašu elementu vai dokumenta lauku.",
             "Katrai piezīmei norādi target_file, comparison_files, target_page un comparison_pages.",
+            "target_text obligāti ir īss, precīzs un burtiski target faila lapā atrodams teksta fragments, kuru var iezīmēt.",
+            "comparison_target_text obligāti ir precīzs citāts vai vērtība salīdzināmajā failā.",
+            "problem un designer_note obligāti nosauc abas konfliktējošās vērtības, abus failus un vietas; vispārīgas frāzes bez vērtībām nav pieļaujamas.",
+            "Ja target_text nav burtiski atrodams target failā vai abas konfliktējošās vērtības nevar nosaukt, kandidātu neradi.",
             "Ja vērtības sakrīt, piezīmi neradi.",
             "Nesalīdzini kadastra numuru ar objekta kodu vai citus atšķirīgus datu tipus.",
         ],
@@ -1575,11 +1742,10 @@ def candidate_to_export_row(c: Dict[str, Any], idx: int, pdf_name: str, discipli
         markup = "highlight" if placement == "exact" and target_text != "MANUAL_PLACEMENT_REQUIRED" else "page_note"
     problem = clean_text(c.get("problem"))
     evidence = clean_text(c.get("evidence"))
-    # PDF/Excel piezīmei izmantojam īsu konstatējumu. Neiekļaujam sekas/riskus/risinājumu.
     comparison_evidence = problem or evidence
-    page = clean_text(c.get("target_page"))
-    if not page:
-        page = "1"
+    page = clean_text(c.get("target_page")) or "1"
+    best_comment = choose_best_comment_text(c)
+    target_candidates = c.get("target_text_candidates") or build_target_text_candidates(c)
     return {
         "note_id": clean_text(c.get("note_id")) or f"AI-{datetime.now().strftime('%Y%m%d%H%M%S')}-{idx:03d}",
         "Nr": idx,
@@ -1588,7 +1754,8 @@ def candidate_to_export_row(c: Dict[str, Any], idx: int, pdf_name: str, discipli
         "target_page": page,
         "target_area": clean_text(c.get("target_area") or c.get("where")),
         "target_text": target_text,
-        "comment_text": shorten_pdf_comment(clean_text(c.get("designer_note") or c.get("comment_text") or comparison_evidence)),
+        "target_text_candidates": " || ".join(target_candidates),
+        "comment_text": shorten_pdf_comment(best_comment or comparison_evidence),
         "issue_type": clean_text(c.get("issue_type") or c.get("family")),
         "severity": clean_text(c.get("severity")) or "medium",
         "comparison_files": clean_text(c.get("comparison_files")),
@@ -1646,10 +1813,15 @@ def shorten_pdf_comment(text: str) -> str:
     return cleaned or original or "Piezīme auditā."
 
 def make_pdf_comment(row: Dict[str, Any]) -> str:
-    # Prioritāte ir lietotāja pārskatītajam īsajam comment_text, nevis garajam
-    # comparison_evidence/problēmas aprakstam.
     comment = clean_text(row.get("comment_text")) or clean_text(row.get("comparison_evidence"))
-    return f"Komentārs:\n{shorten_pdf_comment(comment)}"
+    comment = shorten_pdf_comment(comment)
+    area = clean_text(row.get("target_area"))
+    page = clean_text(row.get("target_page"))
+    prefix = area or (f"{page}. lapa" if page else "")
+    if prefix and prefix.lower() not in comment.lower():
+        comment = f"{prefix}: {comment}"
+    return f"Komentārs:\n{comment}"
+
 
 def safe_int_page(value: Any, page_count: int) -> int:
     txt = clean_text(value)
@@ -1676,7 +1848,7 @@ def add_page_note(page: Any, row: Dict[str, Any], comment: str) -> None:
 
 
 def add_no_findings_banner(pdf_bytes: bytes) -> Tuple[Optional[bytes], List[Dict[str, Any]]]:
-    """Pirmajā lapā augšējā labajā stūrī pievieno redzamu audita rezultāta paziņojumu."""
+    """Pirmajā lapā ieraksta redzamu audita rezultāta paziņojumu lapas saturā."""
     if fitz is None:
         return None, [{"status": "error", "message": "PyMuPDF/fitz nav pieejams Streamlit vidē."}]
     try:
@@ -1685,35 +1857,21 @@ def add_no_findings_banner(pdf_bytes: bytes) -> Tuple[Optional[bytes], List[Dict
             doc.close()
             return None, [{"status": "error", "message": "PDF nav lapu."}]
         page = doc[0]
-        page_rect = page.rect
-        width = min(290.0, max(190.0, page_rect.width * 0.34))
+        rect = page.rect
+        width = min(320.0, max(220.0, rect.width * 0.32))
         height = 58.0
-        margin = 18.0
-        box = fitz.Rect(page_rect.x1 - width - margin, page_rect.y0 + margin, page_rect.x1 - margin, page_rect.y0 + margin + height)
+        margin = 16.0
+        box = fitz.Rect(rect.x1 - width - margin, rect.y0 + margin, rect.x1 - margin, rect.y0 + margin + height)
         message = "Audita rezultātā neatbilstības nav konstatētas."
-        try:
-            annot = page.add_freetext_annot(
-                box,
-                message,
-                fontsize=10,
-                fontname="Helv",
-                text_color=(0, 0, 0),
-                fill_color=(1, 1, 1),
-                border_color=(0, 0, 0),
-                align=1,
-            )
-            annot.set_info(title="AI būvprojekta audits", content=message)
-            annot.update()
-        except Exception:
-            page.draw_rect(box, color=(0, 0, 0), fill=(1, 1, 1), width=1)
-            page.insert_textbox(
-                box + (6, 6, -6, -6),
-                message,
-                fontsize=10,
-                fontname="helv",
-                align=1,
-                color=(0, 0, 0),
-            )
+        page.draw_rect(box, color=(0.10, 0.45, 0.10), fill=(0.90, 1.00, 0.90), width=1.2, overlay=True)
+        inner = fitz.Rect(box.x0 + 7, box.y0 + 7, box.x1 - 7, box.y1 - 7)
+        rc = page.insert_textbox(inner, message, fontsize=10, fontname="helv", color=(0.00, 0.25, 0.00), align=1, overlay=True)
+        # Ja teksts neietilpst, palielina laukumu un atkārto uzrakstu.
+        if rc < 0:
+            box = fitz.Rect(rect.x1 - width - margin, rect.y0 + margin, rect.x1 - margin, rect.y0 + margin + 78.0)
+            page.draw_rect(box, color=(0.10, 0.45, 0.10), fill=(0.90, 1.00, 0.90), width=1.2, overlay=True)
+            inner = fitz.Rect(box.x0 + 7, box.y0 + 7, box.x1 - 7, box.y1 - 7)
+            page.insert_textbox(inner, message, fontsize=9, fontname="helv", color=(0.00, 0.25, 0.00), align=1, overlay=True)
         out = io.BytesIO()
         doc.save(out, garbage=4, deflate=True)
         doc.close()
@@ -1723,16 +1881,12 @@ def add_no_findings_banner(pdf_bytes: bytes) -> Tuple[Optional[bytes], List[Dict
 
 
 def annotate_pdf_bytes(pdf_bytes: bytes, accepted_df: pd.DataFrame) -> Tuple[Optional[bytes], List[Dict[str, Any]]]:
-    """Create an annotated PDF from accepted candidate rows.
-
-    The PDF is an aid for review: exact text matches are highlighted; otherwise a page note is added.
-    """
+    """Anotē PDF, primāri piesaistot piezīmi konkrētam, atrodamam teksta fragmentam."""
     report: List[Dict[str, Any]] = []
     if fitz is None:
         return None, [{"status": "error", "message": "PyMuPDF/fitz nav pieejams Streamlit vidē."}]
     if accepted_df is None or accepted_df.empty:
         return pdf_bytes, []
-
     try:
         doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     except Exception as e:
@@ -1741,57 +1895,40 @@ def annotate_pdf_bytes(pdf_bytes: bytes, accepted_df: pd.DataFrame) -> Tuple[Opt
     for _, row_s in accepted_df.iterrows():
         row = {str(k): v for k, v in row_s.to_dict().items()}
         note_id = clean_text(row.get("note_id"))
-        target_text = clean_text(row.get("target_text"))
-        markup_type = clean_text(row.get("markup_type")).lower()
         placement = clean_text(row.get("placement_confidence")).lower()
         page_index = safe_int_page(row.get("target_page"), len(doc))
         page = doc[page_index]
         comment = make_pdf_comment(row)
-
         status = "page_note"
         matches_count = 0
+        used_anchor = ""
+        error_text = ""
         try:
-            can_search = bool(target_text) and target_text != "MANUAL_PLACEMENT_REQUIRED" and markup_type not in {"page_note", "sticky_note"}
-            if can_search:
-                matches = page.search_for(target_text, quads=True)
-                matches_count = len(matches)
-                if matches:
-                    # Avoid very broad accidental highlights for tiny targets like "7" or "19".
-                    if len(target_text) <= 3:
-                        matches = matches[:1]
-                    annot = page.add_highlight_annot(matches)
-                    annot.set_info(title="AI būvprojekta audits", content=comment)
-                    annot.update()
-                    status = "highlight_exact" if placement == "exact" else "highlight_found"
-                else:
-                    add_page_note(page, row, comment)
-                    status = "text_not_found_page_note"
+            used_anchor, matches = find_best_anchor_on_page(page, row)
+            matches_count = len(matches)
+            if matches:
+                annot = page.add_highlight_annot(matches)
+                annot.set_info(title="AI būvprojekta audits", content=comment)
+                annot.update()
+                status = "highlight_exact" if placement == "exact" else "highlight_found"
             else:
                 add_page_note(page, row, comment)
-                status = "page_note_manual"
+                status = "text_not_found_page_note"
         except Exception as e:
+            error_text = str(e)
             try:
                 add_page_note(page, row, comment)
                 status = "annotation_error_page_note"
             except Exception:
                 status = "annotation_error"
-            report.append({
-                "note_id": note_id,
-                "target_page": page_index + 1,
-                "target_text": target_text,
-                "status": status,
-                "matches": matches_count,
-                "error": str(e),
-            })
-            continue
-
         report.append({
             "note_id": note_id,
             "target_page": page_index + 1,
-            "target_text": target_text,
+            "target_text": clean_text(row.get("target_text")),
+            "used_anchor": used_anchor,
             "status": status,
             "matches": matches_count,
-            "error": "",
+            "error": error_text,
         })
 
     out = io.BytesIO()
