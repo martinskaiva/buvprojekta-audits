@@ -43,7 +43,7 @@ except Exception:
     HttpError = Exception
 
 
-APP_VERSION = "v0.7.0"
+APP_VERSION = "v0.7.1"
 APP_TITLE = f"BP AI Audit Copilot {APP_VERSION}"
 
 REQUIRED_EXPORT_COLUMNS = [
@@ -472,10 +472,63 @@ def drive_upload_bytes(
 
 
 
+EXCEL_ILLEGAL_CHARACTERS_RE = re.compile(
+    r"[\x00-\x08\x0B\x0C\x0E-\x1F]"
+)
+
+
+def excel_safe_value(value: Any) -> Any:
+    """Sagatavo vērtību drošai ierakstīšanai XLSX.
+
+    PDF teksta slānī mēdz būt vadības rakstzīmes, kuras openpyxl nepieņem.
+    Skaitļus un tukšās vērtības saglabā to sākotnējā tipā; tekstam izņem
+    neatļautos XML vadības simbolus un ievēro Excel šūnas garuma limitu.
+    """
+    if value is None:
+        return ""
+
+    try:
+        if pd.isna(value):
+            return ""
+    except Exception:
+        pass
+
+    if isinstance(value, (int, float, bool)):
+        return value
+
+    text = str(value)
+    text = EXCEL_ILLEGAL_CHARACTERS_RE.sub("", text)
+    text = text.replace("\x7f", "")
+    return text[:32767]
+
+
+def make_excel_safe_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+    safe_df = df.copy()
+    for column in safe_df.columns:
+        safe_df[column] = safe_df[column].map(excel_safe_value)
+    safe_df.columns = [
+        excel_safe_value(column)[:255]
+        for column in safe_df.columns
+    ]
+    return safe_df
+
+
 def dataframe_to_xlsx_bytes(df: pd.DataFrame, sheet_name: str) -> bytes:
+    """Ieraksta DataFrame XLSX, pirms tam iztīrot PDF vadības rakstzīmes."""
+    safe_df = make_excel_safe_dataframe(df)
+    safe_sheet_name = re.sub(
+        r"[\[\]:*?/\\\\]",
+        "_",
+        clean_text(sheet_name),
+    )[:31] or "Sheet1"
+
     bio = io.BytesIO()
     with pd.ExcelWriter(bio, engine="openpyxl") as writer:
-        df.to_excel(writer, sheet_name=sheet_name[:31], index=False)
+        safe_df.to_excel(
+            writer,
+            sheet_name=safe_sheet_name,
+            index=False,
+        )
     return bio.getvalue()
 
 
@@ -3799,6 +3852,11 @@ def main():
         save_error = clean_text(st.session_state.get("drive_save_error"))
         if save_error:
             st.error("Audita failu saglabāšana Google Drive neizdevās.")
+            if "cannot be used in worksheets" in save_error.lower():
+                st.warning(
+                    "PDF teksta slānī bija Excel neatļautas vadības rakstzīmes. "
+                    "v0.7.1 tās pirms XLSX saglabāšanas automātiski iztīra."
+                )
             st.code(save_error)
 
         save_result = st.session_state.get("drive_save_result")
