@@ -43,7 +43,7 @@ except Exception:
     HttpError = Exception
 
 
-APP_VERSION = "v0.6.4.6"
+APP_VERSION = "v0.6.4.7"
 APP_TITLE = f"BP AI Audit Copilot {APP_VERSION}"
 
 REQUIRED_EXPORT_COLUMNS = [
@@ -465,6 +465,135 @@ def drive_upload_bytes(
         supportsAllDrives=True,
     ).execute()
 
+
+
+def dataframe_to_xlsx_bytes(df: pd.DataFrame, sheet_name: str) -> bytes:
+    bio = io.BytesIO()
+    with pd.ExcelWriter(bio, engine="openpyxl") as writer:
+        df.to_excel(writer, sheet_name=sheet_name[:31], index=False)
+    return bio.getvalue()
+
+
+def ensure_memory_project_folder(
+    service,
+    memory_folder_id: str,
+    section_folder_name: str,
+    project_folder_name: str,
+) -> Dict[str, Any]:
+    """Atrod vai izveido 03_Memory sadaļas projekta mapi."""
+    section = drive_find_child_folder(service, memory_folder_id, section_folder_name)
+    if not section:
+        raise RuntimeError(
+            f"Mape 03_Memory/{section_folder_name} nav atrasta. "
+            "Izveido to Google Drive struktūrā."
+        )
+    project_code = normalize_project_code(project_folder_name)
+    project_folder = find_project_folder(service, clean_text(section.get("id")), project_code)
+    if project_folder:
+        return project_folder
+    return drive_create_folder(service, clean_text(section.get("id")), project_folder_name)
+
+
+def build_annotated_pdf_exports(
+    accepted_df: pd.DataFrame,
+    pdf_items: List[Dict[str, Any]],
+    timestamp: str,
+) -> List[Dict[str, Any]]:
+    """Sagatavo katru koriģēto PDF kā atsevišķu Drive augšupielādes failu."""
+    exports: List[Dict[str, Any]] = []
+    if accepted_df is None or accepted_df.empty:
+        return exports
+    for item in pdf_items or []:
+        pdf_name = clean_text(item.get("name"))
+        pdf_rel_path = clean_text(item.get("rel_path")) or pdf_name
+        pdf_bytes = item.get("bytes")
+        if not pdf_name or not pdf_bytes:
+            continue
+        target_series = accepted_df["target_file"].astype(str).map(clean_text)
+        rows = accepted_df[target_series.eq(pdf_rel_path)].copy()
+        if rows.empty:
+            rows = accepted_df[target_series.eq(pdf_name)].copy()
+        if rows.empty:
+            continue
+        annotated_pdf, report = annotate_pdf_bytes(pdf_bytes, rows)
+        if not annotated_pdf:
+            continue
+        source_stem = os.path.splitext(pdf_name)[0]
+        safe_stem = re.sub(r"[^A-Za-z0-9_\-]+", "_", source_stem)[:120]
+        exports.append({
+            "name": f"annotated_{safe_stem}_{timestamp}.pdf",
+            "data": annotated_pdf,
+            "mime_type": "application/pdf",
+            "source": pdf_rel_path,
+            "report": report,
+        })
+    return exports
+
+
+def upload_audit_files_to_drive(
+    service,
+    results_target: Dict[str, Any],
+    memory_folder_id: str,
+    project_folder_name: str,
+    accepted_df: pd.DataFrame,
+    rejected_df: pd.DataFrame,
+    pdf_items: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Saglabā PDF rezultātos, bet mācību Excel atbilstošajās 03_Memory mapēs."""
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    uploaded_results: List[Dict[str, Any]] = []
+    uploaded_memory: List[Dict[str, Any]] = []
+
+    pdf_exports = build_annotated_pdf_exports(accepted_df, pdf_items, timestamp)
+    for export in pdf_exports:
+        uploaded = drive_upload_bytes(
+            service,
+            folder_id=clean_text(results_target.get("id")),
+            file_name=export["name"],
+            data=export["data"],
+            mime_type=export["mime_type"],
+        )
+        uploaded["destination_path"] = clean_text(results_target.get("path"))
+        uploaded_results.append(uploaded)
+
+    project_name = clean_text(project_folder_name) or clean_text(results_target.get("name")) or "Nezinams_projekts"
+
+    if accepted_df is not None and not accepted_df.empty:
+        pending_project = ensure_memory_project_folder(
+            service, memory_folder_id, PENDING_FOLDER_NAME, project_name
+        )
+        pending_name = f"accepted_candidates_{normalize_project_code(project_name) or 'project'}_{timestamp}.xlsx"
+        uploaded = drive_upload_bytes(
+            service,
+            folder_id=clean_text(pending_project.get("id")),
+            file_name=pending_name,
+            data=dataframe_to_xlsx_bytes(accepted_df, "accepted_candidates"),
+            mime_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+        uploaded["destination_path"] = f"03_Memory/{PENDING_FOLDER_NAME}/{clean_text(pending_project.get('name'))}"
+        uploaded_memory.append(uploaded)
+
+    if rejected_df is not None and not rejected_df.empty:
+        feedback_project = ensure_memory_project_folder(
+            service, memory_folder_id, FEEDBACK_FOLDER_NAME, project_name
+        )
+        feedback_name = f"rejected_patterns_{normalize_project_code(project_name) or 'project'}_{timestamp}.xlsx"
+        uploaded = drive_upload_bytes(
+            service,
+            folder_id=clean_text(feedback_project.get("id")),
+            file_name=feedback_name,
+            data=dataframe_to_xlsx_bytes(rejected_df, "rejected_patterns"),
+            mime_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+        uploaded["destination_path"] = f"03_Memory/{FEEDBACK_FOLDER_NAME}/{clean_text(feedback_project.get('name'))}"
+        uploaded_memory.append(uploaded)
+
+    return {
+        "results_files": uploaded_results,
+        "memory_files": uploaded_memory,
+        "target": results_target,
+        "timestamp": timestamp,
+    }
 
 def run_drive_write_test(
     service,
@@ -2539,8 +2668,9 @@ def main():
 
         st.subheader("Saglabāšana Google Drive")
         st.caption(
-            "Izvēlies esošu 02_Results projekta mapi vai izveido jaunu apakšmapi. "
-            "Pilnais audita ZIP tiks saglabāts tieši izvēlētajā mapē."
+            "Koriģētie PDF tiek saglabāti atsevišķi izvēlētajā 02_Results projekta mapē. "
+            "Akceptēto piemēru Excel tiek saglabāts 03_Memory/05_Audit_examples_pending, "
+            "bet noraidījumu Excel — 03_Memory/03_Audit_feedback. ZIP paliek tikai kā papildu lejupielāde."
         )
 
         oauth_service = None
@@ -2574,143 +2704,95 @@ def main():
                 )
                 results_root_id = clean_text(results_root.get("id"))
                 results_root_name = clean_text(results_root.get("name")) or "02_Results"
+
+                # Galamērķu saraksts vienmēr sākas 02_Results saknē.
+                # Tas ļauj brīvi izvēlēties citu projektu neatkarīgi no auditējamā 01_Input projekta.
+                project_folders = drive_list_children(
+                    oauth_service, results_root_id, "application/vnd.google-apps.folder"
+                )
+                folder_options: List[Dict[str, str]] = [{
+                    "id": results_root_id,
+                    "name": results_root_name,
+                    "path": results_root_name,
+                }]
+                for folder in sorted(project_folders, key=lambda x: clean_text(x.get("name")).lower()):
+                    folder_options.append({
+                        "id": clean_text(folder.get("id")),
+                        "name": clean_text(folder.get("name")),
+                        "path": f"{results_root_name}/{clean_text(folder.get('name'))}",
+                    })
+
+                option_by_id = {item["id"]: item for item in folder_options}
+                pending_target_id = clean_text(st.session_state.pop("pending_drive_target_folder_id", ""))
+                if pending_target_id:
+                    pending_name = clean_text(st.session_state.pop("pending_drive_target_folder_name", ""))
+                    pending_path = clean_text(st.session_state.pop("pending_drive_target_folder_path", ""))
+                    if pending_target_id not in option_by_id:
+                        item = {
+                            "id": pending_target_id,
+                            "name": pending_name or "Jaunā projekta mape",
+                            "path": pending_path or f"{results_root_name}/{pending_name}",
+                        }
+                        folder_options.append(item)
+                        option_by_id[pending_target_id] = item
+                    st.session_state["drive_target_folder_id"] = pending_target_id
+
                 active_project_name = (
                     clean_text(st.session_state.get("applied_project_filter"))
                     or clean_text(st.session_state.get("selected_project_filter"))
                 )
                 active_project_code = normalize_project_code(active_project_name)
-
-                project_result_folder = None
+                preferred_folder = None
                 if active_project_code:
-                    project_result_folder = find_project_folder(
-                        oauth_service, results_root_id, active_project_code
-                    )
-
-                if not project_result_folder and active_project_name and active_project_name != "01_Input sakne":
-                    st.warning(
-                        f"Mapē {results_root_name} vēl nav atrasta projekta mape "
-                        f"{active_project_name}. Vari to izveidot ar pogu zemāk."
-                    )
-                    create_project_col, _ = st.columns([1, 4])
-                    with create_project_col:
-                        create_project_clicked = st.button(
-                            f"Izveidot {active_project_name}",
-                            use_container_width=True,
-                            key=f"create_results_project_{active_project_code}",
-                        )
-                    if create_project_clicked:
-                        project_result_folder = drive_create_folder(
-                            oauth_service, results_root_id, active_project_name
-                        )
-                        st.success(f"Izveidota rezultātu mape: {active_project_name}")
-                        st.rerun()
-
-                base_folder = project_result_folder or {
-                    "id": results_root_id,
-                    "name": results_root_name,
-                }
-                base_folder_id = clean_text(base_folder.get("id"))
-                base_folder_name = clean_text(base_folder.get("name"))
-
-                child_folders = drive_list_children(
-                    oauth_service,
-                    base_folder_id,
-                    "application/vnd.google-apps.folder",
-                )
-                folder_options: List[Dict[str, str]] = [{
-                    "id": base_folder_id,
-                    "name": base_folder_name,
-                    "path": f"{results_root_name}/{base_folder_name}" if base_folder_id != results_root_id else results_root_name,
-                }]
-                for folder in sorted(child_folders, key=lambda x: clean_text(x.get("name")).lower()):
-                    folder_options.append({
-                        "id": clean_text(folder.get("id")),
-                        "name": clean_text(folder.get("name")),
-                        "path": (
-                            f"{results_root_name}/{base_folder_name}/{clean_text(folder.get('name'))}"
-                            if base_folder_id != results_root_id
-                            else f"{results_root_name}/{clean_text(folder.get('name'))}"
-                        ),
-                    })
-
-                option_by_id = {item["id"]: item for item in folder_options}
-                # Streamlit neļauj mainīt widgeta session_state vērtību pēc tam,
-                # kad widgets ar šo key jau ir izveidots tajā pašā izpildes ciklā.
-                # Ja tikko izveidota jauna mape, tās ID vispirms glabājam atsevišķā
-                # pending atslēgā un piemērojam pirms selectbox izveides nākamajā rerun.
-                pending_target_id = clean_text(
-                    st.session_state.pop("pending_drive_target_folder_id", "")
-                )
-                if pending_target_id:
-                    # Ja jaunā mape ir izveidota zem pašlaik izvēlētās mapes,
-                    # pievienojam to opcijām arī tad, ja tā nav base mapes tiešais bērns.
-                    pending_target_name = clean_text(
-                        st.session_state.pop("pending_drive_target_folder_name", "")
-                    )
-                    pending_target_path = clean_text(
-                        st.session_state.pop("pending_drive_target_folder_path", "")
-                    )
-                    if pending_target_id not in option_by_id:
-                        pending_item = {
-                            "id": pending_target_id,
-                            "name": pending_target_name or "Jaunā mape",
-                            "path": pending_target_path or pending_target_name or "Jaunā mape",
-                        }
-                        folder_options.append(pending_item)
-                        option_by_id[pending_target_id] = pending_item
-                    st.session_state["drive_target_folder_id"] = pending_target_id
+                    preferred_folder = find_project_folder(oauth_service, results_root_id, active_project_code)
 
                 current_target_id = clean_text(st.session_state.get("drive_target_folder_id"))
                 if current_target_id not in option_by_id:
-                    st.session_state["drive_target_folder_id"] = base_folder_id
+                    preferred_id = clean_text((preferred_folder or {}).get("id"))
+                    st.session_state["drive_target_folder_id"] = (
+                        preferred_id if preferred_id in option_by_id else results_root_id
+                    )
 
                 selected_target_id = st.selectbox(
-                    "Kurā Drive mapē saglabāt audita failus?",
+                    "Kurā 02_Results projekta mapē saglabāt koriģētos PDF?",
                     options=[item["id"] for item in folder_options],
                     format_func=lambda folder_id: option_by_id[folder_id]["path"],
                     key="drive_target_folder_id",
                 )
                 selected_target = option_by_id[selected_target_id]
-                st.session_state.drive_target_folder_name = selected_target["name"]
-                st.session_state.drive_target_folder_path = selected_target["path"]
-                st.info(f"Izvēlētais galamērķis: {selected_target['path']}")
+                st.info(f"Izvēlētais PDF galamērķis: {selected_target['path']}")
 
-                with st.expander("+ Izveidot jaunu mapi izvēlētajā vietā", expanded=False):
-                    suggested_name = datetime.now().strftime("%Y-%m-%d_Audits")
+                with st.expander("+ Izveidot jaunu projekta mapi 02_Results", expanded=False):
+                    suggested_name = active_project_name if active_project_name and active_project_name != "01_Input sakne" else "Jauns_projekts"
                     new_folder_name = st.text_input(
-                        "Jaunās mapes nosaukums",
+                        "Jaunās projekta mapes nosaukums",
                         value=suggested_name,
                         key="new_drive_folder_name",
                     )
-                    st.caption(f"Jaunā mape tiks izveidota zem: {selected_target['path']}")
-                    create_folder_col, _ = st.columns([1, 4])
-                    with create_folder_col:
+                    st.caption(f"Jaunā mape tiks izveidota tieši zem: {results_root_name}")
+                    create_col, _ = st.columns([1, 4])
+                    with create_col:
                         create_folder_clicked = st.button(
-                            "Izveidot mapi",
+                            "Izveidot projekta mapi",
                             type="primary",
                             use_container_width=True,
                             key="create_new_drive_target_folder",
                         )
                     if create_folder_clicked:
-                        created_folder = drive_create_folder(
-                            oauth_service,
-                            selected_target_id,
-                            new_folder_name,
-                        )
-                        created_folder_id = clean_text(created_folder.get("id"))
-                        created_folder_name = clean_text(created_folder.get("name"))
-                        created_folder_path = f"{selected_target['path']}/{created_folder_name}"
-                        st.session_state["pending_drive_target_folder_id"] = created_folder_id
-                        st.session_state["pending_drive_target_folder_name"] = created_folder_name
-                        st.session_state["pending_drive_target_folder_path"] = created_folder_path
-                        st.success(
-                            "Mape jau pastāvēja un tika izvēlēta."
-                            if created_folder.get("already_existed")
-                            else f"Izveidota jauna mape: {clean_text(created_folder.get('name'))}"
-                        )
+                        created = drive_create_folder(oauth_service, results_root_id, new_folder_name)
+                        created_id = clean_text(created.get("id"))
+                        created_name = clean_text(created.get("name"))
+                        st.session_state["pending_drive_target_folder_id"] = created_id
+                        st.session_state["pending_drive_target_folder_name"] = created_name
+                        st.session_state["pending_drive_target_folder_path"] = f"{results_root_name}/{created_name}"
                         st.rerun()
 
-                action_col1, action_col2, _ = st.columns([1, 1, 3])
+                st.caption(
+                    f"Memory Excel projekta mape tiks sasaistīta ar izvēlēto rezultātu projektu: "
+                    f"{selected_target['name']}"
+                )
+
+                action_col1, action_col2, _ = st.columns([1, 1.35, 3])
                 with action_col1:
                     test_drive_write_clicked = st.button(
                         "Testēt rakstīšanu",
@@ -2719,10 +2801,10 @@ def main():
                     )
                 with action_col2:
                     save_audit_clicked = st.button(
-                        "Saglabāt audita ZIP Drive",
+                        "Saglabāt audita failus Google Drive",
                         type="primary",
                         use_container_width=True,
-                        key=f"save_audit_zip_drive_{audit_run_id}",
+                        key=f"save_audit_files_drive_{audit_run_id}",
                     )
 
                 if test_drive_write_clicked:
@@ -2731,9 +2813,7 @@ def main():
                     try:
                         with st.spinner("Izveidoju testa failu izvēlētajā mapē..."):
                             result = run_drive_write_test_to_folder(
-                                oauth_service,
-                                target_folder_id=selected_target_id,
-                                target_folder_name=selected_target["path"],
+                                oauth_service, selected_target_id, selected_target["path"]
                             )
                         st.session_state.drive_write_test_result = result
                     except Exception as exc:
@@ -2743,20 +2823,19 @@ def main():
                     st.session_state.drive_save_result = None
                     st.session_state.drive_save_error = ""
                     try:
-                        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                        zip_name = f"bp_ai_audit_copilot_{base}_{timestamp}.zip"
-                        with st.spinner("Saglabāju pilno audita ZIP Google Drive..."):
-                            uploaded_zip = drive_upload_bytes(
+                        if accepted_df.empty and rejected_df.empty:
+                            raise RuntimeError("Nav nevienas akceptētas vai noraidītas piezīmes, ko saglabāt.")
+                        with st.spinner("Saglabāju PDF un Memory Excel Google Drive..."):
+                            result = upload_audit_files_to_drive(
                                 oauth_service,
-                                folder_id=selected_target_id,
-                                file_name=zip_name,
-                                data=zip_bytes,
-                                mime_type="application/zip",
+                                results_target=selected_target,
+                                memory_folder_id=memory_folder_id.strip(),
+                                project_folder_name=selected_target["name"],
+                                accepted_df=accepted_df,
+                                rejected_df=rejected_df,
+                                pdf_items=selected_pdf_items,
                             )
-                        st.session_state.drive_save_result = {
-                            "file": uploaded_zip,
-                            "target": selected_target,
-                        }
+                        st.session_state.drive_save_result = result
                     except Exception as exc:
                         st.session_state.drive_save_error = str(exc)
 
@@ -2773,29 +2852,31 @@ def main():
         write_test_result = st.session_state.get("drive_write_test_result")
         if isinstance(write_test_result, dict) and write_test_result:
             test_file = write_test_result.get("file") or {}
-            target = write_test_result.get("target") or {}
             st.success(f"Drive rakstīšanas tests izdevās: {clean_text(test_file.get('name'))}")
-            file_link = clean_text(test_file.get("webViewLink"))
-            if file_link:
-                st.markdown(f"[Atvērt testa failu Google Drive]({file_link})")
-            st.caption(f"Mērķa mape: {clean_text(target.get('name'))}")
+            if clean_text(test_file.get("webViewLink")):
+                st.markdown(f"[Atvērt testa failu Google Drive]({clean_text(test_file.get('webViewLink'))})")
 
         save_error = clean_text(st.session_state.get("drive_save_error"))
         if save_error:
-            st.error("Audita ZIP saglabāšana Google Drive neizdevās.")
+            st.error("Audita failu saglabāšana Google Drive neizdevās.")
             st.code(save_error)
 
         save_result = st.session_state.get("drive_save_result")
         if isinstance(save_result, dict) and save_result:
-            saved_file = save_result.get("file") or {}
-            target = save_result.get("target") or {}
+            result_files = save_result.get("results_files") or []
+            memory_files = save_result.get("memory_files") or []
             st.success(
-                f"Audita ZIP saglabāts: {clean_text(saved_file.get('name'))}"
+                f"Saglabāšana pabeigta: {len(result_files)} PDF rezultātu faili un "
+                f"{len(memory_files)} Memory Excel faili."
             )
-            saved_link = clean_text(saved_file.get("webViewLink"))
-            if saved_link:
-                st.markdown(f"[Atvērt saglabāto auditu Google Drive]({saved_link})")
-            st.caption(f"Mērķa mape: {clean_text(target.get('path'))}")
+            for file_info in result_files + memory_files:
+                name = clean_text(file_info.get("name"))
+                path = clean_text(file_info.get("destination_path"))
+                link = clean_text(file_info.get("webViewLink"))
+                if link:
+                    st.markdown(f"- [{name}]({link}) — `{path}`")
+                else:
+                    st.markdown(f"- {name} — `{path}`")
 
 
 if __name__ == "__main__":
