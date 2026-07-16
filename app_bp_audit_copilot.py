@@ -43,7 +43,7 @@ except Exception:
     HttpError = Exception
 
 
-APP_VERSION = "v0.7.3"
+APP_VERSION = "v0.7.4"
 APP_TITLE = f"BP AI Audit Copilot {APP_VERSION}"
 
 REQUIRED_EXPORT_COLUMNS = [
@@ -2573,6 +2573,301 @@ def make_zip(
 
 
 
+
+MANUAL_IMPORT_REQUIRED_COLUMNS = [
+    "note_number",
+    "source_file",
+    "family",
+    "issue_type",
+    "target_page",
+    "target_area",
+    "target_text",
+    "problem",
+    "comment_text",
+]
+
+MANUAL_IMPORT_OPTIONAL_COLUMNS = [
+    "comparison_file",
+    "comparison_page",
+    "comparison_text",
+    "evidence",
+    "severity",
+    "markup_type",
+    "placement_confidence",
+    "active",
+    "scope",
+    "notes_for_ai",
+]
+
+MANUAL_IMPORT_COLUMNS = (
+    MANUAL_IMPORT_REQUIRED_COLUMNS
+    + MANUAL_IMPORT_OPTIONAL_COLUMNS
+)
+
+
+def parse_bool_value(value: Any, default: bool = True) -> bool:
+    text = clean_text(value).casefold()
+    if not text:
+        return default
+    if text in {"true", "1", "yes", "y", "jā", "ja", "x", "active"}:
+        return True
+    if text in {"false", "0", "no", "n", "nē", "ne", "inactive"}:
+        return False
+    return default
+
+
+def normalize_manual_import_dataframe(
+    dataframe: pd.DataFrame,
+) -> Tuple[pd.DataFrame, List[str]]:
+    """Validē un normalizē ChatGPT/manuāli sagatavotu piezīmju Excel."""
+    errors: List[str] = []
+    if dataframe is None or dataframe.empty:
+        return pd.DataFrame(columns=MANUAL_IMPORT_COLUMNS), [
+            "Excel failā nav piezīmju rindu."
+        ]
+
+    df = dataframe.copy()
+    df.columns = [
+        clean_text(column).casefold().replace(" ", "_")
+        for column in df.columns
+    ]
+
+    aliases = {
+        "nr": "note_number",
+        "number": "note_number",
+        "id": "note_number",
+        "pdf": "source_file",
+        "target_file": "source_file",
+        "source_pdf": "source_file",
+        "comparison_files": "comparison_file",
+        "comparison_pages": "comparison_page",
+        "page": "target_page",
+        "where": "target_area",
+        "designer_note": "comment_text",
+        "comment": "comment_text",
+        "title": "problem",
+        "description": "problem",
+        "comparison_evidence": "evidence",
+    }
+    df = df.rename(
+        columns={
+            column: aliases.get(column, column)
+            for column in df.columns
+        }
+    )
+
+    for column in MANUAL_IMPORT_COLUMNS:
+        if column not in df.columns:
+            df[column] = ""
+
+    missing = [
+        column
+        for column in MANUAL_IMPORT_REQUIRED_COLUMNS
+        if column not in dataframe.rename(
+            columns={
+                original: aliases.get(
+                    clean_text(original).casefold().replace(" ", "_"),
+                    clean_text(original).casefold().replace(" ", "_"),
+                )
+                for original in dataframe.columns
+            }
+        ).columns
+    ]
+    if missing:
+        errors.append(
+            "Trūkst obligātās kolonnas: " + ", ".join(missing)
+        )
+
+    for column in df.columns:
+        if column != "active":
+            df[column] = df[column].map(clean_text)
+
+    df["active"] = df["active"].map(
+        lambda value: parse_bool_value(value, default=True)
+    )
+    df = df[df["active"]].copy()
+
+    for row_index, row in df.iterrows():
+        row_label = clean_text(row.get("note_number")) or str(row_index + 2)
+        if not clean_text(row.get("source_file")):
+            errors.append(
+                f"Rindai {row_label} nav norādīts source_file."
+            )
+        if not clean_text(row.get("family")):
+            errors.append(
+                f"Rindai {row_label} nav norādīta family."
+            )
+        if not clean_text(row.get("comment_text")):
+            errors.append(
+                f"Rindai {row_label} nav norādīts comment_text."
+            )
+        if (
+            not clean_text(row.get("problem"))
+            and not clean_text(row.get("evidence"))
+        ):
+            errors.append(
+                f"Rindai {row_label} nav problem vai evidence."
+            )
+
+    return df[MANUAL_IMPORT_COLUMNS].reset_index(drop=True), errors
+
+
+def read_manual_import_excel(
+    uploaded_file: Any,
+) -> Tuple[pd.DataFrame, List[str]]:
+    if uploaded_file is None:
+        return pd.DataFrame(columns=MANUAL_IMPORT_COLUMNS), []
+
+    try:
+        raw = uploaded_file.getvalue()
+        xls = pd.ExcelFile(io.BytesIO(raw))
+        preferred = [
+            "audit_notes_import",
+            "manual_notes",
+            "notes",
+            "piezimes",
+        ]
+        sheet_name = next(
+            (
+                sheet
+                for wanted in preferred
+                for sheet in xls.sheet_names
+                if clean_text(sheet).casefold() == wanted
+            ),
+            xls.sheet_names[0],
+        )
+        dataframe = pd.read_excel(
+            io.BytesIO(raw),
+            sheet_name=sheet_name,
+            dtype=object,
+        )
+        return normalize_manual_import_dataframe(dataframe)
+    except Exception as exc:
+        return pd.DataFrame(columns=MANUAL_IMPORT_COLUMNS), [
+            f"Excel failu neizdevās nolasīt: {exc}"
+        ]
+
+
+def match_manual_source_pdf(
+    source_file: str,
+    selected_pdf_items: List[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    wanted = _canonical_drive_rel_path(source_file)
+    if not wanted:
+        return None
+
+    exact = [
+        item for item in selected_pdf_items
+        if _canonical_drive_rel_path(
+            clean_text(item.get("rel_path") or item.get("name"))
+        ) == wanted
+    ]
+    if len(exact) == 1:
+        return exact[0]
+
+    wanted_name = wanted.rsplit("/", 1)[-1]
+    by_name = [
+        item for item in selected_pdf_items
+        if _canonical_drive_rel_path(
+            clean_text(item.get("name"))
+        ) == wanted_name
+    ]
+    if len(by_name) == 1:
+        return by_name[0]
+
+    partial = [
+        item for item in selected_pdf_items
+        if wanted in _canonical_drive_rel_path(
+            clean_text(item.get("rel_path") or item.get("name"))
+        )
+        or _canonical_drive_rel_path(
+            clean_text(item.get("rel_path") or item.get("name"))
+        ) in wanted
+    ]
+    return partial[0] if len(partial) == 1 else None
+
+
+def manual_import_rows_to_candidates(
+    dataframe: pd.DataFrame,
+    selected_pdf_items: List[Dict[str, Any]],
+) -> Tuple[List[Dict[str, Any]], List[str]]:
+    """Pārvērš importētās Excel rindas par parastiem pārskatāmiem kandidātiem."""
+    candidates: List[Dict[str, Any]] = []
+    warnings: List[str] = []
+
+    if dataframe is None or dataframe.empty:
+        return candidates, warnings
+
+    for row_index, row in dataframe.iterrows():
+        number = clean_text(row.get("note_number")) or f"IMP-{row_index + 1}"
+        matched_pdf = match_manual_source_pdf(
+            clean_text(row.get("source_file")),
+            selected_pdf_items,
+        )
+        if matched_pdf is None:
+            warnings.append(
+                f"{number}: source_file “{clean_text(row.get('source_file'))}” "
+                "neatbilst nevienam no šajā auditā izvēlētajiem PDF."
+            )
+            continue
+
+        source_name = clean_text(matched_pdf.get("name"))
+        source_rel_path = clean_text(
+            matched_pdf.get("rel_path") or source_name
+        )
+        target_text = clean_text(row.get("target_text"))
+        target_page = clean_text(row.get("target_page")) or "1"
+        placement = clean_text(row.get("placement_confidence"))
+        markup_type = clean_text(row.get("markup_type"))
+
+        # Importa rindai atļaujam arī page note, ja precīza teksta enkura nav.
+        if not placement:
+            placement = "exact" if target_text else "manual_needed"
+        if not markup_type:
+            markup_type = "highlight" if target_text else "page_note"
+
+        evidence_parts = [
+            clean_text(row.get("evidence")),
+            clean_text(row.get("comparison_text")),
+        ]
+        evidence = " | ".join(
+            value for value in evidence_parts if value
+        )
+
+        candidate = {
+            "candidate_source": "manual_excel_import",
+            "manual_note_number": number,
+            "title": clean_text(row.get("problem"))[:180]
+            or f"Importēta piezīme {number}",
+            "family": clean_text(row.get("family")),
+            "issue_type": clean_text(row.get("issue_type")),
+            "status": "manual_import",
+            "where": clean_text(row.get("target_area")),
+            "target_area": clean_text(row.get("target_area")),
+            "target_page": target_page,
+            "target_text": target_text or "MANUAL_PLACEMENT_REQUIRED",
+            "problem": clean_text(row.get("problem")),
+            "evidence": evidence,
+            "designer_note": clean_text(row.get("comment_text")),
+            "comment_text": clean_text(row.get("comment_text")),
+            "severity": clean_text(row.get("severity")) or "medium",
+            "markup_type": markup_type,
+            "placement_confidence": placement,
+            "comparison_files": clean_text(row.get("comparison_file")),
+            "comparison_pages": clean_text(row.get("comparison_page")),
+            "comparison_text": clean_text(row.get("comparison_text")),
+            "scope": clean_text(row.get("scope")),
+            "notes_for_ai": clean_text(row.get("notes_for_ai")),
+            "source_pdf": source_name,
+            "source_pdf_rel_path": source_rel_path,
+            "include_default": True,
+            "reject_default": False,
+        }
+        candidates.append(candidate)
+
+    return candidates, warnings
+
+
 def render_pdf_progress_dashboard(
     placeholder: Any,
     states: List[Dict[str, Any]],
@@ -2620,6 +2915,10 @@ def init_state():
         "pdf_pages": [],
         "candidates": [],
         "ai_errors": [],
+        "manual_import_df": pd.DataFrame(columns=MANUAL_IMPORT_COLUMNS),
+        "manual_import_errors": [],
+        "manual_import_warnings": [],
+        "manual_import_file_name": "",
         "selected_project_filter": "",
         "selected_folder_filter": "Viss projekts",
         "pdf_search_value": "",
@@ -2715,8 +3014,8 @@ def main():
         )
         model = st.text_input("OpenAI modelis", value=get_secret("OPENAI_MODEL", default="gpt-4.1-mini") or "gpt-4.1-mini")
         max_context_chars = st.slider("PDF konteksta garums", 5000, 60000, 25000, 5000)
-        max_examples_per_family = st.slider("Piemēri vienai ģimenei", 1, 12, 5, 1)
-        max_candidates_per_family = st.slider("Max piezīmes vienai ģimenei", 0, 8, 3, 1)
+        max_examples_per_family = st.slider("Piemēri vienai ģimenei", 1, 12, 12, 1)
+        max_candidates_per_family = st.slider("Max piezīmes vienai ģimenei", 0, 8, 4, 1)
         st.caption("0 nozīmē: ģimeni šoreiz nepalaist.")
 
         index_df = st.session_state.get("index_df", pd.DataFrame())
@@ -3323,6 +3622,85 @@ def main():
             with st.expander("PDF izvēles traceback"):
                 st.code(traceback.format_exc())
 
+
+    st.header("3B. Papildu piezīmju Excel imports")
+    st.caption(
+        "Šeit vari augšupielādēt ChatGPT vai cilvēka sagatavotu Excel. "
+        "Importētās rindas tiks pievienotas AI kandidātiem un būs jāpārskata "
+        "5. sadaļā tāpat kā rīka ģenerētās piezīmes. Nekas netiek automātiski "
+        "saglabāts Drive, kamēr piezīmes nav pārskatītas un audits nav saglabāts."
+    )
+
+    manual_upload = st.file_uploader(
+        "Augšupielādēt piezīmju Excel (.xlsx)",
+        type=["xlsx", "xlsm"],
+        key="manual_audit_notes_upload",
+        help=(
+            "Ieteicamais lapas nosaukums: audit_notes_import. "
+            "Failā jābūt source_file, family, issue_type, target_page, "
+            "target_area, target_text, problem un comment_text kolonnām."
+        ),
+    )
+
+    if manual_upload is not None:
+        upload_name = clean_text(getattr(manual_upload, "name", ""))
+        if upload_name != st.session_state.get("manual_import_file_name"):
+            manual_df, manual_errors = read_manual_import_excel(manual_upload)
+            st.session_state.manual_import_df = manual_df
+            st.session_state.manual_import_errors = manual_errors
+            st.session_state.manual_import_file_name = upload_name
+            st.session_state.manual_import_warnings = []
+
+    manual_df = st.session_state.get(
+        "manual_import_df",
+        pd.DataFrame(columns=MANUAL_IMPORT_COLUMNS),
+    )
+    manual_errors = st.session_state.get("manual_import_errors", [])
+
+    for message in manual_errors:
+        st.warning(message)
+
+    if manual_upload is None and st.session_state.get("manual_import_file_name"):
+        st.info(
+            "Iepriekš nolasītais importa fails šajā sesijā: "
+            f"{st.session_state.get('manual_import_file_name')}"
+        )
+
+    if manual_df is not None and not manual_df.empty:
+        st.success(
+            f"Importam sagatavotas piezīmes: {len(manual_df)}"
+        )
+        preview_columns = [
+            "note_number",
+            "source_file",
+            "family",
+            "target_page",
+            "target_text",
+            "comment_text",
+        ]
+        st.dataframe(
+            manual_df[preview_columns],
+            use_container_width=True,
+            hide_index=True,
+        )
+        clear_import_col, _ = st.columns([1, 4])
+        with clear_import_col:
+            if st.button(
+                "Noņemt importēto Excel",
+                use_container_width=True,
+                key="clear_manual_import",
+            ):
+                st.session_state.manual_import_df = pd.DataFrame(
+                    columns=MANUAL_IMPORT_COLUMNS
+                )
+                st.session_state.manual_import_errors = []
+                st.session_state.manual_import_warnings = []
+                st.session_state.manual_import_file_name = ""
+                st.rerun()
+    else:
+        st.caption("Papildu piezīmju Excel nav ielādēts.")
+
+
     st.header("4. AI piezīmju ģenerēšana")
     selected_pdf_items = st.session_state.get("selected_pdf_items", [])
     ready = bool(selected_pdf_items) and not st.session_state.index_df.empty
@@ -3346,6 +3724,17 @@ def main():
 
             all_candidates: List[Dict[str, Any]] = []
             errors: List[Dict[str, Any]] = []
+
+            manual_candidates, manual_warnings = manual_import_rows_to_candidates(
+                st.session_state.get(
+                    "manual_import_df",
+                    pd.DataFrame(columns=MANUAL_IMPORT_COLUMNS),
+                ),
+                selected_pdf_items,
+            )
+            all_candidates.extend(manual_candidates)
+            st.session_state.manual_import_warnings = manual_warnings
+
             progress = st.progress(0)
             status = st.empty()
             pdf_progress_placeholder = st.empty()
@@ -3571,6 +3960,12 @@ def main():
             st.session_state.ai_errors = errors
             status.write("AI analīze pabeigta.")
             st.success(f"Ģenerētas pārskatāmas piezīmes: {len(final_candidates)}")
+            if manual_candidates:
+                st.info(
+                    f"No manuālā Excel pievienoti kandidāti: {len(manual_candidates)}"
+                )
+            for warning in manual_warnings:
+                st.warning(warning)
 
     if st.session_state.ai_errors:
         with st.expander("AI batch kļūdas"):
@@ -3593,6 +3988,15 @@ def main():
                 source_pdf = clean_text(c.get("source_pdf")) or st.session_state.selected_pdf_name
                 source_pdf_rel = clean_text(c.get("source_pdf_rel_path")) or source_pdf
                 st.markdown(f"**PDF:** {source_pdf_rel}")
+                if clean_text(c.get("candidate_source")) == "manual_excel_import":
+                    st.info(
+                        "Avots: manuāli augšupielādēts piezīmju Excel"
+                        + (
+                            f" · Nr. {clean_text(c.get('manual_note_number'))}"
+                            if clean_text(c.get("manual_note_number"))
+                            else ""
+                        )
+                    )
                 st.markdown(f"**Ģimene:** `{family}`")
                 st.markdown(f"**Kur:** {clean_text(c.get('where') or c.get('target_area'))}")
                 st.markdown(f"**Statuss:** {clean_text(c.get('status'))}")
