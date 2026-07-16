@@ -43,7 +43,7 @@ except Exception:
     HttpError = Exception
 
 
-APP_VERSION = "v0.7.8"
+APP_VERSION = "v0.7.9"
 APP_TITLE = f"BP AI Audit Copilot {APP_VERSION}"
 
 REQUIRED_EXPORT_COLUMNS = [
@@ -2882,6 +2882,271 @@ def match_manual_source_pdf(
     ]
     return partial[0] if len(partial) == 1 else None
 
+
+def _manual_candidate_page_text(
+    pdf_item: Dict[str, Any],
+    target_page: Any,
+) -> str:
+    try:
+        page_number = max(1, int(float(clean_text(target_page) or "1")))
+    except Exception:
+        page_number = 1
+
+    pages = pdf_item.get("pages") or []
+    for page in pages:
+        try:
+            if int(page.get("page") or 0) == page_number:
+                return clean_text(page.get("text"))
+        except Exception:
+            continue
+
+    return clean_text(pdf_item.get("text"))[:12000]
+
+
+def _manual_exact_anchor_from_page(
+    page_text: str,
+    values: List[str],
+) -> str:
+    """Atrod īsu, burtiski lapā sastopamu teksta enkuru."""
+    page_text = clean_text(page_text)
+    if not page_text:
+        return ""
+
+    candidates: List[str] = []
+    for value in values:
+        value = clean_text(value)
+        if not value:
+            continue
+        candidates.append(value)
+        candidates.extend(extract_anchor_tokens(value))
+        candidates.extend(_quoted_values(value))
+
+    seen = set()
+    ordered = []
+    for value in candidates:
+        value = clean_text(value).strip(" ,.;:")
+        key = value.casefold()
+        if (
+            not value
+            or key in seen
+            or len(value) < 3
+            or len(value) > 180
+        ):
+            continue
+        seen.add(key)
+        ordered.append(value)
+
+    # Garāki un specifiskāki teksti vispirms.
+    ordered.sort(key=lambda value: len(value), reverse=True)
+    page_low = page_text.casefold()
+
+    for value in ordered:
+        if value.casefold() in page_low:
+            return value
+
+    return ""
+
+
+def _looks_mainly_english(text: str) -> bool:
+    low = f" {clean_text(text).casefold()} "
+    if not low:
+        return False
+
+    english_markers = [
+        " please ",
+        " the ",
+        " and ",
+        " is ",
+        " are ",
+        " should ",
+        " section ",
+        " building ",
+        " floor ",
+        " drawing ",
+        " document ",
+        " different ",
+        " described ",
+        " maximum ",
+    ]
+    latvian_markers = [
+        " lūdzu ",
+        " norādīts ",
+        " dokumentā ",
+        " rasējumā ",
+        " sadaļā ",
+        " nepieciešams ",
+        " precizēt ",
+        " neatbilst ",
+        " salīdzinot ",
+        " augstums ",
+    ]
+
+    en_score = sum(marker in low for marker in english_markers)
+    lv_score = sum(marker in low for marker in latvian_markers)
+    return en_score >= 2 and en_score > lv_score
+
+
+def refine_manual_import_candidate(
+    client: Any,
+    model: str,
+    candidate: Dict[str, Any],
+    selected_pdf_items: List[Dict[str, Any]],
+) -> Tuple[Dict[str, Any], str]:
+    """Pārvērš importa piezīmi latviski un piesaista precīzam PDF tekstam.
+
+    Vispirms izmanto deterministisku burtiska teksta meklēšanu. Ja enkurs nav
+    atrodams vai komentārs ir angliski, AI saņem tikai konkrētās lapas tekstu
+    un atgriež īsu komentāru latviešu valodā un burtisku target_text.
+    """
+    refined = dict(candidate)
+    source_rel = clean_text(
+        refined.get("source_pdf_rel_path")
+        or refined.get("source_pdf")
+    )
+    pdf_item = next(
+        (
+            item
+            for item in selected_pdf_items
+            if _canonical_drive_rel_path(
+                clean_text(item.get("rel_path") or item.get("name"))
+            ) == _canonical_drive_rel_path(source_rel)
+        ),
+        None,
+    )
+    if pdf_item is None:
+        return refined, "Importa kandidātam neizdevās atrast sasaistīto PDF."
+
+    page_text = _manual_candidate_page_text(
+        pdf_item,
+        refined.get("target_page"),
+    )
+    exact_anchor = _manual_exact_anchor_from_page(
+        page_text,
+        [
+            clean_text(refined.get("target_text")),
+            clean_text(refined.get("problem")),
+            clean_text(refined.get("evidence")),
+            clean_text(refined.get("designer_note")),
+            clean_text(refined.get("comparison_text")),
+        ],
+    )
+
+    if exact_anchor:
+        refined["target_text"] = exact_anchor
+        refined["markup_type"] = "highlight"
+        refined["placement_confidence"] = "exact"
+
+    comment = clean_text(
+        refined.get("designer_note")
+        or refined.get("comment_text")
+    )
+    needs_ai = (
+        not exact_anchor
+        or _looks_mainly_english(comment)
+        or not comment
+    )
+    if not needs_ai:
+        return refined, ""
+
+    system_prompt = (
+        "Tu esi būvprojekta audita redaktors. "
+        "Atbildi tikai ar derīgu JSON objektu. "
+        "Komentāram obligāti jābūt latviešu valodā. "
+        "target_text obligāti jābūt īsam, burtiski un precīzi atrodamam "
+        "dotās PDF lapas tekstā. Neizdomā tekstu. "
+        "Ja precīzu enkuru nevar atrast, target_text atstāj tukšu."
+    )
+    user_payload = {
+        "source_file": clean_text(refined.get("source_pdf")),
+        "target_page": clean_text(refined.get("target_page")),
+        "target_area": clean_text(refined.get("target_area")),
+        "problem": clean_text(refined.get("problem")),
+        "current_comment": comment,
+        "current_target_text": clean_text(refined.get("target_text")),
+        "comparison_files": clean_text(refined.get("comparison_files")),
+        "comparison_text": clean_text(refined.get("comparison_text")),
+        "evidence": clean_text(refined.get("evidence")),
+        "pdf_page_text": page_text[:10000],
+        "required_output": {
+            "comment_text_lv": (
+                "īss, pašpietiekams komentārs projektētājam latviešu valodā"
+            ),
+            "target_text": (
+                "īss burtisks citāts no pdf_page_text vai tukša virkne"
+            ),
+        },
+    }
+
+    try:
+        response = client.chat.completions.create(
+            model=model,
+            temperature=0,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {
+                    "role": "user",
+                    "content": json.dumps(
+                        user_payload,
+                        ensure_ascii=False,
+                    ),
+                },
+            ],
+        )
+        raw = clean_text(response.choices[0].message.content)
+        data = json.loads(strip_json_fences(raw))
+
+        comment_lv = clean_text(data.get("comment_text_lv"))
+        ai_anchor = clean_text(data.get("target_text"))
+
+        if comment_lv:
+            refined["designer_note"] = comment_lv
+            refined["comment_text"] = comment_lv
+
+        # AI enkuru pieņem tikai tad, ja tas patiešām ir lapā.
+        if ai_anchor and ai_anchor.casefold() in page_text.casefold():
+            refined["target_text"] = ai_anchor
+            refined["markup_type"] = "highlight"
+            refined["placement_confidence"] = "exact"
+        elif not exact_anchor:
+            refined["target_text"] = "MANUAL_PLACEMENT_REQUIRED"
+            refined["markup_type"] = "page_note"
+            refined["placement_confidence"] = "manual_needed"
+
+        return refined, ""
+    except Exception as exc:
+        if not exact_anchor:
+            refined["target_text"] = "MANUAL_PLACEMENT_REQUIRED"
+            refined["markup_type"] = "page_note"
+            refined["placement_confidence"] = "manual_needed"
+        return refined, f"Importa piezīmes precizēšana neizdevās: {exc}"
+
+
+def refine_manual_import_candidates(
+    client: Any,
+    model: str,
+    candidates: List[Dict[str, Any]],
+    selected_pdf_items: List[Dict[str, Any]],
+) -> Tuple[List[Dict[str, Any]], List[str]]:
+    refined_candidates: List[Dict[str, Any]] = []
+    warnings: List[str] = []
+
+    for candidate in candidates:
+        refined, warning = refine_manual_import_candidate(
+            client,
+            model,
+            candidate,
+            selected_pdf_items,
+        )
+        refined_candidates.append(refined)
+        if warning:
+            number = clean_text(candidate.get("manual_note_number"))
+            warnings.append(
+                f"{number + ': ' if number else ''}{warning}"
+            )
+
+    return refined_candidates, warnings
+
+
 def manual_import_rows_to_candidates(
     dataframe: pd.DataFrame,
     selected_pdf_items: List[Dict[str, Any]],
@@ -3958,11 +4223,28 @@ def main():
                 ),
                 selected_pdf_items,
             )
+
+            if manual_candidates:
+                status = st.empty()
+                status.write(
+                    "Precizē manuālā Excel piezīmes: tulko latviski un "
+                    "meklē precīzus teksta enkurus PDF lapās."
+                )
+                refined_manual, refine_warnings = refine_manual_import_candidates(
+                    client,
+                    model,
+                    manual_candidates,
+                    selected_pdf_items,
+                )
+                manual_candidates = refined_manual
+                manual_warnings.extend(refine_warnings)
+
             all_candidates.extend(manual_candidates)
             st.session_state.manual_import_warnings = manual_warnings
 
             progress = st.progress(0)
-            status = st.empty()
+            if "status" not in locals():
+                status = st.empty()
             pdf_progress_placeholder = st.empty()
 
             selected_family_set = set(selected_families)
