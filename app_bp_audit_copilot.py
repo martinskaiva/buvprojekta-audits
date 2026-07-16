@@ -43,7 +43,7 @@ except Exception:
     HttpError = Exception
 
 
-APP_VERSION = "v0.7.7"
+APP_VERSION = "v0.7.8"
 APP_TITLE = f"BP AI Audit Copilot {APP_VERSION}"
 
 REQUIRED_EXPORT_COLUMNS = [
@@ -2782,8 +2782,9 @@ def _manual_pdf_document_code_key(value: Any) -> str:
     raw = re.sub(r"\s*\(\d+\)\s*$", "", raw)
 
     patterns = [
-        r"\b(RWC\d+-\d+(?:_[A-Z0-9]+){5}_\d{4,6})\b",
-        r"\b(RWC\d+-\d+(?:_[A-Z0-9]+){5}_(?:RA|SP|MS|TD)_?\d{4,6})\b",
+        # Pēc ciparu koda drīkst sekot "_" un aprakstošais faila nosaukums.
+        r"\b(RWC\d+-\d+(?:_[A-Z0-9]+){5}_\d{4,6})(?=_|$)",
+        r"\b(RWC\d+-\d+(?:_[A-Z0-9]+){5}_(?:RA|SP|MS|TD)_?\d{4,6})(?=_|$)",
     ]
 
     for pattern in patterns:
@@ -2797,7 +2798,7 @@ def _manual_pdf_document_code_key(value: Any) -> str:
 
     key = _manual_pdf_name_key(value)
     match = re.search(
-        r"\b(rwc\d+_\d+(?:_[a-z0-9]+){5}_\d{4,6})\b",
+        r"\b(rwc\d+_\d+(?:_[a-z0-9]+){5}_\d{4,6})(?=_|$)",
         key,
         flags=re.I,
     )
@@ -2908,10 +2909,24 @@ def manual_import_rows_to_candidates(
             available = "; ".join(selected_names[:6])
             if len(selected_names) > 6:
                 available += f"; … vēl {len(selected_names) - 6}"
+            requested_code = _manual_pdf_document_code_key(
+                clean_text(row.get("source_file"))
+            )
+            selected_codes = [
+                _manual_pdf_document_code_key(item.get("name"))
+                for item in selected_pdf_items
+                if _manual_pdf_document_code_key(item.get("name"))
+            ]
+            code_info = ""
+            if requested_code or selected_codes:
+                code_info = (
+                    f" Excel dokumenta kods: {requested_code or 'nav'}; "
+                    f"izvēlēto PDF kodi: {', '.join(selected_codes) or 'nav'}."
+                )
             warnings.append(
                 f"{number}: source_file “{clean_text(row.get('source_file'))}” "
                 "neatbilst nevienam no šajā auditā izvēlētajiem PDF. "
-                f"Izvēlētie faili: {available or 'nav'}."
+                f"Izvēlētie faili: {available or 'nav'}.{code_info}"
             )
             continue
 
