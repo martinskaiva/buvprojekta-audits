@@ -43,7 +43,7 @@ except Exception:
     HttpError = Exception
 
 
-APP_VERSION = "v0.7.5"
+APP_VERSION = "v0.7.6"
 APP_TITLE = f"BP AI Audit Copilot {APP_VERSION}"
 
 REQUIRED_EXPORT_COLUMNS = [
@@ -2748,10 +2748,57 @@ def read_manual_import_excel(
         ]
 
 
+def _manual_pdf_name_key(value: Any) -> str:
+    """Normalizē PDF nosaukumu manuālā Excel sasaistīšanai.
+
+    Google Drive, pārlūks un ChatGPT lejupielādes vienam failam var pievienot
+    tehniskus sufiksus, piemēram, ``(1)`` vai ``(2)``. Tie nav dokumenta
+    identitātes daļa un sasaistē tiek ignorēti.
+    """
+    value = clean_text(value).replace("\\", "/")
+    name = value.rsplit("/", 1)[-1]
+    name = re.sub(r"\.pdf$", "", name, flags=re.I)
+    name = re.sub(r"\s*\(\d+\)\s*$", "", name)
+    name = re.sub(r"\s*-\s*copy\s*$", "", name, flags=re.I)
+    name = name.casefold()
+    name = re.sub(r"[\s\-–—]+", "_", name)
+    name = re.sub(r"[^0-9a-zāčēģīķļņšūž._]+", "", name)
+    name = re.sub(r"_+", "_", name).strip("_")
+    return name
+
+
+def _manual_pdf_document_code_key(value: Any) -> str:
+    """Izvelk stabilo būvprojekta dokumenta koda daļu no faila nosaukuma."""
+    key = _manual_pdf_name_key(value)
+    match = re.search(
+        r"(rwc\d+(?:_\d+)?(?:_[a-z0-9]+){5,})",
+        key,
+        flags=re.I,
+    )
+    if match:
+        return match.group(1).casefold()
+
+    # Fallback: daļa līdz pirmajam aprakstošajam nosaukumam pēc ciparu koda.
+    match = re.search(
+        r"(.+?_(?:ra|sp|ms|td)_\d{4,6})",
+        key,
+        flags=re.I,
+    )
+    return match.group(1).casefold() if match else ""
+
+
 def match_manual_source_pdf(
     source_file: str,
     selected_pdf_items: List[Dict[str, Any]],
 ) -> Optional[Dict[str, Any]]:
+    """Atrod Excel source_file atbilstošo auditā izvēlēto PDF.
+
+    Prioritāte:
+    1) pilns relatīvais ceļš;
+    2) precīzs faila nosaukums;
+    3) normalizēts nosaukums bez lejupielādes sufiksa ``(1)/(2)``;
+    4) stabilais dokumenta kods.
+    """
     wanted = _canonical_drive_rel_path(source_file)
     if not wanted:
         return None
@@ -2775,17 +2822,48 @@ def match_manual_source_pdf(
     if len(by_name) == 1:
         return by_name[0]
 
+    wanted_key = _manual_pdf_name_key(source_file)
+    by_normalized_name = [
+        item for item in selected_pdf_items
+        if _manual_pdf_name_key(
+            clean_text(item.get("name"))
+        ) == wanted_key
+        or _manual_pdf_name_key(
+            clean_text(item.get("rel_path"))
+        ) == wanted_key
+    ]
+    if len(by_normalized_name) == 1:
+        return by_normalized_name[0]
+
+    wanted_code = _manual_pdf_document_code_key(source_file)
+    if wanted_code:
+        by_document_code = [
+            item for item in selected_pdf_items
+            if _manual_pdf_document_code_key(
+                clean_text(item.get("name"))
+            ) == wanted_code
+            or _manual_pdf_document_code_key(
+                clean_text(item.get("rel_path"))
+            ) == wanted_code
+        ]
+        if len(by_document_code) == 1:
+            return by_document_code[0]
+
     partial = [
         item for item in selected_pdf_items
-        if wanted in _canonical_drive_rel_path(
-            clean_text(item.get("rel_path") or item.get("name"))
+        if (
+            wanted_key
+            and (
+                wanted_key in _manual_pdf_name_key(
+                    clean_text(item.get("rel_path") or item.get("name"))
+                )
+                or _manual_pdf_name_key(
+                    clean_text(item.get("rel_path") or item.get("name"))
+                ) in wanted_key
+            )
         )
-        or _canonical_drive_rel_path(
-            clean_text(item.get("rel_path") or item.get("name"))
-        ) in wanted
     ]
     return partial[0] if len(partial) == 1 else None
-
 
 def manual_import_rows_to_candidates(
     dataframe: pd.DataFrame,
@@ -2805,9 +2883,18 @@ def manual_import_rows_to_candidates(
             selected_pdf_items,
         )
         if matched_pdf is None:
+            selected_names = [
+                clean_text(item.get("name"))
+                for item in selected_pdf_items
+                if clean_text(item.get("name"))
+            ]
+            available = "; ".join(selected_names[:6])
+            if len(selected_names) > 6:
+                available += f"; … vēl {len(selected_names) - 6}"
             warnings.append(
                 f"{number}: source_file “{clean_text(row.get('source_file'))}” "
-                "neatbilst nevienam no šajā auditā izvēlētajiem PDF."
+                "neatbilst nevienam no šajā auditā izvēlētajiem PDF. "
+                f"Izvēlētie faili: {available or 'nav'}."
             )
             continue
 
@@ -3683,6 +3770,44 @@ def main():
             use_container_width=True,
             hide_index=True,
         )
+
+        selected_for_match = st.session_state.get(
+            "selected_pdf_items",
+            [],
+        )
+        if selected_for_match:
+            matched_count = 0
+            unmatched_sources = []
+            for source_value in manual_df["source_file"].tolist():
+                if match_manual_source_pdf(
+                    clean_text(source_value),
+                    selected_for_match,
+                ) is not None:
+                    matched_count += 1
+                else:
+                    unmatched_sources.append(clean_text(source_value))
+
+            if matched_count == len(manual_df):
+                st.success(
+                    f"PDF sasaistes pārbaude: visas {matched_count} Excel rindas "
+                    "atbilst auditā izvēlētajiem PDF."
+                )
+            else:
+                st.warning(
+                    f"PDF sasaistes pārbaude: atbilst {matched_count} no "
+                    f"{len(manual_df)} Excel rindām."
+                )
+                unique_unmatched = list(dict.fromkeys(unmatched_sources))
+                if unique_unmatched:
+                    st.caption(
+                        "Neatpazītie source_file: "
+                        + "; ".join(unique_unmatched[:8])
+                    )
+        else:
+            st.info(
+                "PDF sasaisti varēs pārbaudīt pēc auditējamo PDF izvēles "
+                "un to satura nolasīšanas 3. sadaļā."
+            )
         clear_import_col, _ = st.columns([1, 4])
         with clear_import_col:
             if st.button(
