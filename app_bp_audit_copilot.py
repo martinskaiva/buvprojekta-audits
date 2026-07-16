@@ -43,7 +43,7 @@ except Exception:
     HttpError = Exception
 
 
-APP_VERSION = "v0.7.6"
+APP_VERSION = "v0.7.7"
 APP_TITLE = f"BP AI Audit Copilot {APP_VERSION}"
 
 REQUIRED_EXPORT_COLUMNS = [
@@ -2768,24 +2768,40 @@ def _manual_pdf_name_key(value: Any) -> str:
 
 
 def _manual_pdf_document_code_key(value: Any) -> str:
-    """Izvelk stabilo būvprojekta dokumenta koda daļu no faila nosaukuma."""
+    """Izvelk stabilo dokumenta kodu no PDF faila nosaukuma.
+
+    Piemēram, abi nosaukumi:
+    - RWC2-02_SN_SA_ZZ_ZZ_TD_00001_ExplanatoryNoteEN_Rev.1.pdf
+    - RWC2-02_SN_SA_ZZ_ZZ_TD_00001_ExplanatoryNoteLV_Rev.1.pdf
+
+    tiek sasaistīti ar vienu kodu:
+    RWC2-02_SN_SA_ZZ_ZZ_TD_00001
+    """
+    raw = clean_text(value).replace("\\", "/").rsplit("/", 1)[-1]
+    raw = re.sub(r"\.pdf$", "", raw, flags=re.I)
+    raw = re.sub(r"\s*\(\d+\)\s*$", "", raw)
+
+    patterns = [
+        r"\b(RWC\d+-\d+(?:_[A-Z0-9]+){5}_\d{4,6})\b",
+        r"\b(RWC\d+-\d+(?:_[A-Z0-9]+){5}_(?:RA|SP|MS|TD)_?\d{4,6})\b",
+    ]
+
+    for pattern in patterns:
+        match = re.search(pattern, raw, flags=re.I)
+        if match:
+            return re.sub(
+                r"[\s\-–—]+",
+                "_",
+                match.group(1).casefold(),
+            )
+
     key = _manual_pdf_name_key(value)
     match = re.search(
-        r"(rwc\d+(?:_\d+)?(?:_[a-z0-9]+){5,})",
-        key,
-        flags=re.I,
-    )
-    if match:
-        return match.group(1).casefold()
-
-    # Fallback: daļa līdz pirmajam aprakstošajam nosaukumam pēc ciparu koda.
-    match = re.search(
-        r"(.+?_(?:ra|sp|ms|td)_\d{4,6})",
+        r"\b(rwc\d+_\d+(?:_[a-z0-9]+){5}_\d{4,6})\b",
         key,
         flags=re.I,
     )
     return match.group(1).casefold() if match else ""
-
 
 def match_manual_source_pdf(
     source_file: str,
@@ -2878,8 +2894,9 @@ def manual_import_rows_to_candidates(
 
     for row_index, row in dataframe.iterrows():
         number = clean_text(row.get("note_number")) or f"IMP-{row_index + 1}"
+        requested_source_file = clean_text(row.get("source_file"))
         matched_pdf = match_manual_source_pdf(
-            clean_text(row.get("source_file")),
+            requested_source_file,
             selected_pdf_items,
         )
         if matched_pdf is None:
@@ -2947,6 +2964,7 @@ def manual_import_rows_to_candidates(
             "notes_for_ai": clean_text(row.get("notes_for_ai")),
             "source_pdf": source_name,
             "source_pdf_rel_path": source_rel_path,
+            "manual_requested_source_file": requested_source_file,
             "include_default": True,
             "reject_default": False,
         }
@@ -4182,6 +4200,19 @@ def main():
                 source_pdf_rel = clean_text(c.get("source_pdf_rel_path")) or source_pdf
                 st.markdown(f"**PDF:** {source_pdf_rel}")
                 if clean_text(c.get("candidate_source")) == "manual_excel_import":
+                    requested_source = clean_text(
+                        c.get("manual_requested_source_file")
+                    )
+                    mapped_note = ""
+                    if (
+                        requested_source
+                        and _manual_pdf_name_key(requested_source)
+                        != _manual_pdf_name_key(source_pdf_rel)
+                    ):
+                        mapped_note = (
+                            f" · Excel fails: {requested_source}"
+                            f" → auditā izmantots: {source_pdf_rel}"
+                        )
                     st.info(
                         "Avots: manuāli augšupielādēts piezīmju Excel"
                         + (
@@ -4189,6 +4220,7 @@ def main():
                             if clean_text(c.get("manual_note_number"))
                             else ""
                         )
+                        + mapped_note
                     )
                 st.markdown(f"**Ģimene:** `{family}`")
                 st.markdown(f"**Kur:** {clean_text(c.get('where') or c.get('target_area'))}")
