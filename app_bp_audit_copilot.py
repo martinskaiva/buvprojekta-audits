@@ -43,7 +43,7 @@ except Exception:
     HttpError = Exception
 
 
-APP_VERSION = "v0.7.4"
+APP_VERSION = "v0.7.5"
 APP_TITLE = f"BP AI Audit Copilot {APP_VERSION}"
 
 REQUIRED_EXPORT_COLUMNS = [
@@ -3697,6 +3697,47 @@ def main():
                 st.session_state.manual_import_warnings = []
                 st.session_state.manual_import_file_name = ""
                 st.rerun()
+
+        st.markdown("### Nākamie soļi")
+        kb_ready_for_import = not st.session_state.get(
+            "index_df",
+            pd.DataFrame(),
+        ).empty
+        pdfs_ready_for_import = bool(
+            st.session_state.get("selected_pdf_items", [])
+        )
+
+        step1_icon = "✅" if kb_ready_for_import else "⬜"
+        step2_icon = "✅" if pdfs_ready_for_import else "⬜"
+        step3_icon = "✅"
+
+        st.markdown(
+            f"{step1_icon} **1. Zināšanu bāze nolasīta**  \\n"
+            f"{step2_icon} **2. Auditējamie PDF izvēlēti un to saturs nolasīts**  \\n"
+            f"{step3_icon} **3. Papildu piezīmju Excel nolasīts**"
+        )
+
+        if not kb_ready_for_import:
+            st.warning(
+                "Atgriezies 1. sadaļā un nospied “Nolasīt zināšanu bāzi”."
+            )
+        if not pdfs_ready_for_import:
+            st.warning(
+                "Atgriezies 3. sadaļā, izvēlies PDF, apstiprini izvēli un "
+                "nospied “Nolasīt izvēlēto PDF saturu”."
+            )
+
+        if kb_ready_for_import and pdfs_ready_for_import:
+            st.success(
+                "Viss ir sagatavots. Ritini uz 4. sadaļu un nospied "
+                "“Analizēt izvēlētos PDF”. Importētās piezīmes tiks "
+                "pievienotas AI kandidātiem un parādīsies 5. sadaļā pārskatīšanai."
+            )
+        else:
+            st.info(
+                "Importētais Excel paliks šajā Streamlit sesijā. "
+                "Pēc trūkstošo soļu izpildes atgriezies 4. sadaļā."
+            )
     else:
         st.caption("Papildu piezīmju Excel nav ielādēts.")
 
@@ -3705,7 +3746,34 @@ def main():
     selected_pdf_items = st.session_state.get("selected_pdf_items", [])
     ready = bool(selected_pdf_items) and not st.session_state.index_df.empty
     if not ready:
-        st.caption("Vispirms jānolasa vismaz viens PDF un audit_examples_index.")
+        missing_steps = []
+        if st.session_state.index_df.empty:
+            missing_steps.append(
+                "1. sadaļā jānospiež “Nolasīt zināšanu bāzi”"
+            )
+        if not selected_pdf_items:
+            missing_steps.append(
+                "3. sadaļā jāizvēlas PDF un jānospiež "
+                "“Nolasīt izvēlēto PDF saturu”"
+            )
+
+        st.warning(
+            "AI analīzi vēl nevar palaist. Trūkst: "
+            + "; ".join(missing_steps)
+            + "."
+        )
+
+        manual_count = len(
+            st.session_state.get(
+                "manual_import_df",
+                pd.DataFrame(),
+            )
+        )
+        if manual_count:
+            st.info(
+                f"Papildu Excel ir nolasīts ({manual_count} piezīmes), "
+                "bet vispirms jāizpilda iepriekš norādītie soļi."
+            )
     else:
         st.caption(f"Analīzei sagatavoti PDF: {len(selected_pdf_items)}")
         analyze_col, _ = st.columns([1, 4])
