@@ -44,7 +44,7 @@ except Exception:
     HttpError = Exception
 
 
-APP_VERSION = "v0.9.7"
+APP_VERSION = "v0.9.8"
 APP_TITLE = f"BP AI Audit Copilot {APP_VERSION}"
 
 REQUIRED_EXPORT_COLUMNS = [
@@ -2731,6 +2731,59 @@ def _candidate_has_explicit_correction(candidate: Dict[str, Any]) -> bool:
     return len(_quoted_values(text)) >= 2
 
 
+
+def language_candidate_has_real_correction(
+    candidate: Dict[str, Any],
+) -> bool:
+    """Atmet gadījumus, kuros 'kļūda' un 'labojums' faktiski ir vienādi."""
+    text = " ".join([
+        clean_text(candidate.get("problem")),
+        clean_text(candidate.get("designer_note")),
+        clean_text(candidate.get("comment_text")),
+        clean_text(candidate.get("evidence")),
+    ])
+
+    patterns = [
+        (
+            r'["“”\']([^"“”\']{1,120})["“”\']\s*'
+            r'(?:→|->|=>)\s*'
+            r'["“”\']([^"“”\']{1,120})["“”\']'
+        ),
+        (
+            r'\b([A-Za-zĀ-ž0-9./+\-]{2,80})\s*'
+            r'(?:→|->|=>)\s*'
+            r'([A-Za-zĀ-ž0-9./+\-]{2,80})\b'
+        ),
+    ]
+
+    pairs: List[Tuple[str, str]] = []
+    for pattern in patterns:
+        for match in re.finditer(pattern, text):
+            pairs.append((
+                clean_text(match.group(1)),
+                clean_text(match.group(2)),
+            ))
+
+    if not pairs:
+        return True
+
+    for wrong, correct in pairs:
+        wrong_key = re.sub(
+            r"[\s'\"“”.,;:]+",
+            "",
+            wrong.casefold(),
+        )
+        correct_key = re.sub(
+            r"[\s'\"“”.,;:]+",
+            "",
+            correct.casefold(),
+        )
+        if wrong_key and correct_key and wrong_key != correct_key:
+            return True
+
+    return False
+
+
 def is_style_only_language_candidate(candidate: Dict[str, Any]) -> bool:
     """Atmet stila ieteikumus, saglabājot konkrētas vārdu un galotņu kļūdas."""
     if clean_text(candidate.get("family")) != "A_text_language":
@@ -2912,6 +2965,8 @@ def call_ai_for_grammar_chunks(
                     continue
                 if is_style_only_language_candidate(candidate):
                     continue
+                if not language_candidate_has_real_correction(candidate):
+                    continue
                 if (
                     clean_text(candidate.get("candidate_source"))
                     == "sa_technical_sections"
@@ -2975,6 +3030,9 @@ SA_ALLOWED_EVIDENCE_TYPES = {
     "incomplete_text",
     "explicit_value_error",
     "explicit_normative_conflict",
+    "review_missing_detail",
+    "review_cross_discipline_link",
+    "review_specification_coverage",
 }
 
 SA_SPECULATIVE_PHRASES = [
@@ -3033,11 +3091,11 @@ def _sa_candidate_text(candidate: Dict[str, Any]) -> str:
     ]).casefold()
 
 
-def sa_technical_candidate_passes_evidence_gate(
+def sa_technical_candidate_evidence_level(
     candidate: Dict[str, Any],
     source_text: str,
-) -> Tuple[bool, str]:
-    """Atļauj tikai konkrēti pierādāmas SA tehniskās piezīmes."""
+) -> Tuple[str, str]:
+    """Klasificē SA tehnisko kandidātu kā confirmed, review vai reject."""
     evidence_type = clean_text(
         candidate.get("evidence_type")
     ).casefold()
@@ -3048,28 +3106,31 @@ def sa_technical_candidate_passes_evidence_gate(
     combined = _sa_candidate_text(candidate)
 
     if evidence_type not in SA_ALLOWED_EVIDENCE_TYPES:
-        return False, "nav atļauta evidence_type"
-
-    if any(phrase in combined for phrase in SA_SPECULATIVE_PHRASES):
-        return False, "spekulatīvs formulējums"
-
-    if any(
-        phrase in combined
-        for phrase in SA_FORBIDDEN_MISSING_CONTENT_PHRASES
-    ):
-        return False, "vispārīgs detalizācijas pieņēmums"
+        return "reject", "nav atļauta evidence_type"
 
     if not target_text or target_text == "MANUAL_PLACEMENT_REQUIRED":
-        return False, "nav precīza target_text"
-
+        return "reject", "nav precīza target_text"
     if not _sa_value_is_in_text(target_text, source_text):
-        return False, "target_text nav dokumenta blokā"
-
+        return "reject", "target_text nav dokumenta blokā"
     if not evidence_1 or not _sa_value_is_in_text(
         evidence_1,
         source_text,
     ):
-        return False, "evidence_1 nav dokumenta blokā"
+        return "reject", "evidence_1 nav dokumenta blokā"
+
+    confirmed_types = {
+        "internal_conflict",
+        "placeholder",
+        "broken_reference",
+        "incomplete_text",
+        "explicit_value_error",
+        "explicit_normative_conflict",
+    }
+    review_types = {
+        "review_missing_detail",
+        "review_cross_discipline_link",
+        "review_specification_coverage",
+    }
 
     if evidence_type in {
         "internal_conflict",
@@ -3077,9 +3138,9 @@ def sa_technical_candidate_passes_evidence_gate(
         "explicit_normative_conflict",
     }:
         if not evidence_2:
-            return False, "pretrunai trūkst evidence_2"
+            return "reject", "pretrunai trūkst evidence_2"
         if not _sa_value_is_in_text(evidence_2, source_text):
-            return False, "evidence_2 nav dokumenta blokā"
+            return "reject", "evidence_2 nav dokumenta blokā"
 
     if evidence_type == "placeholder":
         placeholder_markers = [
@@ -3096,7 +3157,7 @@ def sa_technical_candidate_passes_evidence_gate(
             marker in evidence_1.casefold()
             for marker in placeholder_markers
         ):
-            return False, "nav identificējams placeholder"
+            return "reject", "nav identificējams placeholder"
 
     if evidence_type == "broken_reference":
         reference_markers = [
@@ -3112,22 +3173,54 @@ def sa_technical_candidate_passes_evidence_gate(
             marker in evidence_1.casefold()
             for marker in reference_markers
         ):
-            return False, "nav konkrētas atsauces"
+            return "reject", "nav konkrētas atsauces"
 
-    if family == "N_completeness_or_missing_content":
-        if evidence_type not in {
-            "placeholder",
-            "broken_reference",
-            "incomplete_text",
-        }:
-            return False, "N ģimenei nav objektīvi pārbaudāms trūkums"
-
-    # Viena dokumenta tehniskajā blokā nedrīkst ģenerēt starpdokumentu piezīmi.
     if family == "J_cross_document_traceability":
-        return False, "J ģimene atļauta tikai cross-document posmā"
+        return "reject", "J ģimene atļauta tikai cross-document posmā"
 
-    return True, ""
+    if evidence_type in confirmed_types:
+        if any(
+            phrase in combined
+            for phrase in SA_SPECULATIVE_PHRASES
+        ):
+            return "reject", "drošas kļūdas formulējums ir spekulatīvs"
+        return "confirmed", ""
 
+    if evidence_type in review_types:
+        allowed_review_families = {
+            "G_material_type_model",
+            "H_quantity_position",
+            "I_specification_coverage",
+            "L_fire_safety_or_regulatory_logic",
+            "M_scope_or_discipline_boundary",
+            "N_completeness_or_missing_content",
+        }
+        if family not in allowed_review_families:
+            return "reject", "review tips neatbilst ģimenei"
+
+        # Review kandidātam jānosauc konkrēts risinājums vai objekts.
+        object_tokens = re.findall(
+            r"\b[A-Za-zĀ-ž0-9][A-Za-zĀ-ž0-9\-_/]{3,}\b",
+            target_text,
+        )
+        if not object_tokens:
+            return "reject", "review kandidāts ir pārāk vispārīgs"
+
+        return "review", ""
+
+    return "reject", "nezināms pierādījumu līmenis"
+
+
+def sa_technical_candidate_passes_evidence_gate(
+    candidate: Dict[str, Any],
+    source_text: str,
+) -> Tuple[bool, str]:
+    """Atpakaļsaderīgs wrapper."""
+    level, reason = sa_technical_candidate_evidence_level(
+        candidate,
+        source_text,
+    )
+    return level != "reject", reason
 
 def split_sa_technical_chunks(
     pdf_item: Dict[str, Any],
@@ -3193,8 +3286,8 @@ def call_ai_for_sa_technical_chunks(
     negative_rules: List[str],
     max_chunks: int = 10,
     chunk_chars: int = 6500,
-    max_candidates_per_chunk: int = 2,
-    max_total_candidates: int = 12,
+    max_candidates_per_chunk: int = 3,
+    max_total_candidates: int = 18,
     progress_callback: Optional[Any] = None,
 ) -> Tuple[List[Dict[str, Any]], List[str]]:
     """Meklē SA skaidrojošajā aprakstā tehniskas un saturiskas nepilnības."""
@@ -3216,23 +3309,20 @@ def call_ai_for_sa_technical_chunks(
     seen = set()
 
     system = (
-        "Tu esi konservatīvs SA skaidrojošā apraksta tehniskais auditors. "
-        "Piezīmi atgriez tikai tad, ja problēma ir tieši pierādāma dotajā tekstā. "
-        "Atļautie gadījumi: iekšēja pretruna ar diviem citātiem; placeholder; "
-        "salauzta vai neeksistējoša atsauce; fiziski nepabeigts teksts; "
-        "divu konkrētu vērtību nesakritība; normatīva pretruna tikai tad, ja "
-        "gan prasība, gan konflikta teksts burtiski atrodas dotajā blokā. "
-        "NEKAD neizdomā, kam dokumentā būtu jābūt. "
-        "NEZIŅO, ka apraksts nav pietiekami detalizēts, nav pilnīgs, nav "
-        "sasaistīts ar citām disciplīnām vai būtu jāpapildina ar specifikāciju, "
-        "ja tekstā nav konkrēta pierādījuma. "
+        "Tu esi SA skaidrojošā apraksta tehniskais auditors. "
+        "Atgriez divu veidu kandidātus. "
+        "CONFIRMED: tieši pierādāma neatbilstība — iekšēja pretruna, "
+        "placeholder, salauzta atsauce, nepabeigts teksts, divu vērtību "
+        "nesakritība vai normatīva pretruna, ja abi pierādījumi ir blokā. "
+        "REVIEW: konkrēts tehnisks jautājums cilvēka pārbaudei, piemēram, "
+        "iespējams trūkstošs konkrēta risinājuma apraksts, specifikācijas "
+        "segums vai disciplīnu sasaiste. REVIEW nav droša kļūda un pēc "
+        "noklusējuma netiks eksportēta. "
+        "NEKAD neizdomā normatīvu prasības vai tehniskus faktus. "
         "NEZIŅO par stilu, valodu, datumiem vai revīzijām. "
-        "Vienā SA blokā neveido J_cross_document_traceability piezīmes; tās "
-        "drīkst rasties tikai atsevišķajā vairāku faktiski ielādētu dokumentu "
-        "salīdzināšanas posmā. "
-        "target_text, evidence_1 un vajadzības gadījumā evidence_2 ir īsi "
-        "burtiski citāti no document_block. "
-        "Ja pierādījuma nav, neatgriez kandidātu. "
+        "Vienā SA blokā neveido J_cross_document_traceability piezīmes. "
+        "Katram kandidātam target_text un evidence_1 ir īsi burtiski citāti "
+        "no document_block. CONFIRMED pretrunai norādi arī evidence_2. "
         "Komentāram jābūt latviešu valodā. Atbildi tikai derīgā JSON."
     )
 
@@ -3257,8 +3347,9 @@ def call_ai_for_sa_technical_chunks(
             "pdf_file": pdf_name,
             "pages_in_block": pages,
             "task": (
-                "Atrodi būtiskas SA tehniskās un saturiskās nepilnības. "
-                "Valodas, stila un datumu piezīmes neatgriez."
+                "Atrodi drošas tehniskās neatbilstības un atsevišķi "
+                "pamatotus REVIEW jautājumus. Valodas, stila un datumu "
+                "piezīmes neatgriez."
             ),
             "allowed_families": SA_TECHNICAL_FAMILIES,
             "max_candidates_this_block": chunk_limit,
@@ -3284,7 +3375,9 @@ def call_ai_for_sa_technical_chunks(
                     "evidence_type": (
                         "internal_conflict|placeholder|broken_reference|"
                         "incomplete_text|explicit_value_error|"
-                        "explicit_normative_conflict"
+                        "explicit_normative_conflict|review_missing_detail|"
+                        "review_cross_discipline_link|"
+                        "review_specification_coverage"
                     ),
                     "evidence_1": (
                         "pirmais īsais burtiskais citāts no document_block"
@@ -3355,16 +3448,27 @@ def call_ai_for_sa_technical_chunks(
                     raw.get("evidence_2")
                 )
 
-                passes_gate, gate_reason = (
-                    sa_technical_candidate_passes_evidence_gate(
+                evidence_level, gate_reason = (
+                    sa_technical_candidate_evidence_level(
                         candidate,
                         chunk_text,
                     )
                 )
-                if not passes_gate:
+                if evidence_level == "reject":
                     continue
                 if candidate_is_too_vague(candidate):
                     continue
+
+                candidate["evidence_level"] = evidence_level
+                candidate["technical_review_question"] = (
+                    evidence_level == "review"
+                )
+                candidate["include_default"] = (
+                    evidence_level == "confirmed"
+                )
+                if evidence_level == "review":
+                    candidate["status"] = "review_question"
+                    candidate["severity"] = "low"
 
                 key = (
                     family,
@@ -4840,6 +4944,8 @@ def candidate_quality_score(candidate: Dict[str, Any]) -> float:
         score += 80.0
     elif source == "sa_technical_sections":
         score += 35.0
+        if candidate.get("technical_review_question"):
+            score -= 20.0
 
     placement = clean_text(candidate.get("placement_confidence")).casefold()
     markup = clean_text(candidate.get("markup_type")).casefold()
@@ -4957,11 +5063,19 @@ def limit_candidates_per_pdf(
         ]
 
         if rows and is_sa_explanatory_candidate(rows[0]):
-            technical = [
+            confirmed_technical = [
                 row
                 for row in ordinary
-                if clean_text(row.get("family"))
-                not in {"A_text_language", "C_dates_versions"}
+                if (
+                    clean_text(row.get("family"))
+                    not in {"A_text_language", "C_dates_versions"}
+                    and not row.get("technical_review_question")
+                )
+            ]
+            review_technical = [
+                row
+                for row in ordinary
+                if row.get("technical_review_question")
             ]
             language = [
                 row
@@ -4969,7 +5083,14 @@ def limit_candidates_per_pdf(
                 if clean_text(row.get("family")) == "A_text_language"
             ]
 
-            technical.sort(
+            confirmed_technical.sort(
+                key=lambda row: (
+                    candidate_quality_score(row),
+                    clean_text(row.get("target_page")),
+                ),
+                reverse=True,
+            )
+            review_technical.sort(
                 key=lambda row: (
                     candidate_quality_score(row),
                     clean_text(row.get("target_page")),
@@ -4984,13 +5105,13 @@ def limit_candidates_per_pdf(
                 reverse=True,
             )
 
-            # SA skaidrojošajā aprakstā tehniskais saturs netiek izspiests
-            # ar valodas piezīmēm. Valodas piezīmēm ir atsevišķs limits 12.
-            technical_limit = 12
+            confirmed_limit = 8
+            review_limit = 10
             language_limit = 12
             selected = (
                 protected
-                + technical[:technical_limit]
+                + confirmed_technical[:confirmed_limit]
+                + review_technical[:review_limit]
                 + language[:language_limit]
             )
         else:
@@ -6200,8 +6321,8 @@ def main():
                                 negative_rules=negative_rules,
                                 max_chunks=10,
                                 chunk_chars=6500,
-                                max_candidates_per_chunk=2,
-                                max_total_candidates=12,
+                                max_candidates_per_chunk=3,
+                                max_total_candidates=18,
                                 progress_callback=(
                                     sa_technical_progress_callback
                                 ),
@@ -6418,6 +6539,14 @@ def main():
                     continue
                 if is_style_only_language_candidate(candidate):
                     continue
+                if (
+                    clean_text(candidate.get("family"))
+                    == "A_text_language"
+                    and not language_candidate_has_real_correction(
+                        candidate
+                    )
+                ):
+                    continue
                 normalized_target = re.sub(
                     r"\s+", " ", clean_text(candidate.get("target_text")).casefold()
                 ).strip(" ,.;:")
@@ -6476,9 +6605,10 @@ def main():
                 f"{audit_budget['grammar_max_chunks']} bloki / "
                 f"{audit_budget['grammar_total']} kandidāti. "
                 "SA skaidrojošam aprakstam: tehniskās ģimenes vispirms, "
-                "tehniskajām piezīmēm obligāts burtisks pierādījums, "
-                "C_dates_versions netiek palaista, valodas piezīmes beigās "
-                "ar limitu 12. "
+                "drošās tehniskās piezīmes un pārbaudāmie tehniskie "
+                "jautājumi tiek rādīti pirms valodas piezīmēm; review "
+                "jautājumi pēc noklusējuma netiek eksportēti, "
+                "C_dates_versions netiek palaista, valodas limits ir 12. "
                 "Citu ģimeņu parastais limits: "
                 f"{audit_budget['regular_family_limit']} kandidāti vienā PDF."
             )
@@ -6540,6 +6670,11 @@ def main():
                         + mapped_note
                     )
                 st.markdown(f"**Ģimene:** `{family}`")
+                if c.get("technical_review_question"):
+                    st.warning(
+                        "Pārbaudāms tehniskais jautājums — nav apstiprināta "
+                        "neatbilstība un pēc noklusējuma netiek iekļauts eksportā."
+                    )
                 st.markdown(f"**Kur:** {clean_text(c.get('where') or c.get('target_area'))}")
                 st.markdown(f"**Statuss:** {clean_text(c.get('status'))}")
                 st.markdown("**Problēma:**")
@@ -6555,7 +6690,12 @@ def main():
                 decision = st.radio(
                     "Lēmums par piezīmi",
                     options=["Iekļaut Excel / markup", "Noraidīt"],
-                    index=0,
+                    index=(
+                        1
+                        if c.get("technical_review_question")
+                        or c.get("include_default") is False
+                        else 0
+                    ),
                     horizontal=True,
                     key=f"decision_{audit_run_id}_{candidate_id}",
                 )
