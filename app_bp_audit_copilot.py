@@ -44,7 +44,7 @@ except Exception:
     HttpError = Exception
 
 
-APP_VERSION = "v0.9.2"
+APP_VERSION = "v0.9.4"
 APP_TITLE = f"BP AI Audit Copilot {APP_VERSION}"
 
 REQUIRED_EXPORT_COLUMNS = [
@@ -2657,6 +2657,130 @@ def detect_unit_case_candidates(pdf_item: Dict[str, Any]) -> List[Dict[str, Any]
     return out
 
 
+
+STYLE_ONLY_ISSUE_TYPES = {
+    "style",
+    "stylistic_issue",
+    "stylistic_improvement",
+    "wording",
+    "wording_improvement",
+    "awkward_phrase",
+    "clarity",
+    "clarity_improvement",
+    "readability",
+    "sentence_rewrite",
+    "sentence_structure",
+    "formal_style",
+    "editorial_preference",
+    "terminology_preference",
+}
+
+STYLE_ONLY_PHRASES = [
+    "ieteicams pārfrāzēt",
+    "varētu pārfrāzēt",
+    "formulējumu varētu",
+    "formulējumu vajadzētu",
+    "padarīt skaidrāku",
+    "padarīt saprotamāku",
+    "uzlabot formulējumu",
+    "uzlabot stilu",
+    "stilistiski",
+    "labāk skanētu",
+    "precizēt formulējumu",
+    "ieteicams pārstrukturēt",
+    "varētu izteikt",
+    "ieteicams izteikt",
+    "teikumu varētu",
+    "teikumu vajadzētu",
+    "redakcionāli uzlabot",
+    "vienkāršot teikumu",
+    "awkward",
+    "improve wording",
+    "improve clarity",
+    "rewrite the sentence",
+    "rephrase",
+]
+
+CONCRETE_LANGUAGE_ISSUE_TYPES = {
+    "spelling_error",
+    "typographical_error",
+    "grammar_error",
+    "grammatical_ending_error",
+    "case_ending_error",
+    "declension_error",
+    "agreement_error",
+    "word_form_error",
+    "wrong_word_ending",
+    "punctuation_error",
+    "capitalization_error",
+    "unit_symbol_case_error",
+    "known_spelling_correction",
+    "spelling_or_grammar_error",
+}
+
+
+def _candidate_has_explicit_correction(candidate: Dict[str, Any]) -> bool:
+    text = " ".join([
+        clean_text(candidate.get("problem")),
+        clean_text(candidate.get("designer_note")),
+        clean_text(candidate.get("comment_text")),
+        clean_text(candidate.get("evidence")),
+    ])
+    if re.search(r"(?:→|->|=>)", text):
+        return True
+    return len(_quoted_values(text)) >= 2
+
+
+def is_style_only_language_candidate(candidate: Dict[str, Any]) -> bool:
+    """Atmet stila ieteikumus, saglabājot konkrētas vārdu un galotņu kļūdas."""
+    if clean_text(candidate.get("family")) != "A_text_language":
+        return False
+
+    source = clean_text(candidate.get("candidate_source"))
+    if source in {"manual_excel_import", "project_deterministic_rule"}:
+        return False
+
+    issue_type = clean_text(candidate.get("issue_type")).casefold()
+    text = " ".join([
+        clean_text(candidate.get("title")),
+        clean_text(candidate.get("problem")),
+        clean_text(candidate.get("designer_note")),
+        clean_text(candidate.get("comment_text")),
+        clean_text(candidate.get("evidence")),
+    ]).casefold()
+
+    if issue_type in STYLE_ONLY_ISSUE_TYPES:
+        return True
+    if any(phrase in text for phrase in STYLE_ONLY_PHRASES):
+        return True
+
+    target = clean_text(candidate.get("target_text"))
+    if not target or target == "MANUAL_PLACEMENT_REQUIRED":
+        return True
+
+    target_words = re.findall(r"\S+", target)
+    if len(target_words) > 8 or len(target) > 100:
+        return True
+
+    explicit_correction = _candidate_has_explicit_correction(candidate)
+    concrete_type = issue_type in CONCRETE_LANGUAGE_ISSUE_TYPES
+
+    if not concrete_type and not explicit_correction:
+        return True
+
+    vague_actions = [
+        "pārskatīt formulējumu",
+        "precizēt tekstu",
+        "izvērtēt formulējumu",
+        "saskaņot formulējumu",
+        "pārbaudīt formulējumu",
+    ]
+    if any(action in text for action in vague_actions) and not explicit_correction:
+        return True
+
+    return False
+
+
 def select_representative_grammar_chunks(chunks: List[Dict[str, Any]], max_chunks: int) -> List[Dict[str, Any]]:
     """Atlasa blokus vienmērīgi visā dokumentā, ne tikai no sākuma."""
     if max_chunks <= 0 or len(chunks) <= max_chunks:
@@ -2714,16 +2838,29 @@ def call_ai_for_grammar_chunks(
                 pass
 
         system = (
-            "Tu esi rūpīgs būvprojekta teksta redaktors. Atrodi tikai skaidri pierādāmas drukas, "
-            "pareizrakstības, locījumu, pieturzīmju un acīmredzamas terminoloģijas kļūdas. "
-            "Neziņo par gaumes jautājumiem vai maznozīmīgu pārfrāzēšanu. Apvieno vienas tēmas kļūdas. "
-            "target_text ir burtiski blokā atrodams kļūdainais vārds vai īsa frāze. "
-            "Komentārs obligāti latviešu valodā. Neatkārto already_reported_texts. Atbildi tikai JSON."
+            "Tu esi stingrs būvprojekta pareizrakstības un gramatikas pārbaudītājs. "
+            "Atrodi tikai nepareizi uzrakstītus vārdus, drukas kļūdas, nepareizas "
+            "galotnes vai locījumus, vārdu saskaņas kļūdas, nepareizu vārda formu, "
+            "nepareizu lielo/mazo burtu lietojumu un acīmredzamu pieturzīmju kļūdu. "
+            "NEKAD neziņo par stilu, neveiklu formulējumu, skaidrību, lasāmību, "
+            "sinonīmu izvēli, teikuma pārfrāzēšanu vai redakcionālu gaumi. "
+            "Kandidātu drīkst atgriezt tikai tad, ja vari norādīt konkrētu kļūdaino "
+            "vārdu vai īsu frāzi un konkrētu pareizo formu. "
+            "target_text ir burtiski blokā atrodams kļūdainais teksts, nevis viss teikums. "
+            "problem un designer_note norādi formā “kļūdainais” → “pareizais”. "
+            "issue_type izmanto tikai vienu no: spelling_error, typographical_error, "
+            "grammatical_ending_error, declension_error, agreement_error, "
+            "word_form_error, punctuation_error, capitalization_error. "
+            "Komentārs obligāti latviešu valodā. Neatkārto already_reported_texts. "
+            "Atbildi tikai JSON."
         )
         payload = {
             "pdf_file": pdf_name,
             "page": page_no,
-            "task": "Atrodi svarīgākās un skaidri pamatotās teksta kļūdas šajā PDF lapas blokā.",
+            "task": (
+                "Atrodi tikai konkrētas pareizrakstības vai gramatiskās formas kļūdas. "
+                "Stilistiskus ieteikumus neatgriez."
+            ),
             "max_candidates_this_block": chunk_budget,
             "project_and_global_examples": examples,
             "negative_rules_do_not_repeat": negative_rules,
@@ -2736,7 +2873,11 @@ def call_ai_for_grammar_chunks(
                 "target_text": "precīzs kļūdainais teksts no text_block",
                 "problem": "kas tieši ir nepareizi un kāds ir labojums",
                 "designer_note": "īss komentārs projektētājam latviešu valodā",
-                "issue_type": "spelling_or_grammar_error",
+                "issue_type": (
+                    "spelling_error|typographical_error|grammatical_ending_error|"
+                    "declension_error|agreement_error|word_form_error|"
+                    "punctuation_error|capitalization_error"
+                ),
                 "severity": "low|medium",
                 "markup_type": "highlight",
                 "placement_confidence": "exact",
@@ -2768,6 +2909,8 @@ def call_ai_for_grammar_chunks(
                 if not target or target.casefold() not in chunk_text.casefold():
                     continue
                 if candidate_is_too_vague(candidate):
+                    continue
+                if is_style_only_language_candidate(candidate):
                     continue
                 if any(target.casefold() == value.casefold() for value in already_reported):
                     continue
@@ -4129,6 +4272,130 @@ def init_state():
             st.session_state[k] = v
 
 
+
+def candidate_quality_score(candidate: Dict[str, Any]) -> float:
+    """Piešķir prioritāti precīzām, pierādāmām un lietotāja importētām piezīmēm."""
+    score = 0.0
+
+    source = clean_text(candidate.get("candidate_source"))
+    if source == "manual_excel_import":
+        score += 100.0
+    elif source == "project_deterministic_rule":
+        score += 80.0
+
+    placement = clean_text(candidate.get("placement_confidence")).casefold()
+    markup = clean_text(candidate.get("markup_type")).casefold()
+    target_text = clean_text(candidate.get("target_text"))
+    evidence = clean_text(candidate.get("evidence"))
+    problem = clean_text(candidate.get("problem"))
+    note = clean_text(
+        candidate.get("designer_note")
+        or candidate.get("comment_text")
+    )
+
+    if placement == "exact":
+        score += 20.0
+    if markup == "highlight":
+        score += 12.0
+    if target_text and target_text != "MANUAL_PLACEMENT_REQUIRED":
+        score += min(12.0, len(target_text) / 12.0)
+    if evidence:
+        score += min(8.0, len(evidence) / 40.0)
+    if problem:
+        score += min(6.0, len(problem) / 80.0)
+    if note:
+        score += min(5.0, len(note) / 100.0)
+
+    severity = clean_text(candidate.get("severity")).casefold()
+    score += {
+        "high": 10.0,
+        "medium": 5.0,
+        "low": 1.0,
+    }.get(severity, 0.0)
+
+    family = clean_text(candidate.get("family"))
+    if family in {
+        "C_dates_versions",
+        "D_document_identity",
+        "G_material_type_model",
+        "H_quantity_position",
+        "J_cross_document_traceability",
+        "L_fire_safety_or_regulatory_logic",
+        "N_completeness_or_missing_content",
+    }:
+        score += 4.0
+
+    if family == "A_text_language" and source not in {
+        "manual_excel_import",
+        "project_deterministic_rule",
+    }:
+        score -= 2.0
+        if is_style_only_language_candidate(candidate):
+            score -= 100.0
+
+    if placement == "manual_needed":
+        score -= 8.0
+    if markup == "page_note":
+        score -= 4.0
+
+    return score
+
+
+def limit_candidates_per_pdf(
+    candidates: List[Dict[str, Any]],
+    max_notes_per_pdf: int,
+) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
+    """Saglabā visvērtīgākās piezīmes katram PDF.
+
+    Manuāli importētās un deterministiskās piezīmes netiek izmestas.
+    Limits galvenokārt samazina AI ģenerēto mazvērtīgo kandidātu skaitu.
+    """
+    grouped: Dict[str, List[Dict[str, Any]]] = {}
+    for candidate in candidates:
+        key = _canonical_drive_rel_path(
+            candidate.get("source_pdf_rel_path")
+            or candidate.get("source_pdf")
+        )
+        grouped.setdefault(key, []).append(candidate)
+
+    kept: List[Dict[str, Any]] = []
+    suppressed_by_pdf: Dict[str, int] = {}
+
+    for pdf_key, rows in grouped.items():
+        protected = [
+            row
+            for row in rows
+            if clean_text(row.get("candidate_source"))
+            in {"manual_excel_import", "project_deterministic_rule"}
+        ]
+        ordinary = [
+            row
+            for row in rows
+            if row not in protected
+        ]
+
+        ordinary.sort(
+            key=lambda row: (
+                candidate_quality_score(row),
+                clean_text(row.get("target_page")),
+            ),
+            reverse=True,
+        )
+
+        available_slots = max(
+            0,
+            int(max_notes_per_pdf) - len(protected),
+        )
+        selected = protected + ordinary[:available_slots]
+        kept.extend(selected)
+
+        suppressed = len(rows) - len(selected)
+        if suppressed > 0:
+            suppressed_by_pdf[pdf_key] = suppressed
+
+    return kept, suppressed_by_pdf
+
+
 def main():
     st.set_page_config(page_title=APP_TITLE, layout="wide")
     init_state()
@@ -4206,38 +4473,45 @@ def main():
         )
         depth_settings = {
             "Ātra": {
-                "grammar_max_chunks": 4,
-                "grammar_chunk_chars": 5000,
+                "grammar_max_chunks": 3,
+                "grammar_chunk_chars": 5500,
+                "grammar_per_chunk": 2,
+                "grammar_total": 6,
+                "project_examples": 3,
+                "regular_family_limit": 3,
+                "max_notes_per_pdf": 8,
+            },
+            "Sabalansēta": {
+                "grammar_max_chunks": 5,
+                "grammar_chunk_chars": 4500,
                 "grammar_per_chunk": 3,
                 "grammar_total": 10,
                 "project_examples": 4,
-                "regular_family_limit": 5,
+                "regular_family_limit": 4,
+                "max_notes_per_pdf": 12,
             },
-            "Sabalansēta": {
+            "Pilna": {
                 "grammar_max_chunks": 8,
                 "grammar_chunk_chars": 4000,
                 "grammar_per_chunk": 4,
-                "grammar_total": 20,
+                "grammar_total": 18,
                 "project_examples": 6,
-                "regular_family_limit": 8,
-            },
-            "Pilna": {
-                "grammar_max_chunks": 14,
-                "grammar_chunk_chars": 3500,
-                "grammar_per_chunk": 5,
-                "grammar_total": 30,
-                "project_examples": 8,
-                "regular_family_limit": 15,
+                "regular_family_limit": 7,
+                "max_notes_per_pdf": 20,
             },
         }
         audit_budget = depth_settings[audit_depth]
         st.caption(
-            "Valodas pārbaude vienā PDF: "
+            "Valodas pārbaude meklē tikai konkrētas pareizrakstības, drukas, "
+            "galotņu, locījumu un vārdu saskaņas kļūdas; stilistiski ieteikumi "
+            "tiek atmesti. Vienā PDF: "
             f"līdz {audit_budget['grammar_max_chunks']} blokiem, "
             f"līdz {audit_budget['grammar_per_chunk']} piezīmēm blokā un "
             f"līdz {audit_budget['grammar_total']} piezīmēm kopā. "
             "Citām ģimenēm limits vienā PDF: "
-            f"{audit_budget['regular_family_limit']}."
+            f"{audit_budget['regular_family_limit']}. "
+            "Pēc kvalitātes atlases vienam PDF rādīs ne vairāk kā "
+            f"{audit_budget['max_notes_per_pdf']} piezīmes."
         )
 
         index_df = st.session_state.get("index_df", pd.DataFrame())
@@ -5386,6 +5660,8 @@ def main():
                     continue
                 if candidate_is_too_vague(candidate):
                     continue
+                if is_style_only_language_candidate(candidate):
+                    continue
                 normalized_target = re.sub(
                     r"\s+", " ", clean_text(candidate.get("target_text")).casefold()
                 ).strip(" ,.;:")
@@ -5415,6 +5691,11 @@ def main():
                 candidate["reject_default"] = False
                 final_candidates.append(candidate)
 
+            final_candidates, suppressed_by_pdf = limit_candidates_per_pdf(
+                final_candidates,
+                audit_budget["max_notes_per_pdf"],
+            )
+
             for state in pdf_states:
                 state["candidates"] = 0
             for candidate in final_candidates:
@@ -5439,8 +5720,16 @@ def main():
                 f"{audit_budget['grammar_max_chunks']} bloki / "
                 f"{audit_budget['grammar_total']} kandidāti. "
                 "Citu ģimeņu limits: "
-                f"{audit_budget['regular_family_limit']} kandidāti vienā PDF."
+                f"{audit_budget['regular_family_limit']} kandidāti vienā PDF. "
+                "Kvalitātes atlases limits: "
+                f"{audit_budget['max_notes_per_pdf']} piezīmes vienam PDF."
             )
+            suppressed_total = sum(suppressed_by_pdf.values())
+            if suppressed_total:
+                st.info(
+                    "Kvalitātes filtrs paslēpa "
+                    f"{suppressed_total} zemākas prioritātes AI piezīmes."
+                )
             if manual_candidates:
                 st.info(
                     f"No manuālā Excel pievienoti kandidāti: {len(manual_candidates)}"
