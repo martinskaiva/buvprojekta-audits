@@ -44,7 +44,7 @@ except Exception:
     HttpError = Exception
 
 
-APP_VERSION = "v0.9.8"
+APP_VERSION = "v0.9.9"
 APP_TITLE = f"BP AI Audit Copilot {APP_VERSION}"
 
 REQUIRED_EXPORT_COLUMNS = [
@@ -4824,6 +4824,9 @@ def init_state():
         "drive_save_error": "",
         "input_root_info": None,
         "project_folders": [],
+        "loaded_input_project_id": "",
+        "loaded_input_project_name": "",
+        "loaded_input_project_pdf_count": 0,
         "audit_run_id": "",
         "drive_write_test_result": None,
         "drive_write_test_error": "",
@@ -5476,28 +5479,29 @@ def main():
                     )
                     input_root_id = clean_text(input_root_info.get("id"))
 
-                with st.spinner("Nolasu projektu mapes un PDF failu sarakstu..."):
+                with st.spinner("Nolasu 01_Input projektu mapju sarakstu..."):
                     project_folders = drive_list_children(
                         service,
                         input_root_id,
                         "application/vnd.google-apps.folder",
                     )
-                    listed_files = drive_list_recursive(
-                        service,
-                        input_root_id,
-                        (".pdf",),
-                        prefix="",
-                        max_files=5000,
-                    )
 
                 st.session_state.input_root_info = input_root_info
                 st.session_state.project_folders = [
-                    dict(item) for item in project_folders if isinstance(item, dict)
+                    dict(item)
+                    for item in project_folders
+                    if isinstance(item, dict)
                 ]
-                # Saglabā tikai vienkāršas kopijas. UI nedrīkst mainīt Drive rezultātu objektus uz vietas.
-                st.session_state.pdf_files = [
-                    dict(item) for item in listed_files if isinstance(item, dict)
-                ]
+
+                # PDF tiek nolasīti tikai pēc tam, kad lietotājs 3. solī
+                # izvēlas konkrētu projektu un nospiež ielādes pogu.
+                st.session_state.pdf_files = []
+                st.session_state.loaded_input_project_id = ""
+                st.session_state.loaded_input_project_name = ""
+                st.session_state.loaded_input_project_pdf_count = 0
+                st.session_state.selected_subfolder_paths = []
+                st.session_state.selected_pdf_ids_ui = []
+                st.session_state.selected_pdf_items = []
 
                 root_name = clean_text(input_root_info.get("name"))
                 resolved_note = (
@@ -5507,19 +5511,20 @@ def main():
                 )
                 st.success(
                     f"{resolved_note}. Projektu mapes: "
-                    f"{len(st.session_state.project_folders)}; "
-                    f"PDF faili: {len(st.session_state.pdf_files)}"
+                    f"{len(st.session_state.project_folders)}. "
+                    "PDF vēl netiek nolasīti — izvēlies projektu 3. solī."
                 )
                 if input_root_info.get("warning"):
                     st.warning(clean_text(input_root_info.get("warning")))
-                if len(st.session_state.pdf_files) == 0:
-                    st.warning("01_Input mapē vai tās apakšmapēs netika atrasts neviens PDF. Pārbaudi folder ID un service account piekļuvi.")
                 if st.session_state.get("drive_list_warnings"):
                     with st.expander("Drive nolasīšanas brīdinājumi"):
                         for w in st.session_state.get("drive_list_warnings", []):
                             st.warning(w)
             except Exception as e:
                 st.session_state.pdf_files = []
+                st.session_state.loaded_input_project_id = ""
+                st.session_state.loaded_input_project_name = ""
+                st.session_state.loaded_input_project_pdf_count = 0
                 st.error(
                     "Neizdevās nolasīt PDF failus no 01_Input. "
                     "Lietotne turpina darboties."
@@ -5560,8 +5565,9 @@ def main():
     if pdf_files or st.session_state.get("project_folders"):
         st.subheader("3. Izvēlies un nolasi auditējamos PDF")
         st.caption(
-            "Izvēlies projektu, tad atzīmē vienu vai vairākas apakšmapes vertikālajā sarakstā. "
-            "Zemāk automātiski parādīsies visi PDF no atzīmētajām mapēm."
+            "Vispirms izvēlies projekta mapi un nospied projekta ielādes "
+            "pogu. Tikai pēc tam tiks nolasīta šī projekta apakšmapju "
+            "struktūra un PDF faili."
         )
 
         try:
@@ -5623,14 +5629,106 @@ def main():
                     current_project = project_options[0]
                     st.session_state.selected_project_filter = current_project
 
+                loaded_project_name = clean_text(
+                    st.session_state.get("loaded_input_project_name")
+                )
+
                 project_value = st.selectbox(
                     "Auditējamā projekta mape 01_Input mapē",
                     options=project_options,
-                    format_func=lambda x: f"{x} ({project_counts.get(x, 0)} PDF)",
+                    format_func=lambda x: (
+                        f"{x} "
+                        f"({st.session_state.get('loaded_input_project_pdf_count', 0)} PDF)"
+                        if x == loaded_project_name
+                        else x
+                    ),
                     key="selected_project_filter",
                 )
 
-                previous_project = clean_text(st.session_state.get("applied_project_filter"))
+                selected_project_folder = next(
+                    (
+                        item
+                        for item in actual_project_folders
+                        if clean_text(item.get("name")) == project_value
+                    ),
+                    None,
+                )
+
+                load_project_col, _ = st.columns([1, 4])
+                with load_project_col:
+                    load_selected_project_clicked = st.button(
+                        "Ielādēt izvēlētā projekta mapes un PDF",
+                        type="primary",
+                        use_container_width=True,
+                        key="load_selected_input_project",
+                    )
+
+                if load_selected_project_clicked:
+                    if not selected_project_folder:
+                        st.error(
+                            "Izvēlētā projekta Drive mape netika atrasta."
+                        )
+                        return
+
+                    selected_project_id = clean_text(
+                        selected_project_folder.get("id")
+                    )
+                    if not selected_project_id:
+                        st.error(
+                            "Izvēlētajai projekta mapei nav derīga Drive ID."
+                        )
+                        return
+
+                    with st.spinner(
+                        f"Nolasu tikai projekta {project_value} "
+                        "apakšmapes un PDF..."
+                    ):
+                        listed_files = drive_list_recursive(
+                            service,
+                            selected_project_id,
+                            (".pdf",),
+                            prefix=project_value,
+                            max_files=5000,
+                        )
+
+                    st.session_state.pdf_files = [
+                        dict(item)
+                        for item in listed_files
+                        if isinstance(item, dict)
+                    ]
+                    st.session_state.loaded_input_project_id = (
+                        selected_project_id
+                    )
+                    st.session_state.loaded_input_project_name = (
+                        project_value
+                    )
+                    st.session_state.loaded_input_project_pdf_count = len(
+                        st.session_state.pdf_files
+                    )
+                    st.session_state.applied_project_filter = project_value
+                    st.session_state.selected_subfolder_paths = []
+                    st.session_state.selected_pdf_ids_ui = []
+                    st.session_state.selected_pdf_items = []
+                    st.session_state.pdf_search_value = ""
+                    st.rerun()
+
+                if loaded_project_name != project_value:
+                    st.info(
+                        "Projekts ir izvēlēts, bet tā apakšmapes un PDF vēl "
+                        "nav nolasīti. Nospied "
+                        "“Ielādēt izvēlētā projekta mapes un PDF”."
+                    )
+                    return
+
+                if not st.session_state.get("pdf_files"):
+                    st.warning(
+                        f"Projektā {project_value} netika atrasts neviens PDF."
+                    )
+                    return
+
+                previous_project = clean_text(
+                    st.session_state.get("applied_project_filter")
+                )
                 if project_value != previous_project:
                     st.session_state.applied_project_filter = project_value
                     st.session_state.selected_subfolder_paths = []
