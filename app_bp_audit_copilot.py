@@ -43,7 +43,7 @@ except Exception:
     HttpError = Exception
 
 
-APP_VERSION = "v0.7.9"
+APP_VERSION = "v0.8.0"
 APP_TITLE = f"BP AI Audit Copilot {APP_VERSION}"
 
 REQUIRED_EXPORT_COLUMNS = [
@@ -1832,16 +1832,47 @@ def choose_best_comment_text(c: Dict[str, Any]) -> str:
     return note
 
 
+def _normalize_anchor_word(value: Any) -> str:
+    value = clean_text(value).casefold()
+    value = value.replace("₂", "2").replace("²", "2").replace("³", "3")
+    value = re.sub(r"^[^\wāčēģīķļņšūž±+/-]+|[^\wāčēģīķļņšūž±+/-]+$", "", value)
+    return value
+
+
+def _correction_left_sides(text: str) -> List[str]:
+    """No formulējumiem “kļūda” → “labojums” paņem tikai kļūdaino tekstu."""
+    text = clean_text(text)
+    values: List[str] = []
+    patterns = [
+        r'["“”\']([^"“”\']{1,180})["“”\']\s*(?:→|->|=>)\s*["“”\']([^"“”\']{1,180})["“”\']',
+        r'([A-Za-zĀ-ž0-9./+\-]{2,80})\s*(?:→|->|=>)\s*([A-Za-zĀ-ž0-9./+\-]{2,80})',
+    ]
+    for pattern in patterns:
+        for match in re.finditer(pattern, text):
+            wrong = clean_text(match.group(1)).strip(" ,.;:")
+            if wrong:
+                values.append(wrong)
+    return values
+
+
 def row_anchor_candidates(row: Dict[str, Any]) -> List[str]:
+    """Izveido prioritāru kļūdainā teksta fragmentu sarakstu.
+
+    Importētām piezīmēm vispirms meklē:
+    - Excel target_text;
+    - labojuma kreiso jeb kļūdaino pusi;
+    - pēdiņās minētos vārdus un teikumus;
+    - tehniskos kodus un vērtības.
+    """
     out: List[str] = []
     seen = set()
 
-    def add(value: str) -> None:
+    def add(value: Any) -> None:
         value = clean_text(value)
         if not value or value == "MANUAL_PLACEMENT_REQUIRED":
             return
         value = re.sub(r"\s+", " ", value).strip(" ,;")
-        if len(value) < 2 or len(value) > 160:
+        if len(value) < 2 or len(value) > 220:
             return
         key = value.casefold()
         if key in seen:
@@ -1853,471 +1884,127 @@ def row_anchor_candidates(row: Dict[str, Any]) -> List[str]:
     if raw_candidates:
         for part in raw_candidates.split("||"):
             add(part)
+
     add(row.get("target_text"))
+
+    text_fields = [
+        clean_text(row.get("comment_text")),
+        clean_text(row.get("comparison_evidence")),
+        clean_text(row.get("problem")),
+        clean_text(row.get("evidence")),
+    ]
+
+    # Kļūdainā puse ir svarīgāka par piedāvāto pareizo labojumu.
+    for text_value in text_fields:
+        for value in _correction_left_sides(text_value):
+            add(value)
+
+    for text_value in text_fields:
+        for value in _quoted_values(text_value):
+            add(value)
+        for value in extract_anchor_tokens(text_value):
+            add(value)
+
     add(row.get("target_area"))
-    for field in ["comment_text", "comparison_evidence"]:
-        for x in extract_anchor_tokens(clean_text(row.get(field))):
-            add(x)
     return out
 
 
-def find_best_anchor_on_page(page: Any, row: Dict[str, Any]) -> Tuple[str, List[Any]]:
+def _word_sequence_matches(page: Any, candidate: str) -> List[Any]:
+    """Atrod kandidātu PDF vārdos arī tad, ja frāze sadalīta vairākās rindās."""
+    try:
+        words = page.get_text("words")
+    except Exception:
+        return []
+
+    candidate_tokens = [
+        _normalize_anchor_word(token)
+        for token in re.findall(r"\S+", clean_text(candidate))
+    ]
+    candidate_tokens = [token for token in candidate_tokens if token]
+    if not candidate_tokens:
+        return []
+
+    page_tokens = []
+    for word in words:
+        token = _normalize_anchor_word(word[4])
+        if token:
+            page_tokens.append((token, word))
+
+    token_count = len(candidate_tokens)
+    matches: List[Any] = []
+    for start_index in range(0, len(page_tokens) - token_count + 1):
+        sequence = [
+            page_tokens[start_index + offset][0]
+            for offset in range(token_count)
+        ]
+        if sequence != candidate_tokens:
+            continue
+
+        rects = [
+            fitz.Rect(
+                page_tokens[start_index + offset][1][0],
+                page_tokens[start_index + offset][1][1],
+                page_tokens[start_index + offset][1][2],
+                page_tokens[start_index + offset][1][3],
+            )
+            for offset in range(token_count)
+        ]
+        matches.extend(rects)
+
+    return matches
+
+
+def find_all_anchors_on_page(
+    page: Any,
+    row: Dict[str, Any],
+    max_anchors: int = 8,
+) -> Tuple[List[str], List[Any]]:
+    """Atrod un apvieno vairākus kļūdainos vārdus/frāzes vienai piezīmei."""
+    used_anchors: List[str] = []
+    all_matches: List[Any] = []
+    seen_rects = set()
+
     for candidate in row_anchor_candidates(row):
+        matches: List[Any] = []
         try:
             matches = page.search_for(candidate, quads=True)
         except Exception:
             matches = []
-        if matches:
-            if len(candidate) <= 3:
-                matches = matches[:1]
-            return candidate, matches
-    return "", []
 
+        if not matches:
+            matches = _word_sequence_matches(page, candidate)
 
-def normalize_candidate(c: Dict[str, Any], family: str) -> Dict[str, Any]:
-    """Normalizē kandidātu un sagatavo konkrētus PDF enkurtekstus."""
-    out = dict(c)
-    out["family"] = family
-    problem = clean_text(out.get("problem") or out.get("evidence"))
-    note = clean_text(out.get("designer_note") or out.get("comment_text"))
-    if not problem:
-        problem = note
-    out["problem"] = problem
-    out["designer_note"] = clean_text(note or problem)
-    inferred_target = infer_target_text_from_candidate(out)
-    if inferred_target:
-        out["target_text"] = inferred_target
-    elif not clean_text(out.get("target_text")):
-        out["target_text"] = "MANUAL_PLACEMENT_REQUIRED"
-    out["target_text_candidates"] = build_target_text_candidates(out)
-    return out
+        if not matches:
+            continue
 
+        added = False
+        for match in matches:
+            rect = fitz.Rect(match.rect if hasattr(match, "rect") else match)
+            rect_key = (
+                round(rect.x0, 1),
+                round(rect.y0, 1),
+                round(rect.x1, 1),
+                round(rect.y1, 1),
+            )
+            if rect_key in seen_rects:
+                continue
+            seen_rects.add(rect_key)
+            all_matches.append(match)
+            added = True
 
-def candidate_is_too_vague(c: Dict[str, Any]) -> bool:
-    problem = clean_text(c.get("problem"))
-    note = clean_text(c.get("designer_note") or c.get("comment_text"))
-    evidence = clean_text(c.get("evidence"))
-    target_area = clean_text(c.get("target_area") or c.get("where"))
-    text = " ".join([clean_text(c.get("title")), problem, note, evidence]).lower()
+        if added:
+            used_anchors.append(candidate)
 
-    if not note and not problem:
-        return True
-    if _candidate_says_no_issue(text):
-        return True
-
-    speculative_phrases = [
-        "nav skaidrs, vai",
-        "nav zināms, vai",
-        "iespējams, ka",
-        "varētu būt",
-        "var neatbilst",
-        "var nebūt",
-        "iespējama neatbilstība",
-        "nepieciešams pārbaudīt",
-        "jāpārbauda ar citiem",
-    ]
-    if any(p in text for p in speculative_phrases):
-        return True
-
-    vague_phrases = [
-        "dažādos dokumentos",
-        "citiem projekta dokumentiem",
-        "jāsaskaņo ar citiem",
-        "pārbaudīt un saskaņot",
-        "pilnībā saskaņots",
-        "nav pilnībā saskaņots",
-    ]
-    comparison_phrases = [
-        " neatbilst ", " nesakrīt ", " atšķiras ", " pretrunā ",
-        " savukārt ", " salīdzinot ar ", " norādīts citādi ",
-    ]
-    has_vague = any(p in text for p in vague_phrases)
-    has_comparison = any(p in f" {text} " for p in comparison_phrases)
-    specifics = extract_specific_values(" ".join([problem, note, evidence]))
-    has_source_location = bool(target_area) or any(
-        source in text
-        for source in [
-            "titullauk", "faila nosauk", "galvenajā tekst", "tabulā", "profilā",
-            "plānā", "site plan", "specifikācijā", "aprakstā", "rasējumā", "lapā",
-        ]
-    )
-
-    if has_comparison and (len(specifics) < 2 or not has_source_location):
-        return True
-    if has_vague and len(specifics) < 2:
-        return True
-    if _comparison_types_conflict(" ".join([problem, note, evidence])):
-        return True
-
-    # B_lv_en salīdzinājumā identiski citāti nav kļūda.
-    if clean_text(c.get("family")) == "B_lv_en":
-        values = _quoted_values(problem)
-        if len(values) >= 2:
-            a = re.sub(r"\s+", " ", values[0]).strip().casefold()
-            b = re.sub(r"\s+", " ", values[1]).strip().casefold()
-            if a == b:
-                return True
-
-    return False
-
-
-def make_candidate_id(c: Dict[str, Any], audit_run_id: str, ordinal: int) -> str:
-    raw = "|".join([
-        audit_run_id,
-        clean_text(c.get("source_pdf_rel_path") or c.get("source_pdf")),
-        clean_text(c.get("family")),
-        clean_text(c.get("target_page")),
-        clean_text(c.get("target_text")),
-        clean_text(c.get("problem")),
-        str(ordinal),
-    ])
-    return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:20]
-
-
-def clear_review_widget_state() -> None:
-    prefixes = ("designer_note_", "decision_", "reject_reason_", "do_not_show_")
-    for key in list(st.session_state.keys()):
-        if any(str(key).startswith(prefix) for prefix in prefixes):
-            del st.session_state[key]
-
-
-def detect_unit_case_candidates(pdf_item: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """Deterministiski atrod biežākās SI mērvienību reģistra kļūdas."""
-    replacements = {
-        "Mpa": "MPa",
-        "Kpa": "kPa",
-        "Kw": "kW",
-    }
-    out: List[Dict[str, Any]] = []
-    for page_data in pdf_item.get("pages", []) or []:
-        page_no = int(page_data.get("page") or 1)
-        page_text = str(page_data.get("text") or "")
-        for wrong, correct in replacements.items():
-            if re.search(rf"(?<![A-Za-z]){re.escape(wrong)}(?![A-Za-z])", page_text):
-                out.append({
-                    "title": f"Mērvienības simbola pieraksts: {wrong}",
-                    "where": f"{page_no}. lapa",
-                    "target_page": page_no,
-                    "target_area": "teksts",
-                    "target_text": wrong,
-                    "status": "unit_symbol_case_error",
-                    "problem": f"{page_no}. lapā mērvienības simbols norādīts kā “{wrong}”; pareizais SI pieraksts ir “{correct}”.",
-                    "designer_note": f"{page_no}. lapā mērvienības simbols norādīts kā “{wrong}”; pareizais SI pieraksts ir “{correct}”.",
-                    "issue_type": "unit_symbol_case_error",
-                    "severity": "low",
-                    "markup_type": "highlight",
-                    "placement_confidence": "exact",
-                    "evidence": wrong,
-                    "family": "A_text_language",
-                })
-    return out
-
-
-def call_ai_for_family(
-    client,
-    model: str,
-    pdf_name: str,
-    pdf_text: str,
-    family: str,
-    examples: List[Dict[str, str]],
-    negative_rules: List[str],
-    max_candidates: int,
-) -> Tuple[List[Dict[str, Any]], str]:
-    instr = FAMILY_INSTRUCTIONS.get(family, {"name": family, "look_for": "", "report_if": "", "do_not_report": ""})
-    system = (
-        "Tu esi būvprojekta audita asistents. Ģenerē tikai pierādāmas piezīmes. "
-        "Neizdomā faktus. Līdzīgie audit_examples piemēri ir globāli zelta paraugi no dažādiem projektiem un ir izmantojami jebkura projekta auditā tikai FORMULĒJUMAM un kļūdu tipa izpratnei — "
-        "nekad nepārnes no tiem konkrētus faktus, diametrus, materiālus, failu nosaukumus, projektu kodus vai dokumentu atsauces uz jaunu piezīmi. "
-        "Piezīmi drīkst ģenerēt tikai tad, ja auditējamā PDF tekstā ir konkrēts pierādījums. "
-        "Ja piezīme salīdzina divas vērtības, skaidri nosauc abas vērtības un to avotus. "
-        "Nedrīkst rakstīt vispārīgi: 'var neatbilst', 'dažādos dokumentos', 'jāsaskaņo ar citiem dokumentiem', "
-        "ja nav precīzi nosaukts, kas tieši kam neatbilst. "
-        "Ja nav pietiekama pierādījuma, atgriez tukšu candidates sarakstu. "
-        "Raksti īsi. Neraksti sekas, riskus vai risinājuma instrukcijas. "
-        "PDF komentāram vajag tikai konkrētu konstatējumu: kas dokumentā redzams un ar ko tas nesakrīt. "
-        "designer_note jābūt tik garai, cik nepieciešams konkrētās kļūdas vai nesakritības nepārprotamam aprakstam, bet bez lieka konteksta. "
-        "Nelieto virsrakstus Kāpēc tas ir svarīgi, Ieteikums vai Risinājums. "
-        "Virsrakstam, problem, designer_note, target_text un evidence obligāti jāapraksta viena un tā pati problēma. "
-        "Ja secini, ka vērtības sakrīt vai neatbilstības nav, kandidātu neradi. "
-        "Nesalīdzini atšķirīgus datu laukus, piemēram, kadastra numuru ar objekta apzīmējumu. "
-        "Atbildi tikai derīgā JSON formātā."
-    )
-    user = {
-        "task": "Analizē vienu PDF dokumentu un atrodi piezīmes konkrētajā kļūdu ģimenē.",
-        "pdf_file": pdf_name,
-        "family": family,
-        "family_instruction": instr,
-        "max_candidates": max_candidates,
-        "precision_rules": [
-            "Problēmas aprakstā jābūt konkrētai kļūdai, nevis vispārīgam riskam.",
-            "Ja raksti, ka A neatbilst B, obligāti nosauc A vērtību/tekstu un B vērtību/tekstu.",
-            "Ja salīdzināmais avots nav iekļauts auditējamā PDF tekstā, neatsaucies uz šo avotu kā uz pierādījumu.",
-            "Nedrīkst pārņemt faktus no similar_positive_examples; tie ir tikai stila un tipoloģijas piemēri.",
-            "Frāzes 'var neatbilst', 'var nebūt saskaņots', 'jāpārbauda ar citiem dokumentiem' ir atļautas tikai tad, ja blakus ir konkrēts nepareizais teksts un konkrēts salīdzināmais teksts.",
-            "designer_note jābūt lietojamai bez failu atvēršanas: tajā jāmin abas konkrētās vērtības/teksti un vietas/avoti.",
-            "designer_note nav cieta zīmju vai teikumu limita; izmanto tikai tik daudz teksta, cik vajadzīgs konkrētās kļūdas vai nesakritības pilnam aprakstam.",
-            "designer_note nedrīkst saturēt: Kāpēc tas ir svarīgi, Ieteikums, Risinājums, Lūdzu pārbaudīt, Lūdzu saskaņot, risku vai seku aprakstu.",
-            "title, problem, designer_note, target_text un evidence apraksta tikai vienu un to pašu kļūdu.",
-            "target_text obligāti ir precīzs, īss, burtiski auditējamā PDF lapā atrodams teksta fragments; izvēlies elementa kodu, vērtību, datumu vai īsu tabulas tekstu, nevis pārfrāzētu teikumu.",
-            "Ja konkrētu burtiski atrodamu target_text nevar nosaukt, kandidātu neatgriez, izņemot gadījumus, kuros kļūda attiecas uz visu lapu vai trūkstošu saturu.",
-            "Starpdokumentu nesakritībā designer_note obligāti nosauc target faila konkrēto vērtību un salīdzināmā faila konkrēto konfliktējošo vērtību, kā arī abus failus vai vietas.",
-            "Neraksti tikai 'nav saskaņots starp dokumentiem', 'ir vienāds, bet apraksts atšķiras' vai līdzīgu vispārīgu apgalvojumu bez abām precīzajām vērtībām.",
-            "Ja abi salīdzinātie teksti vai skaitļi sakrīt, kandidātu neatgriez.",
-            "Neizmanto spekulatīvas frāzes: nav skaidrs vai, iespējams, varētu būt.",
-            "Salīdzini tikai viena tipa laukus: kodu ar kodu, datumu ar datumu, diametru ar diametru, kadastra numuru ar kadastra numuru.",
-        ],
-        "similar_positive_examples": examples,
-        "negative_rules_do_not_repeat": negative_rules,
-        "pdf_text": pdf_text,
-        "required_json_schema": {
-            "candidates": [
-                {
-                    "title": "īss piezīmes virsraksts",
-                    "where": "lapa un zona/tabula/teksts",
-                    "target_page": 1,
-                    "target_area": "zona, tabula vai vieta dokumentā",
-                    "target_text": "obligāts īss, precīzs un burtiski target lapā atrodams teksts, ko iezīmēt PDF; MANUAL_PLACEMENT_REQUIRED tikai visas lapas vai trūkstoša satura kļūdai",
-                    "status": "kļūdas tips vai risks",
-                    "problem": "precīzi apraksti kļūdu: norādi nepareizo tekstu/vērtību pēdiņās, salīdzināmo pareizo vai konfliktējošo tekstu/vērtību pēdiņās un avotu; bez vispārīgām frāzēm",
-                    "why_important": "atstāj tukšu; neraksti sekas vai riska aprakstu",
-                    "designer_note": "konkrēts PDF komentārs bez cieta garuma limita: apraksti tikai konstatēto kļūdu vai nesakritību, norādot vajadzīgās vērtības/tekstus un to vietas; bez pamatojuma, ieteikuma, riska, sekām vai risinājuma",
-                    "comparison_files": "salīdzināmo failu nosaukumi; tukšs, ja salīdzinājums ir vienā failā",
-                    "comparison_pages": "salīdzināmo lapu numuri; tukšs, ja nav zināmi",
-                    "issue_type": "normalizēts issue_type",
-                    "severity": "low|medium|high",
-                    "markup_type": "highlight|rectangle|sticky_note|page_note",
-                    "placement_confidence": "exact|approximate|manual_needed",
-                    "evidence": "precīzs pierādījums: citāts vai vērtības no auditējamā PDF; ja ir salīdzinājums, norādi abas puses",
-                }
-            ]
-        },
-    }
-    try:
-        resp = client.chat.completions.create(
-            model=model,
-            messages=[
-                {"role": "system", "content": system},
-                {"role": "user", "content": json.dumps(user, ensure_ascii=False)},
-            ],
-            temperature=0.1,
-            response_format={"type": "json_object"},
-        )
-        content = resp.choices[0].message.content or "{}"
-        data = json.loads(strip_json_fences(content))
-        candidates = data.get("candidates", [])
-        if not isinstance(candidates, list):
-            return [], "AI JSON laukam candidates nav saraksta tips."
-        cleaned_candidates = []
-        for c in candidates:
-            if isinstance(c, dict):
-                normalized = normalize_candidate(c, family)
-                if not candidate_is_too_vague(normalized):
-                    cleaned_candidates.append(normalized)
-        return cleaned_candidates, ""
-    except Exception as e:
-        return [], str(e)
-
-
-def call_ai_for_cross_document_family(
-    client,
-    model: str,
-    pdf_items: List[Dict[str, Any]],
-    examples: List[Dict[str, str]],
-    negative_rules: List[str],
-    max_candidates: int,
-) -> Tuple[List[Dict[str, Any]], str]:
-    """J ģimeni palaiž vienā pieprasījumā ar vairāku PDF skaidri marķētu kontekstu."""
-    family = "J_cross_document_traceability"
-    docs = []
-    total_chars = 0
-    for item in pdf_items:
-        rel_path = clean_text(item.get("rel_path") or item.get("name"))
-        content = str(item.get("text") or "")[:18000]
-        block = f"===== FILE: {rel_path} =====\n{content}"
-        if total_chars + len(block) > 100000:
+        if len(used_anchors) >= max_anchors:
             break
-        docs.append(block)
-        total_chars += len(block)
-    if len(docs) < 2:
-        return [], "J_cross_document_traceability vajag vismaz divus nolasītus PDF."
 
-    system = (
-        "Tu pārbaudi izsekojamību starp vairākiem būvprojekta PDF. "
-        "Ziņo tikai par konkrētu viena un tā paša elementa pretrunu starp vismaz diviem nosauktiem failiem. "
-        "Obligāti nosauc abus failus, lapas, abas vērtības un precīzos citātus. "
-        "Dažādi mezglu kodi paši par sevi nav kļūda. Neraksti 'nav skaidrs, vai', 'iespējams' vai 'varētu'. "
-        "Ja nav pierādāmas pretrunas, atgriez tukšu candidates sarakstu. "
-        "problem un designer_note apraksta vienu un to pašu konstatējumu. Atbildi tikai JSON."
-    )
-    payload = {
-        "family": family,
-        "max_candidates": max_candidates,
-        "rules": [
-            "Salīdzini tikai vienu un to pašu elementu vai dokumenta lauku.",
-            "Katrai piezīmei norādi target_file, comparison_files, target_page un comparison_pages.",
-            "target_text obligāti ir īss, precīzs un burtiski target faila lapā atrodams teksta fragments, kuru var iezīmēt.",
-            "comparison_target_text obligāti ir precīzs citāts vai vērtība salīdzināmajā failā.",
-            "problem un designer_note obligāti nosauc abas konfliktējošās vērtības, abus failus un vietas; vispārīgas frāzes bez vērtībām nav pieļaujamas.",
-            "Ja target_text nav burtiski atrodams target failā vai abas konfliktējošās vērtības nevar nosaukt, kandidātu neradi.",
-            "Ja vērtības sakrīt, piezīmi neradi.",
-            "Nesalīdzini kadastra numuru ar objekta kodu vai citus atšķirīgus datu tipus.",
-        ],
-        "similar_positive_examples": examples,
-        "negative_rules_do_not_repeat": negative_rules,
-        "documents": "\n\n".join(docs),
-        "required_json_schema": {
-            "candidates": [{
-                "title": "īss virsraksts",
-                "target_file": "fails, kur tiks ievietota piezīme",
-                "target_page": 1,
-                "target_area": "vieta target failā",
-                "target_text": "precīzs target faila teksts",
-                "comparison_files": "otrs fails vai faili",
-                "comparison_pages": "otra faila lapas",
-                "comparison_target_text": "precīzs teksts otrā failā",
-                "problem": "konkrēta pretruna ar abām vērtībām un avotiem",
-                "designer_note": "tas pats konkrētais konstatējums bez riska un ieteikuma",
-                "issue_type": "cross_document_mismatch",
-                "severity": "low|medium|high",
-                "markup_type": "highlight|page_note",
-                "placement_confidence": "exact|approximate|manual_needed",
-                "evidence": "abi citāti",
-            }]
-        },
-    }
-    try:
-        resp = client.chat.completions.create(
-            model=model,
-            messages=[
-                {"role": "system", "content": system},
-                {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
-            ],
-            temperature=0.1,
-            response_format={"type": "json_object"},
-        )
-        data = json.loads(strip_json_fences(resp.choices[0].message.content or "{}"))
-        candidates = data.get("candidates", [])
-        if not isinstance(candidates, list):
-            return [], "AI JSON laukam candidates nav saraksta tips."
-        cleaned = []
-        valid_paths = {clean_text(x.get("rel_path") or x.get("name")) for x in pdf_items}
-        for raw in candidates:
-            if not isinstance(raw, dict):
-                continue
-            c = normalize_candidate(raw, family)
-            target_file = clean_text(c.get("target_file"))
-            if target_file not in valid_paths:
-                continue
-            if not clean_text(c.get("comparison_files")):
-                continue
-            if not candidate_is_too_vague(c):
-                cleaned.append(c)
-        return cleaned, ""
-    except Exception as e:
-        return [], str(e)
+    return used_anchors, all_matches
 
 
-def candidate_to_export_row(c: Dict[str, Any], idx: int, pdf_name: str, discipline: str) -> Dict[str, Any]:
-    target_text = clean_text(c.get("target_text")) or "MANUAL_PLACEMENT_REQUIRED"
-    placement = clean_text(c.get("placement_confidence")) or "manual_needed"
-    markup = clean_text(c.get("markup_type"))
-    if not markup:
-        markup = "highlight" if placement == "exact" and target_text != "MANUAL_PLACEMENT_REQUIRED" else "page_note"
-    problem = clean_text(c.get("problem"))
-    evidence = clean_text(c.get("evidence"))
-    comparison_evidence = problem or evidence
-    page = clean_text(c.get("target_page")) or "1"
-    best_comment = choose_best_comment_text(c)
-    target_candidates = c.get("target_text_candidates") or build_target_text_candidates(c)
-    return {
-        "note_id": clean_text(c.get("note_id")) or f"AI-{datetime.now().strftime('%Y%m%d%H%M%S')}-{idx:03d}",
-        "Nr": idx,
-        "discipline": discipline,
-        "target_file": pdf_name,
-        "target_page": page,
-        "target_area": clean_text(c.get("target_area") or c.get("where")),
-        "target_text": target_text,
-        "target_text_candidates": " || ".join(target_candidates),
-        "comment_text": shorten_pdf_comment(best_comment or comparison_evidence),
-        "issue_type": clean_text(c.get("issue_type") or c.get("family")),
-        "severity": clean_text(c.get("severity")) or "medium",
-        "comparison_files": clean_text(c.get("comparison_files")),
-        "comparison_pages": clean_text(c.get("comparison_pages")),
-        "comparison_evidence": comparison_evidence,
-        "markup_type": markup,
-        "placement_confidence": placement,
-        "status": "accepted_candidate",
-    }
-
-
-def candidate_to_rejected_row(c: Dict[str, Any], idx: int, pdf_name: str, reason: str, do_not_show: bool) -> Dict[str, Any]:
-    comparison_evidence = clean_text(c.get("problem") or c.get("evidence"))
-    return {
-        "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "source_file": pdf_name,
-        "family": clean_text(c.get("family")),
-        "title": clean_text(c.get("title")),
-        "target_page": clean_text(c.get("target_page")),
-        "target_area": clean_text(c.get("target_area") or c.get("where")),
-        "target_text": clean_text(c.get("target_text")),
-        "comment_text": clean_text(c.get("designer_note") or c.get("comment_text") or comparison_evidence),
-        "issue_type": clean_text(c.get("issue_type")),
-        "reject_reason": reason,
-        "do_not_show_similar": bool(do_not_show),
-        "status": "rejected_by_user",
-        "candidate_index": idx,
-    }
-
-
-
-
-def shorten_pdf_comment(text: str) -> str:
-    """Notīra PDF komentāru, nepārraujot konstatējuma tekstu.
-
-    Netiek lietots simbolu limits un teksts netiek griezts teikuma vidū.
-    Tiek atmestas tikai skaidri nodalītas papildu sadaļas, kas sākas ar
-    pamatojuma, seku vai risinājuma virsrakstu.
-    """
-    original = clean_text(text)
-    if not original:
-        return "Piezīme auditā."
-
-    cleaned = re.sub(r"(?i)^komentārs\s*:\s*", "", original).strip()
-    section_pattern = re.compile(
-        r"(?i)(?:^|[\n\r]+|(?<=[.!?])\s+)(?:kāpēc tas ir svarīgi|ieteikums|risinājums|sekas|riski?|kā novērst)\s*:\s*"
-    )
-    match = section_pattern.search(cleaned)
-    if match:
-        candidate = cleaned[:match.start()].strip()
-        # Saglabājam tikai gramatiski pilnu rezultātu; pretējā gadījumā atstājam oriģinālu.
-        if candidate and candidate[-1:] in ".!?)]}”\"'":
-            cleaned = candidate
-
-    return cleaned or original or "Piezīme auditā."
-
-def make_pdf_comment(row: Dict[str, Any]) -> str:
-    comment = clean_text(row.get("comment_text")) or clean_text(row.get("comparison_evidence"))
-    comment = shorten_pdf_comment(comment)
-    area = clean_text(row.get("target_area"))
-    page = clean_text(row.get("target_page"))
-    prefix = area or (f"{page}. lapa" if page else "")
-    if prefix and prefix.lower() not in comment.lower():
-        comment = f"{prefix}: {comment}"
-    return f"Komentārs:\n{comment}"
-
-
-def safe_int_page(value: Any, page_count: int) -> int:
-    txt = clean_text(value)
-    m = re.search(r"\d+", txt)
-    if not m:
-        return 0
-    page = int(m.group(0)) - 1
-    if page < 0:
-        page = 0
-    if page >= page_count:
-        page = page_count - 1
-    return page
-
+def find_best_anchor_on_page(page: Any, row: Dict[str, Any]) -> Tuple[str, List[Any]]:
+    """Atpakaļsaderīgs wrapper; jaunā loģika var atgriezt vairākus enkurus."""
+    anchors, matches = find_all_anchors_on_page(page, row)
+    return " | ".join(anchors), matches
 
 def add_page_note(page: Any, row: Dict[str, Any], comment: str) -> None:
     try:
@@ -2461,13 +2148,30 @@ def annotate_pdf_bytes(pdf_bytes: bytes, accepted_df: pd.DataFrame) -> Tuple[Opt
         used_anchor = ""
         error_text = ""
         try:
-            used_anchor, matches = find_best_anchor_on_page(page, row)
+            used_anchors, matches = find_all_anchors_on_page(page, row)
+            used_anchor = " | ".join(used_anchors)
             matches_count = len(matches)
             if matches:
                 annot = page.add_highlight_annot(matches)
-                annot.set_info(title="AI būvprojekta audits", content=comment)
+                try:
+                    annot.set_colors(stroke=(1.0, 0.85, 0.0))
+                except Exception:
+                    pass
+                annot.set_info(
+                    title="AI būvprojekta audits",
+                    subject="Konstatētā nepilnība",
+                    content=comment,
+                )
                 annot.update()
-                status = "highlight_exact" if placement == "exact" else "highlight_found"
+                status = (
+                    "highlight_multiple"
+                    if len(used_anchors) > 1
+                    else (
+                        "highlight_exact"
+                        if placement == "exact"
+                        else "highlight_found"
+                    )
+                )
             else:
                 add_page_note(page, row, comment)
                 status = "text_not_found_page_note"
@@ -2483,6 +2187,7 @@ def annotate_pdf_bytes(pdf_bytes: bytes, accepted_df: pd.DataFrame) -> Tuple[Opt
             "target_page": page_index + 1,
             "target_text": clean_text(row.get("target_text")),
             "used_anchor": used_anchor,
+            "anchor_count": len(used_anchors) if "used_anchors" in locals() else (1 if used_anchor else 0),
             "status": status,
             "matches": matches_count,
             "error": error_text,
@@ -3072,7 +2777,12 @@ def refine_manual_import_candidate(
                 "īss, pašpietiekams komentārs projektētājam latviešu valodā"
             ),
             "target_text": (
-                "īss burtisks citāts no pdf_page_text vai tukša virkne"
+                "galvenais īsais burtiskais kļūdainais citāts no pdf_page_text "
+                "vai tukša virkne"
+            ),
+            "additional_target_texts": (
+                "masīvs ar citiem burtiskiem kļūdainiem vārdiem vai frāzēm "
+                "no tās pašas lapas; neiekļauj pareizos labojumus"
             ),
         },
     }
@@ -3097,14 +2807,34 @@ def refine_manual_import_candidate(
 
         comment_lv = clean_text(data.get("comment_text_lv"))
         ai_anchor = clean_text(data.get("target_text"))
+        additional_anchors = data.get("additional_target_texts") or []
+        if not isinstance(additional_anchors, list):
+            additional_anchors = []
 
         if comment_lv:
             refined["designer_note"] = comment_lv
             refined["comment_text"] = comment_lv
 
-        # AI enkuru pieņem tikai tad, ja tas patiešām ir lapā.
-        if ai_anchor and ai_anchor.casefold() in page_text.casefold():
-            refined["target_text"] = ai_anchor
+        verified_anchors: List[str] = []
+        for proposed_anchor in [ai_anchor] + additional_anchors:
+            proposed_anchor = clean_text(proposed_anchor)
+            if (
+                proposed_anchor
+                and proposed_anchor.casefold() in page_text.casefold()
+                and proposed_anchor.casefold()
+                not in {value.casefold() for value in verified_anchors}
+            ):
+                verified_anchors.append(proposed_anchor)
+
+        if verified_anchors:
+            refined["target_text"] = verified_anchors[0]
+            current_candidates = build_target_text_candidates(refined)
+            for verified_anchor in verified_anchors:
+                if verified_anchor.casefold() not in {
+                    value.casefold() for value in current_candidates
+                }:
+                    current_candidates.append(verified_anchor)
+            refined["target_text_candidates"] = current_candidates
             refined["markup_type"] = "highlight"
             refined["placement_confidence"] = "exact"
         elif not exact_anchor:
