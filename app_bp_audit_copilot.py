@@ -44,7 +44,7 @@ except Exception:
     HttpError = Exception
 
 
-APP_VERSION = "v0.8.3"
+APP_VERSION = "v0.9.0"
 APP_TITLE = f"BP AI Audit Copilot {APP_VERSION}"
 
 REQUIRED_EXPORT_COLUMNS = [
@@ -1614,6 +1614,366 @@ def infer_document_role(name: str) -> str:
     return "unknown"
 
 
+
+def _normalize_learning_frame(frame: pd.DataFrame, source_kind: str) -> pd.DataFrame:
+    """Normalizē pending un project_findings rindas vienotai projekta piemēru plūsmai."""
+    if frame is None or frame.empty:
+        return pd.DataFrame()
+
+    df = frame.copy()
+    df.columns = [clean_text(col) for col in df.columns]
+    aliases = {
+        "designer_note": "comment_text",
+        "source_pdf": "source_file",
+        "target_file": "source_file",
+        "family": "normalized_family",
+        "scenario": "normalized_scenario",
+        "problem": "comparison_evidence",
+    }
+    for old, new in aliases.items():
+        if new not in df.columns and old in df.columns:
+            df[new] = df[old]
+
+    defaults = {
+        "note_id": "",
+        "normalized_family": "",
+        "normalized_scenario": "",
+        "target_area": "",
+        "target_text": "",
+        "comment_text": "",
+        "issue_type": "",
+        "comparison_evidence": "",
+        "project_code": "",
+        "source_file": "",
+        "discipline": "",
+        "document_role": "",
+        "decision": "accepted",
+    }
+    for col, default in defaults.items():
+        if col not in df.columns:
+            df[col] = default
+
+    for col in df.columns:
+        df[col] = df[col].map(clean_text)
+
+    if "decision" in df.columns:
+        decision = df["decision"].astype(str).str.casefold()
+        accepted_mask = decision.isin({"", "accepted", "accept", "akceptēts", "true", "1"})
+        df = df[accepted_mask].copy()
+
+    df = df[
+        df["comment_text"].astype(str).str.strip().ne("")
+        | df["target_text"].astype(str).str.strip().ne("")
+    ].copy()
+    df["learning_source"] = source_kind
+    return df.reset_index(drop=True)
+
+
+def load_project_learning_examples(
+    service,
+    memory_folder_id: str,
+    project_code: str,
+    project_memory_folder_id: str = "",
+) -> Tuple[pd.DataFrame, List[str]]:
+    """Nolasa aktīvā projekta pending un akceptētos project_findings piemērus."""
+    messages: List[str] = []
+    frames: List[pd.DataFrame] = []
+    code = normalize_project_code(project_code)
+    if not code:
+        return pd.DataFrame(), ["Projekta piemēri netika nolasīti, jo nav aktīva projekta koda."]
+
+    try:
+        pending_root = drive_find_child_folder(
+            service, memory_folder_id, PENDING_FOLDER_NAME
+        )
+        pending_project = (
+            find_project_folder(service, pending_root["id"], code)
+            if pending_root else None
+        )
+        if pending_project:
+            files = drive_list_recursive(
+                service,
+                pending_project["id"],
+                (".xlsx", ".xlsm"),
+                prefix=f"{PENDING_FOLDER_NAME}/{clean_text(pending_project.get('name'))}",
+                max_files=2000,
+            )
+            for item in files:
+                if clean_text(item.get("name")).startswith("~$"):
+                    continue
+                try:
+                    raw = drive_download_bytes(service, item["id"])
+                    frame = pd.read_excel(io.BytesIO(raw), dtype=object)
+                    frame = _normalize_learning_frame(frame, "pending")
+                    if not frame.empty:
+                        frame["learning_source_file"] = clean_text(item.get("name"))
+                        frames.append(frame)
+                except Exception as exc:
+                    messages.append(
+                        f"Neizdevās nolasīt pending failu {item.get('name')}: {exc}"
+                    )
+        else:
+            messages.append(
+                f"Projektam {code} nav mapes 03_Memory/{PENDING_FOLDER_NAME}."
+            )
+    except Exception as exc:
+        messages.append(f"Pending piemēru nolasīšana neizdevās: {exc}")
+
+    if clean_text(project_memory_folder_id):
+        try:
+            findings = read_project_memory_excel(
+                service,
+                clean_text(project_memory_folder_id),
+                PROJECT_FINDINGS_FILE,
+            )
+            findings = _normalize_learning_frame(findings, "project_findings")
+            if not findings.empty:
+                frames.append(findings)
+        except Exception as exc:
+            messages.append(f"Project findings nolasīšana neizdevās: {exc}")
+
+    if not frames:
+        return pd.DataFrame(), messages
+
+    combined = pd.concat(frames, ignore_index=True, sort=False)
+    dedupe_cols = [
+        col for col in [
+            "source_file", "target_page", "target_text", "comment_text", "issue_type"
+        ] if col in combined.columns
+    ]
+    if dedupe_cols:
+        combined = combined.drop_duplicates(subset=dedupe_cols, keep="last")
+    return combined.reset_index(drop=True), messages
+
+
+def score_project_example(
+    row: pd.Series,
+    family: str,
+    pdf_name: str,
+    pdf_text: str,
+) -> int:
+    score = 0
+    row_family = clean_text(
+        row.get("normalized_family") or row.get("family")
+    )
+    if row_family == family:
+        score += 120
+    elif family == "A_text_language" and row_family in {"B_lv_en", "A_text_language"}:
+        score += 60
+
+    discipline = infer_discipline_from_filename(pdf_name)
+    role = infer_document_role(pdf_name)
+    row_disc = clean_text(row.get("discipline"))
+    if discipline and row_disc and discipline.casefold() == row_disc.casefold():
+        score += 35
+    row_role = clean_text(row.get("document_role"))
+    if role and row_role == role:
+        score += 25
+
+    source_file = clean_text(row.get("source_file"))
+    if source_file:
+        if infer_discipline_from_filename(source_file) == discipline:
+            score += 15
+        if infer_document_role(source_file) == role:
+            score += 15
+
+    target_text = clean_text(row.get("target_text"))
+    if target_text and target_text.casefold() in pdf_text[:20000].casefold():
+        score += 45
+    if clean_text(row.get("learning_source")) == "project_findings":
+        score += 10
+    return score
+
+
+def select_project_examples(
+    project_df: pd.DataFrame,
+    family: str,
+    pdf_name: str,
+    pdf_text: str,
+    max_examples: int = 16,
+) -> List[Dict[str, str]]:
+    if project_df is None or project_df.empty or max_examples <= 0:
+        return []
+    df = project_df.copy()
+    df["_score"] = df.apply(
+        lambda row: score_project_example(row, family, pdf_name, pdf_text),
+        axis=1,
+    )
+    df = df[df["_score"] > 0].sort_values("_score", ascending=False)
+    out: List[Dict[str, str]] = []
+    for _, row in df.head(max_examples).iterrows():
+        out.append({
+            "note_id": clean_text(row.get("note_id")),
+            "family": clean_text(row.get("normalized_family") or row.get("family")),
+            "scenario": clean_text(row.get("normalized_scenario")),
+            "target_area": clean_text(row.get("target_area")),
+            "target_text": clean_text(row.get("target_text")),
+            "comment_text": clean_text(row.get("comment_text")),
+            "issue_type": clean_text(row.get("issue_type")),
+            "comparison_evidence": clean_text(row.get("comparison_evidence")),
+            "project_code": clean_text(row.get("project_code")),
+            "source_path": clean_text(row.get("source_file")),
+            "learning_source": clean_text(row.get("learning_source")),
+        })
+    return out
+
+
+def extract_correction_pairs(text: Any) -> List[Tuple[str, str]]:
+    """Izvelk kļūdainais→pareizais pārus no akceptētas piezīmes."""
+    value = clean_text(text)
+    pairs: List[Tuple[str, str]] = []
+    patterns = [
+        r'["“”\']([^"“”\']{2,120})["“”\']\s*(?:→|->|=>|uz)\s*["“”\']([^"“”\']{2,120})["“”\']',
+        r'\b([A-Za-zĀ-ž0-9./+\-]{2,80})\s*(?:→|->|=>)\s*([A-Za-zĀ-ž0-9./+\-]{2,80})\b',
+    ]
+    for pattern in patterns:
+        for match in re.finditer(pattern, value, flags=re.I):
+            wrong = clean_text(match.group(1)).strip(" ,.;:")
+            correct = clean_text(match.group(2)).strip(" ,.;:")
+            if wrong and correct and wrong.casefold() != correct.casefold():
+                pairs.append((wrong, correct))
+    return pairs
+
+
+def feedback_blocked_texts(feedback_df: pd.DataFrame) -> List[str]:
+    if feedback_df is None or feedback_df.empty:
+        return []
+    values: List[str] = []
+    for _, row in feedback_df.iterrows():
+        if not parse_bool_value(
+            row.get("do_not_show_similar")
+            or row.get("turpmāk līdzīgas piezīmes nerādīt"),
+            default=False,
+        ):
+            continue
+        for col in ["target_text", "comment_text", "problem", "title"]:
+            value = clean_text(row.get(col))
+            if value and value.casefold() not in {v.casefold() for v in values}:
+                values.append(value)
+    return values
+
+
+def text_is_blocked_by_feedback(text: Any, blocked_values: List[str]) -> bool:
+    low = clean_text(text).casefold()
+    if not low:
+        return False
+    for blocked in blocked_values:
+        b = clean_text(blocked).casefold()
+        if len(b) >= 4 and (b in low or low in b):
+            return True
+    return False
+
+
+def build_deterministic_spelling_rules(
+    project_df: pd.DataFrame,
+    feedback_df: pd.DataFrame,
+) -> List[Dict[str, str]]:
+    """No akceptētām projekta piezīmēm izveido atkārtoti meklējamus teksta noteikumus."""
+    if project_df is None or project_df.empty:
+        return []
+    blocked = feedback_blocked_texts(feedback_df)
+    rules: List[Dict[str, str]] = []
+    seen = set()
+    for _, row in project_df.iterrows():
+        family = clean_text(row.get("normalized_family") or row.get("family"))
+        if family not in {"A_text_language", "B_lv_en"}:
+            continue
+        source_texts = [
+            row.get("comment_text"),
+            row.get("comparison_evidence"),
+            row.get("target_text"),
+        ]
+        pairs: List[Tuple[str, str]] = []
+        for source_text in source_texts:
+            pairs.extend(extract_correction_pairs(source_text))
+        for wrong, correct in pairs:
+            key = (wrong.casefold(), correct.casefold())
+            if key in seen or text_is_blocked_by_feedback(wrong, blocked):
+                continue
+            seen.add(key)
+            rules.append({
+                "wrong": wrong,
+                "correct": correct,
+                "issue_type": clean_text(row.get("issue_type")) or "known_spelling_correction",
+                "source": clean_text(row.get("learning_source")) or "project_example",
+            })
+    return rules
+
+
+def detect_project_spelling_candidates(
+    pdf_item: Dict[str, Any],
+    rules: List[Dict[str, str]],
+) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    seen = set()
+    for page_data in pdf_item.get("pages", []) or []:
+        page_no = int(page_data.get("page") or 1)
+        page_text = clean_text(page_data.get("text"))
+        for rule in rules:
+            wrong = clean_text(rule.get("wrong"))
+            correct = clean_text(rule.get("correct"))
+            if not wrong or wrong.casefold() not in page_text.casefold():
+                continue
+            key = (page_no, wrong.casefold(), correct.casefold())
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append({
+                "title": f"Zināma teksta kļūda: {wrong}",
+                "where": f"{page_no}. lapa",
+                "target_page": page_no,
+                "target_area": "teksts",
+                "target_text": wrong,
+                "status": "known_project_spelling_error",
+                "problem": f"Tekstā norādīts “{wrong}”; iepriekš akceptētais labojums ir “{correct}”.",
+                "designer_note": f"Lūdzu labot “{wrong}” uz “{correct}”.",
+                "issue_type": clean_text(rule.get("issue_type")) or "known_spelling_correction",
+                "severity": "low",
+                "markup_type": "highlight",
+                "placement_confidence": "exact",
+                "evidence": wrong,
+                "family": "A_text_language",
+                "candidate_source": "project_deterministic_rule",
+            })
+    return out
+
+
+def split_text_for_grammar(pdf_item: Dict[str, Any], chunk_chars: int = 3500) -> List[Dict[str, Any]]:
+    """Sadala PDF tekstu lapu/bloku vienībās rūpīgai gramatikas analīzei."""
+    chunks: List[Dict[str, Any]] = []
+    for page_data in pdf_item.get("pages", []) or []:
+        page_no = int(page_data.get("page") or 1)
+        text = clean_text(page_data.get("text"))
+        if not text:
+            continue
+        paragraphs = re.split(r"\n\s*\n|(?<=\.)\s+(?=[A-ZĀČĒĢĪĶĻŅŠŪŽ])", text)
+        current = ""
+        for paragraph in paragraphs:
+            paragraph = clean_text(paragraph)
+            if not paragraph:
+                continue
+            if current and len(current) + len(paragraph) + 1 > chunk_chars:
+                chunks.append({"page": page_no, "text": current})
+                current = paragraph
+            else:
+                current = f"{current}\n{paragraph}".strip()
+        if current:
+            chunks.append({"page": page_no, "text": current})
+    return chunks
+
+
+def candidate_blocked_by_feedback(
+    candidate: Dict[str, Any],
+    feedback_df: pd.DataFrame,
+) -> bool:
+    blocked = feedback_blocked_texts(feedback_df)
+    combined = " | ".join(
+        clean_text(candidate.get(col))
+        for col in ["title", "target_text", "problem", "designer_note", "evidence"]
+    )
+    return text_is_blocked_by_feedback(combined, blocked)
+
+
 def score_example(
     row: pd.Series,
     pdf_name: str,
@@ -2295,6 +2655,80 @@ def detect_unit_case_candidates(pdf_item: Dict[str, Any]) -> List[Dict[str, Any]
                     "family": "A_text_language",
                 })
     return out
+
+
+
+def call_ai_for_grammar_chunks(
+    client,
+    model: str,
+    pdf_item: Dict[str, Any],
+    examples: List[Dict[str, str]],
+    negative_rules: List[str],
+) -> Tuple[List[Dict[str, Any]], List[str]]:
+    """A_text_language pārbauda pa īsiem blokiem un neatgriež tikai pirmās 4 kļūdas."""
+    errors: List[str] = []
+    all_candidates: List[Dict[str, Any]] = []
+    pdf_name = clean_text(pdf_item.get("rel_path") or pdf_item.get("name"))
+    for index, chunk in enumerate(split_text_for_grammar(pdf_item), start=1):
+        page_no = int(chunk.get("page") or 1)
+        chunk_text = clean_text(chunk.get("text"))
+        system = (
+            "Tu esi rūpīgs būvprojekta teksta redaktors. Atrodi VISAS konkrētajā teksta blokā "
+            "pierādāmās drukas, pareizrakstības, locījumu, pieturzīmju un acīmredzamas terminoloģijas kļūdas. "
+            "Neierobežo rezultātu ar noteiktu kandidātu skaitu. Neziņo par gaumes jautājumiem. "
+            "Katrai kļūdai target_text ir burtiski blokā atrodams kļūdainais vārds vai īsa frāze. "
+            "Komentārs obligāti latviešu valodā. Atbildi tikai JSON."
+        )
+        payload = {
+            "pdf_file": pdf_name,
+            "page": page_no,
+            "task": "Atrodi visas pamatotās teksta kļūdas šajā vienā PDF lapas blokā.",
+            "project_examples": examples,
+            "negative_rules_do_not_repeat": negative_rules,
+            "text_block": chunk_text,
+            "required_json_schema": {
+                "candidates": [{
+                    "title": "īss kļūdas nosaukums",
+                    "target_page": page_no,
+                    "target_area": "teksts",
+                    "target_text": "precīzs kļūdainais teksts no text_block",
+                    "problem": "kas tieši ir nepareizi un kāds ir labojums",
+                    "designer_note": "īss komentārs projektētājam latviešu valodā",
+                    "issue_type": "spelling_or_grammar_error",
+                    "severity": "low|medium",
+                    "markup_type": "highlight",
+                    "placement_confidence": "exact",
+                    "evidence": "tas pats kļūdainais teksts",
+                }]
+            },
+        }
+        try:
+            response = client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+                ],
+                temperature=0,
+                response_format={"type": "json_object"},
+            )
+            data = json.loads(strip_json_fences(response.choices[0].message.content or "{}"))
+            rows = data.get("candidates", [])
+            if not isinstance(rows, list):
+                errors.append(f"Gramatikas bloks {index}: candidates nav saraksts.")
+                continue
+            for raw in rows:
+                if not isinstance(raw, dict):
+                    continue
+                raw["target_page"] = page_no
+                raw["family"] = "A_text_language"
+                candidate = normalize_candidate(raw, "A_text_language")
+                target = clean_text(candidate.get("target_text"))
+                if target and target.casefold() in chunk_text.casefold() and not candidate_is_too_vague(candidate):
+                    all_candidates.append(candidate)
+        except Exception as exc:
+            errors.append(f"Gramatikas bloks {index}, {page_no}. lapa: {exc}")
+    return all_candidates, errors
 
 
 def call_ai_for_family(
@@ -3592,6 +4026,9 @@ def init_state():
         "index_df": pd.DataFrame(),
         "index_file": None,
         "feedback_df": pd.DataFrame(),
+        "project_learning_df": pd.DataFrame(),
+        "project_learning_messages": [],
+        "project_learning_code": "",
         "feedback_project_code": "",
         "feedback_messages": [],
         "selected_pdf_bytes": None,
@@ -3702,8 +4139,27 @@ def main():
         model = st.text_input("OpenAI modelis", value=get_secret("OPENAI_MODEL", default="gpt-4.1-mini") or "gpt-4.1-mini")
         max_context_chars = st.slider("PDF konteksta garums", 5000, 60000, 25000, 5000)
         max_examples_per_family = st.slider("Piemēri vienai ģimenei", 1, 12, 12, 1)
-        max_candidates_per_family = st.slider("Max piezīmes vienai ģimenei", 0, 8, 4, 1)
-        st.caption("0 nozīmē: ģimeni šoreiz nepalaist.")
+        unlimited_candidates = st.checkbox(
+            "Neierobežot piezīmju skaitu vienai ģimenei",
+            value=True,
+            help=(
+                "Īpaši A_text_language ģimene tiek analizēta pa īsiem lapu blokiem "
+                "un atgriež visas pamatotās kļūdas."
+            ),
+        )
+        max_candidates_per_family = st.number_input(
+            "Drošības limits vienai ģimenei vienā PDF",
+            min_value=1,
+            max_value=100,
+            value=30,
+            step=5,
+            disabled=unlimited_candidates,
+        )
+        effective_candidate_limit = 0 if unlimited_candidates else int(max_candidates_per_family)
+        st.caption(
+            "Ja neierobežotais režīms ir ieslēgts, gramatikas pārbaude notiek pa blokiem; "
+            "citām ģimenēm API tiek prasīts atgriezt visas pamatotās piezīmes."
+        )
 
         index_df = st.session_state.get("index_df", pd.DataFrame())
         if not index_df.empty:
@@ -4099,12 +4555,35 @@ def main():
                     st.session_state.feedback_project_code = active_project_code
                     st.session_state.feedback_messages = feedback_messages
 
+                learning_code = normalize_project_code(
+                    st.session_state.get("active_project_memory_code")
+                    or active_project_code
+                )
+                if learning_code != st.session_state.get("project_learning_code"):
+                    with st.spinner(f"Nolasu projekta {learning_code} akceptētos piemērus..."):
+                        learning_df, learning_messages = load_project_learning_examples(
+                            service,
+                            memory_folder_id.strip(),
+                            learning_code,
+                            clean_text(st.session_state.get("active_project_memory_id")),
+                        )
+                    st.session_state.project_learning_df = learning_df
+                    st.session_state.project_learning_messages = learning_messages
+                    st.session_state.project_learning_code = learning_code
+
                 st.info(
                     f"Problēmu Excel ielasīti automātiski: {len(st.session_state.feedback_df)} rindas "
                     f"projektam {active_project_code or '-'}"
                 )
                 for feedback_message in st.session_state.get("feedback_messages", []):
                     st.warning(feedback_message)
+
+                st.info(
+                    "Aktīvā projekta akceptētie piemēri: "
+                    f"{len(st.session_state.get('project_learning_df', pd.DataFrame()))} rindas"
+                )
+                for learning_message in st.session_state.get("project_learning_messages", []):
+                    st.caption(learning_message)
 
                 selected_project_files = [
                     f for f in normalized_pdf_files
@@ -4568,14 +5047,23 @@ def main():
             per_pdf_families = [
                 family for family in selected_families
                 if family != "J_cross_document_traceability"
-                and max_candidates_per_family > 0
             ]
             run_cross_document = (
                 "J_cross_document_traceability" in selected_family_set
-                and max_candidates_per_family > 0
                 and len(selected_pdf_items) >= 2
             )
-            negative_rules = make_negative_rules(st.session_state.feedback_df)
+            negative_rules = make_negative_rules(
+                st.session_state.feedback_df,
+                max_rules=100,
+            )
+            project_learning_df = st.session_state.get(
+                "project_learning_df",
+                pd.DataFrame(),
+            )
+            deterministic_spelling_rules = build_deterministic_spelling_rules(
+                project_learning_df,
+                st.session_state.feedback_df,
+            )
             total_steps = max(
                 1,
                 len(selected_pdf_items) * len(per_pdf_families)
@@ -4627,6 +5115,12 @@ def main():
 
                 if "A_text_language" in selected_family_set:
                     deterministic = detect_unit_case_candidates(pdf_item)
+                    deterministic.extend(
+                        detect_project_spelling_candidates(
+                            pdf_item,
+                            deterministic_spelling_rules,
+                        )
+                    )
                     for candidate in deterministic:
                         candidate["source_pdf"] = pdf_name
                         candidate["source_pdf_rel_path"] = pdf_rel_path
@@ -4646,7 +5140,14 @@ def main():
                     render_pdf_progress_dashboard(
                         pdf_progress_placeholder, pdf_states, len(per_pdf_families)
                     )
-                    examples = select_examples(
+                    project_examples = select_project_examples(
+                        project_learning_df,
+                        family,
+                        pdf_name,
+                        pdf_text,
+                        max_examples=16,
+                    )
+                    global_examples = select_examples(
                         st.session_state.index_df,
                         family,
                         pdf_name,
@@ -4657,16 +5158,32 @@ def main():
                             or st.session_state.get("applied_project_filter", "")
                         ),
                     )
-                    candidates, err = call_ai_for_family(
-                        client=client,
-                        model=model,
-                        pdf_name=pdf_rel_path,
-                        pdf_text=pdf_text,
-                        family=family,
-                        examples=examples,
-                        negative_rules=negative_rules,
-                        max_candidates=max_candidates_per_family,
-                    )
+                    examples = project_examples + global_examples
+
+                    if family == "A_text_language" and unlimited_candidates:
+                        candidates, grammar_errors = call_ai_for_grammar_chunks(
+                            client=client,
+                            model=model,
+                            pdf_item=pdf_item,
+                            examples=examples,
+                            negative_rules=negative_rules,
+                        )
+                        err = " | ".join(grammar_errors)
+                    else:
+                        candidates, err = call_ai_for_family(
+                            client=client,
+                            model=model,
+                            pdf_name=pdf_rel_path,
+                            pdf_text=pdf_text,
+                            family=family,
+                            examples=examples,
+                            negative_rules=negative_rules,
+                            max_candidates=(
+                                effective_candidate_limit
+                                if effective_candidate_limit > 0
+                                else 100
+                            ),
+                        )
                     if err:
                         errors.append({"pdf": pdf_rel_path, "family": family, "error": err})
                     for candidate in candidates:
@@ -4698,7 +5215,13 @@ def main():
                     str(item.get("text") or "")[:5000]
                     for item in selected_pdf_items
                 )
-                examples = select_examples(
+                examples = select_project_examples(
+                    project_learning_df,
+                    "J_cross_document_traceability",
+                    "MULTI_PDF",
+                    combined_text,
+                    max_examples=16,
+                ) + select_examples(
                     st.session_state.index_df,
                     "J_cross_document_traceability",
                     "MULTI_PDF",
@@ -4715,7 +5238,7 @@ def main():
                     pdf_items=selected_pdf_items,
                     examples=examples,
                     negative_rules=negative_rules,
-                    max_candidates=max_candidates_per_family,
+                    max_candidates=(effective_candidate_limit if effective_candidate_limit > 0 else 100),
                 )
                 if err:
                     errors.append({
@@ -4750,6 +5273,11 @@ def main():
             for ordinal, raw in enumerate(all_candidates, start=1):
                 family = clean_text(raw.get("family"))
                 candidate = normalize_candidate(raw, family)
+                if candidate_blocked_by_feedback(
+                    candidate,
+                    st.session_state.feedback_df,
+                ):
+                    continue
                 if candidate_is_too_vague(candidate):
                     continue
                 dedupe_key = (
