@@ -44,7 +44,7 @@ except Exception:
     HttpError = Exception
 
 
-APP_VERSION = "v0.9.5"
+APP_VERSION = "v0.9.6"
 APP_TITLE = f"BP AI Audit Copilot {APP_VERSION}"
 
 REQUIRED_EXPORT_COLUMNS = [
@@ -2926,6 +2926,260 @@ def call_ai_for_grammar_chunks(
             errors.append(f"Gramatikas bloks {index}, {page_no}. lapa: {exc}")
     return all_candidates, errors
 
+
+SA_TECHNICAL_FAMILIES = [
+    "G_material_type_model",
+    "H_quantity_position",
+    "I_specification_coverage",
+    "J_cross_document_traceability",
+    "L_fire_safety_or_regulatory_logic",
+    "M_scope_or_discipline_boundary",
+    "N_completeness_or_missing_content",
+]
+
+
+def split_sa_technical_chunks(
+    pdf_item: Dict[str, Any],
+    chunk_chars: int = 6500,
+) -> List[Dict[str, Any]]:
+    """Sadala SA skaidrojošo aprakstu tehniskos blokos, saglabājot lapu norādes."""
+    chunks: List[Dict[str, Any]] = []
+    current_parts: List[str] = []
+    current_pages: List[int] = []
+    current_len = 0
+
+    for page_data in pdf_item.get("pages", []) or []:
+        page_no = int(page_data.get("page") or 1)
+        page_text = clean_text(page_data.get("text"))
+        if not page_text:
+            continue
+
+        page_block = f"===== PAGE {page_no} =====\n{page_text}"
+        if current_parts and current_len + len(page_block) > chunk_chars:
+            chunks.append({
+                "pages": list(current_pages),
+                "text": "\n\n".join(current_parts),
+            })
+            current_parts = []
+            current_pages = []
+            current_len = 0
+
+        current_parts.append(page_block)
+        current_pages.append(page_no)
+        current_len += len(page_block)
+
+    if current_parts:
+        chunks.append({
+            "pages": list(current_pages),
+            "text": "\n\n".join(current_parts),
+        })
+
+    return chunks
+
+
+def select_sa_technical_chunks(
+    chunks: List[Dict[str, Any]],
+    max_chunks: int,
+) -> List[Dict[str, Any]]:
+    """Vienmērīgi atlasa tehniskos blokus visā dokumenta garumā."""
+    if max_chunks <= 0 or len(chunks) <= max_chunks:
+        return chunks
+    if max_chunks == 1:
+        return [chunks[0]]
+
+    indexes = {
+        round(i * (len(chunks) - 1) / (max_chunks - 1))
+        for i in range(max_chunks)
+    }
+    return [chunks[index] for index in sorted(indexes)]
+
+
+def call_ai_for_sa_technical_chunks(
+    client,
+    model: str,
+    pdf_item: Dict[str, Any],
+    examples: List[Dict[str, str]],
+    negative_rules: List[str],
+    max_chunks: int = 10,
+    chunk_chars: int = 6500,
+    max_candidates_per_chunk: int = 3,
+    max_total_candidates: int = 18,
+    progress_callback: Optional[Any] = None,
+) -> Tuple[List[Dict[str, Any]], List[str]]:
+    """Meklē SA skaidrojošajā aprakstā tehniskas un saturiskas nepilnības."""
+    pdf_name = clean_text(
+        pdf_item.get("rel_path")
+        or pdf_item.get("name")
+    )
+    all_chunks = split_sa_technical_chunks(
+        pdf_item,
+        chunk_chars=chunk_chars,
+    )
+    chunks = select_sa_technical_chunks(
+        all_chunks,
+        max_chunks=max_chunks,
+    )
+
+    candidates_out: List[Dict[str, Any]] = []
+    errors: List[str] = []
+    seen = set()
+
+    system = (
+        "Tu esi būvprojekta SA skaidrojošā apraksta tehniskais auditors. "
+        "Prioritāte ir risinājumu, skaitļu, daudzumu, materiālu, "
+        "ugunsdrošības, savstarpējo atsauču, trūkstoša satura un "
+        "disciplīnu robežu kļūdām. "
+        "NEZIŅO par stilu, formulējuma gaumi, pareizrakstību, galotnēm, "
+        "datumiem vai revīziju datumu atšķirībām. "
+        "Atgriez tikai konkrēti pierādāmas problēmas. "
+        "Ja vienā blokā minētas savstarpēji pretrunīgas vērtības, nosauc abas. "
+        "Ja trūkst obligāti sagaidāma satura, norādi precīzu sadaļu vai atsauci, "
+        "kas apliecina trūkumu. "
+        "target_text obligāti ir īss, burtiski blokā atrodams teksts vai vērtība. "
+        "Komentāram jābūt latviešu valodā. "
+        "Atbildi tikai derīgā JSON."
+    )
+
+    for index, chunk in enumerate(chunks, start=1):
+        if len(candidates_out) >= max_total_candidates:
+            break
+
+        pages = chunk.get("pages") or []
+        chunk_text = clean_text(chunk.get("text"))
+        remaining = max_total_candidates - len(candidates_out)
+        chunk_limit = min(max_candidates_per_chunk, remaining)
+        if chunk_limit <= 0:
+            break
+
+        if progress_callback:
+            try:
+                progress_callback(index, len(chunks), pages)
+            except Exception:
+                pass
+
+        payload = {
+            "pdf_file": pdf_name,
+            "pages_in_block": pages,
+            "task": (
+                "Atrodi būtiskas SA tehniskās un saturiskās nepilnības. "
+                "Valodas, stila un datumu piezīmes neatgriez."
+            ),
+            "allowed_families": SA_TECHNICAL_FAMILIES,
+            "max_candidates_this_block": chunk_limit,
+            "similar_positive_examples": examples,
+            "negative_rules_do_not_repeat": negative_rules,
+            "document_block": chunk_text,
+            "required_json_schema": {
+                "candidates": [{
+                    "title": "īss tehniskas problēmas nosaukums",
+                    "family": (
+                        "G_material_type_model|H_quantity_position|"
+                        "I_specification_coverage|J_cross_document_traceability|"
+                        "L_fire_safety_or_regulatory_logic|"
+                        "M_scope_or_discipline_boundary|"
+                        "N_completeness_or_missing_content"
+                    ),
+                    "issue_type": "normalizēts tehniskais kļūdas tips",
+                    "target_page": "lapa no pages_in_block",
+                    "target_area": "sadaļa vai tabula",
+                    "target_text": (
+                        "īss burtisks citāts vai vērtība no document_block"
+                    ),
+                    "problem": (
+                        "konkrēts tehnisks konstatējums ar abām vērtībām, "
+                        "ja ir iekšēja pretruna"
+                    ),
+                    "designer_note": (
+                        "īss konkrēts komentārs projektētājam latviešu valodā"
+                    ),
+                    "severity": "medium|high",
+                    "markup_type": "highlight|page_note",
+                    "placement_confidence": "exact|manual_needed",
+                    "evidence": "precīzs citāts vai vērtības",
+                }]
+            },
+        }
+
+        try:
+            response = client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": system},
+                    {
+                        "role": "user",
+                        "content": json.dumps(
+                            payload,
+                            ensure_ascii=False,
+                        ),
+                    },
+                ],
+                temperature=0,
+                response_format={"type": "json_object"},
+            )
+            data = json.loads(
+                strip_json_fences(
+                    response.choices[0].message.content or "{}"
+                )
+            )
+            rows = data.get("candidates", [])
+            if not isinstance(rows, list):
+                errors.append(
+                    f"SA tehniskais bloks {index}: candidates nav saraksts."
+                )
+                continue
+
+            for raw in rows[:chunk_limit]:
+                if not isinstance(raw, dict):
+                    continue
+
+                family = clean_text(raw.get("family"))
+                if family not in SA_TECHNICAL_FAMILIES:
+                    continue
+
+                candidate = normalize_candidate(raw, family)
+                target = clean_text(candidate.get("target_text"))
+
+                if (
+                    target
+                    and target != "MANUAL_PLACEMENT_REQUIRED"
+                    and target.casefold() not in chunk_text.casefold()
+                ):
+                    continue
+                if candidate_is_too_vague(candidate):
+                    continue
+                if candidate_blocked_by_feedback(
+                    candidate,
+                    pd.DataFrame(),
+                ):
+                    continue
+
+                key = (
+                    family,
+                    clean_text(candidate.get("target_page")),
+                    re.sub(
+                        r"\s+",
+                        " ",
+                        target.casefold(),
+                    ).strip(" ,.;:"),
+                    clean_text(candidate.get("issue_type")).casefold(),
+                )
+                if key in seen:
+                    continue
+
+                seen.add(key)
+                candidates_out.append(candidate)
+
+                if len(candidates_out) >= max_total_candidates:
+                    break
+
+        except Exception as exc:
+            errors.append(
+                f"SA tehniskais bloks {index}: {exc}"
+            )
+
+    return candidates_out, errors
+
+
 def call_ai_for_family(
     client,
     model: str,
@@ -4329,22 +4583,26 @@ def families_for_pdf(
         return regular
 
     selected_set = set(regular)
-    ordered = [
-        family
-        for family in SA_EXPLANATORY_TECHNICAL_ORDER
-        if family in selected_set
-    ]
+    ordered: List[str] = []
 
-    # Pievieno citas izvēlētās ģimenes, izņemot datumus un valodu.
-    for family in regular:
-        if family in {
-            "C_dates_versions",
-            "A_text_language",
-        }:
-            continue
-        if family not in ordered:
+    if any(
+        family in selected_set
+        for family in SA_TECHNICAL_FAMILIES
+    ):
+        ordered.append("SA_technical_sections")
+
+    # Atsevišķi saglabā dokumenta identitātes, atsauču un tulkojuma pārbaudes.
+    for family in [
+        "D_document_identity",
+        "E_drawing_list_references",
+        "F_normative_references",
+        "B_lv_en",
+        "K_solution_or_graphic_clarity",
+    ]:
+        if family in selected_set:
             ordered.append(family)
 
+    # C_dates_versions SA skaidrojošajam aprakstam netiek palaista.
     if "A_text_language" in selected_set:
         ordered.append("A_text_language")
 
@@ -4367,6 +4625,8 @@ def candidate_quality_score(candidate: Dict[str, Any]) -> float:
         score += 100.0
     elif source == "project_deterministic_rule":
         score += 80.0
+    elif source == "sa_technical_sections":
+        score += 35.0
 
     placement = clean_text(candidate.get("placement_confidence")).casefold()
     markup = clean_text(candidate.get("markup_type")).casefold()
@@ -5659,25 +5919,108 @@ def main():
                     render_pdf_progress_dashboard(
                         pdf_progress_placeholder, pdf_states, max_family_steps
                     )
-                    project_examples = select_project_examples(
-                        project_learning_df,
-                        family,
-                        pdf_name,
-                        pdf_text,
-                        max_examples=audit_budget["project_examples"],
-                    )
-                    global_examples = select_examples(
-                        st.session_state.index_df,
-                        family,
-                        pdf_name,
-                        pdf_text,
-                        max_examples_per_family,
-                        project_code=normalize_project_code(
-                            st.session_state.get("active_project_memory_code")
-                            or st.session_state.get("applied_project_filter", "")
-                        ),
-                    )
-                    examples = project_examples + global_examples
+                    if family == "SA_technical_sections":
+                        technical_examples: List[Dict[str, str]] = []
+                        for technical_family in SA_TECHNICAL_FAMILIES:
+                            technical_examples.extend(
+                                select_project_examples(
+                                    project_learning_df,
+                                    technical_family,
+                                    pdf_name,
+                                    pdf_text,
+                                    max_examples=2,
+                                )
+                            )
+                            technical_examples.extend(
+                                select_examples(
+                                    st.session_state.index_df,
+                                    technical_family,
+                                    pdf_name,
+                                    pdf_text,
+                                    2,
+                                    project_code=normalize_project_code(
+                                        st.session_state.get(
+                                            "active_project_memory_code"
+                                        )
+                                        or st.session_state.get(
+                                            "applied_project_filter",
+                                            "",
+                                        )
+                                    ),
+                                )
+                            )
+
+                        def sa_technical_progress_callback(
+                            block_index: int,
+                            block_total: int,
+                            pages: List[int],
+                        ) -> None:
+                            page_label = (
+                                f"{pages[0]}–{pages[-1]}"
+                                if len(pages) > 1
+                                else str(pages[0])
+                                if pages
+                                else "?"
+                            )
+                            status.write(
+                                f"PDF {pdf_i}/{len(selected_pdf_items)} | "
+                                f"SA tehniskais bloks {block_index}/{block_total} | "
+                                f"lapas {page_label} | {pdf_rel_path}"
+                            )
+                            if pdf_state is not None:
+                                pdf_state["current_family"] = (
+                                    f"SA tehniskais bloks "
+                                    f"{block_index}/{block_total}"
+                                )
+                            render_pdf_progress_dashboard(
+                                pdf_progress_placeholder,
+                                pdf_states,
+                                max_family_steps,
+                            )
+
+                        candidates, technical_errors = (
+                            call_ai_for_sa_technical_chunks(
+                                client=client,
+                                model=model,
+                                pdf_item=pdf_item,
+                                examples=technical_examples,
+                                negative_rules=negative_rules,
+                                max_chunks=10,
+                                chunk_chars=6500,
+                                max_candidates_per_chunk=3,
+                                max_total_candidates=18,
+                                progress_callback=(
+                                    sa_technical_progress_callback
+                                ),
+                            )
+                        )
+                        err = " | ".join(technical_errors)
+
+                    else:
+                        project_examples = select_project_examples(
+                            project_learning_df,
+                            family,
+                            pdf_name,
+                            pdf_text,
+                            max_examples=audit_budget["project_examples"],
+                        )
+                        global_examples = select_examples(
+                            st.session_state.index_df,
+                            family,
+                            pdf_name,
+                            pdf_text,
+                            max_examples_per_family,
+                            project_code=normalize_project_code(
+                                st.session_state.get(
+                                    "active_project_memory_code"
+                                )
+                                or st.session_state.get(
+                                    "applied_project_filter",
+                                    "",
+                                )
+                            ),
+                        )
+                        examples = project_examples + global_examples
 
                     if family == "A_text_language":
                         already_reported_texts = [
@@ -5740,7 +6083,7 @@ def main():
                             progress_callback=grammar_progress_callback,
                         )
                         err = " | ".join(grammar_errors)
-                    else:
+                    elif family != "SA_technical_sections":
                         candidates, err = call_ai_for_family(
                             client=client,
                             model=model,
@@ -5765,6 +6108,10 @@ def main():
                     for candidate in candidates:
                         candidate["source_pdf"] = pdf_name
                         candidate["source_pdf_rel_path"] = pdf_rel_path
+                        if family == "SA_technical_sections":
+                            candidate[
+                                "candidate_source"
+                            ] = "sa_technical_sections"
                         all_candidates.append(candidate)
                     if pdf_state is not None:
                         pdf_state["completed"] += 1
