@@ -44,7 +44,7 @@ except Exception:
     HttpError = Exception
 
 
-APP_VERSION = "v0.9.4"
+APP_VERSION = "v0.9.5"
 APP_TITLE = f"BP AI Audit Copilot {APP_VERSION}"
 
 REQUIRED_EXPORT_COLUMNS = [
@@ -4273,6 +4273,91 @@ def init_state():
 
 
 
+
+SA_EXPLANATORY_TECHNICAL_ORDER = [
+    "G_material_type_model",
+    "H_quantity_position",
+    "I_specification_coverage",
+    "L_fire_safety_or_regulatory_logic",
+    "M_scope_or_discipline_boundary",
+    "N_completeness_or_missing_content",
+    "D_document_identity",
+    "E_drawing_list_references",
+    "F_normative_references",
+    "B_lv_en",
+    "K_solution_or_graphic_clarity",
+]
+
+
+def is_sa_explanatory_note_name(value: Any) -> bool:
+    name = clean_text(value)
+    discipline = infer_discipline_from_filename(name).casefold()
+    role = infer_document_role(name)
+    low = name.casefold()
+
+    is_sa = discipline == "sa" or "_sa_" in low
+    is_explanatory = (
+        role == "description"
+        or "explanatorynote" in low
+        or "explanatory_note" in low
+        or "skaidroj" in low
+        or "_td_" in low
+    )
+    return is_sa and is_explanatory
+
+
+def families_for_pdf(
+    selected_families: List[str],
+    pdf_item: Dict[str, Any],
+) -> List[str]:
+    """SA skaidrojošam aprakstam tehniskās ģimenes palaiž pirmās.
+
+    C_dates_versions pēc noklusējuma izlaiž, jo jaunāks datums parasti nozīmē
+    korektu jaunu revīziju. A_text_language vienmēr paliek pēdējā.
+    """
+    regular = [
+        family
+        for family in selected_families
+        if family != "J_cross_document_traceability"
+    ]
+
+    pdf_name = clean_text(
+        pdf_item.get("rel_path")
+        or pdf_item.get("name")
+    )
+    if not is_sa_explanatory_note_name(pdf_name):
+        return regular
+
+    selected_set = set(regular)
+    ordered = [
+        family
+        for family in SA_EXPLANATORY_TECHNICAL_ORDER
+        if family in selected_set
+    ]
+
+    # Pievieno citas izvēlētās ģimenes, izņemot datumus un valodu.
+    for family in regular:
+        if family in {
+            "C_dates_versions",
+            "A_text_language",
+        }:
+            continue
+        if family not in ordered:
+            ordered.append(family)
+
+    if "A_text_language" in selected_set:
+        ordered.append("A_text_language")
+
+    return ordered
+
+
+def is_sa_explanatory_candidate(candidate: Dict[str, Any]) -> bool:
+    return is_sa_explanatory_note_name(
+        candidate.get("source_pdf_rel_path")
+        or candidate.get("source_pdf")
+    )
+
+
 def candidate_quality_score(candidate: Dict[str, Any]) -> float:
     """Piešķir prioritāti precīzām, pierādāmām un lietotāja importētām piezīmēm."""
     score = 0.0
@@ -4325,6 +4410,30 @@ def candidate_quality_score(candidate: Dict[str, Any]) -> float:
     }:
         score += 4.0
 
+    if is_sa_explanatory_candidate(candidate):
+        if family in {
+            "G_material_type_model",
+            "H_quantity_position",
+            "I_specification_coverage",
+            "J_cross_document_traceability",
+            "L_fire_safety_or_regulatory_logic",
+            "M_scope_or_discipline_boundary",
+            "N_completeness_or_missing_content",
+        }:
+            score += 18.0
+        elif family in {
+            "D_document_identity",
+            "E_drawing_list_references",
+            "F_normative_references",
+            "B_lv_en",
+            "K_solution_or_graphic_clarity",
+        }:
+            score += 8.0
+        elif family == "A_text_language":
+            score -= 10.0
+        elif family == "C_dates_versions":
+            score -= 30.0
+
     if family == "A_text_language" and source not in {
         "manual_excel_import",
         "project_deterministic_rule",
@@ -4374,19 +4483,57 @@ def limit_candidates_per_pdf(
             if row not in protected
         ]
 
-        ordinary.sort(
-            key=lambda row: (
-                candidate_quality_score(row),
-                clean_text(row.get("target_page")),
-            ),
-            reverse=True,
-        )
+        if rows and is_sa_explanatory_candidate(rows[0]):
+            technical = [
+                row
+                for row in ordinary
+                if clean_text(row.get("family"))
+                not in {"A_text_language", "C_dates_versions"}
+            ]
+            language = [
+                row
+                for row in ordinary
+                if clean_text(row.get("family")) == "A_text_language"
+            ]
 
-        available_slots = max(
-            0,
-            int(max_notes_per_pdf) - len(protected),
-        )
-        selected = protected + ordinary[:available_slots]
+            technical.sort(
+                key=lambda row: (
+                    candidate_quality_score(row),
+                    clean_text(row.get("target_page")),
+                ),
+                reverse=True,
+            )
+            language.sort(
+                key=lambda row: (
+                    candidate_quality_score(row),
+                    clean_text(row.get("target_page")),
+                ),
+                reverse=True,
+            )
+
+            # SA skaidrojošajā aprakstā tehniskais saturs netiek izspiests
+            # ar valodas piezīmēm. Valodas piezīmēm ir atsevišķs limits 12.
+            technical_limit = 18
+            language_limit = 12
+            selected = (
+                protected
+                + technical[:technical_limit]
+                + language[:language_limit]
+            )
+        else:
+            ordinary.sort(
+                key=lambda row: (
+                    candidate_quality_score(row),
+                    clean_text(row.get("target_page")),
+                ),
+                reverse=True,
+            )
+            available_slots = max(
+                0,
+                int(max_notes_per_pdf) - len(protected),
+            )
+            selected = protected + ordinary[:available_slots]
+
         kept.extend(selected)
 
         suppressed = len(rows) - len(selected)
@@ -5397,10 +5544,19 @@ def main():
             pdf_progress_placeholder = st.empty()
 
             selected_family_set = set(selected_families)
-            per_pdf_families = [
-                family for family in selected_families
-                if family != "J_cross_document_traceability"
-            ]
+            family_plan_by_pdf = {
+                _canonical_drive_rel_path(
+                    item.get("rel_path") or item.get("name")
+                ): families_for_pdf(selected_families, item)
+                for item in selected_pdf_items
+            }
+            max_family_steps = max(
+                [
+                    len(families)
+                    for families in family_plan_by_pdf.values()
+                ]
+                or [1]
+            )
             run_cross_document = (
                 "J_cross_document_traceability" in selected_family_set
                 and len(selected_pdf_items) >= 2
@@ -5419,7 +5575,10 @@ def main():
             )
             total_steps = max(
                 1,
-                len(selected_pdf_items) * len(per_pdf_families)
+                sum(
+                    len(families)
+                    for families in family_plan_by_pdf.values()
+                )
                 + (1 if run_cross_document else 0),
             )
             step = 0
@@ -5440,19 +5599,26 @@ def main():
                 state_by_path[_canonical_drive_rel_path(rel_path)] = state
 
             render_pdf_progress_dashboard(
-                pdf_progress_placeholder, pdf_states, len(per_pdf_families)
+                pdf_progress_placeholder, pdf_states, max_family_steps
             )
 
             for pdf_i, pdf_item in enumerate(selected_pdf_items, start=1):
                 pdf_name = clean_text(pdf_item.get("name")) or "audit.pdf"
                 pdf_rel_path = clean_text(pdf_item.get("rel_path")) or pdf_name
                 pdf_text = clean_text(pdf_item.get("text"))
+                per_pdf_families = family_plan_by_pdf.get(
+                    _canonical_drive_rel_path(pdf_rel_path),
+                    [],
+                )
+                is_sa_explanatory = is_sa_explanatory_note_name(
+                    pdf_rel_path
+                )
                 pdf_state = state_by_path.get(_canonical_drive_rel_path(pdf_rel_path))
                 if pdf_state is not None:
                     pdf_state["status"] = "running"
                     pdf_state["current_family"] = "Sagatavo analīzi"
                     render_pdf_progress_dashboard(
-                        pdf_progress_placeholder, pdf_states, len(per_pdf_families)
+                        pdf_progress_placeholder, pdf_states, max_family_steps
                     )
 
                 if not pdf_text:
@@ -5462,7 +5628,7 @@ def main():
                         pdf_state["status"] = "error"
                         pdf_state["error"] = error_message
                         render_pdf_progress_dashboard(
-                            pdf_progress_placeholder, pdf_states, len(per_pdf_families)
+                            pdf_progress_placeholder, pdf_states, max_family_steps
                         )
                     continue
 
@@ -5491,7 +5657,7 @@ def main():
                         f"pārbaude {step}/{total_steps}: {family} | {pdf_rel_path}"
                     )
                     render_pdf_progress_dashboard(
-                        pdf_progress_placeholder, pdf_states, len(per_pdf_families)
+                        pdf_progress_placeholder, pdf_states, max_family_steps
                     )
                     project_examples = select_project_examples(
                         project_learning_df,
@@ -5536,8 +5702,27 @@ def main():
                                     f"A_text_language bloks {block_index}/{block_total}"
                                 )
                             render_pdf_progress_dashboard(
-                                pdf_progress_placeholder, pdf_states, len(per_pdf_families)
+                                pdf_progress_placeholder, pdf_states, max_family_steps
                             )
+
+                        grammar_max_chunks = audit_budget[
+                            "grammar_max_chunks"
+                        ]
+                        grammar_per_chunk = audit_budget[
+                            "grammar_per_chunk"
+                        ]
+                        grammar_total = audit_budget["grammar_total"]
+
+                        if is_sa_explanatory:
+                            grammar_max_chunks = max(
+                                grammar_max_chunks,
+                                6,
+                            )
+                            grammar_per_chunk = max(
+                                grammar_per_chunk,
+                                3,
+                            )
+                            grammar_total = 12
 
                         candidates, grammar_errors = call_ai_for_grammar_chunks(
                             client=client,
@@ -5545,10 +5730,12 @@ def main():
                             pdf_item=pdf_item,
                             examples=examples,
                             negative_rules=negative_rules,
-                            max_chunks=audit_budget["grammar_max_chunks"],
-                            chunk_chars=audit_budget["grammar_chunk_chars"],
-                            max_candidates_per_chunk=audit_budget["grammar_per_chunk"],
-                            max_total_candidates=audit_budget["grammar_total"],
+                            max_chunks=grammar_max_chunks,
+                            chunk_chars=audit_budget[
+                                "grammar_chunk_chars"
+                            ],
+                            max_candidates_per_chunk=grammar_per_chunk,
+                            max_total_candidates=grammar_total,
                             already_reported_texts=already_reported_texts,
                             progress_callback=grammar_progress_callback,
                         )
@@ -5562,7 +5749,16 @@ def main():
                             family=family,
                             examples=examples,
                             negative_rules=negative_rules,
-                            max_candidates=audit_budget["regular_family_limit"],
+                            max_candidates=(
+                                max(
+                                    audit_budget["regular_family_limit"],
+                                    7,
+                                )
+                                if is_sa_explanatory
+                                else audit_budget[
+                                    "regular_family_limit"
+                                ]
+                            ),
                         )
                     if err:
                         errors.append({"pdf": pdf_rel_path, "family": family, "error": err})
@@ -5575,14 +5771,14 @@ def main():
                         pdf_state["candidates"] += len(candidates)
                     progress.progress(step / total_steps)
                     render_pdf_progress_dashboard(
-                        pdf_progress_placeholder, pdf_states, len(per_pdf_families)
+                        pdf_progress_placeholder, pdf_states, max_family_steps
                     )
 
                 if pdf_state is not None:
                     pdf_state["status"] = "done"
                     pdf_state["current_family"] = ""
                     render_pdf_progress_dashboard(
-                        pdf_progress_placeholder, pdf_states, len(per_pdf_families)
+                        pdf_progress_placeholder, pdf_states, max_family_steps
                     )
 
             if run_cross_document:
@@ -5705,7 +5901,7 @@ def main():
                 if candidate_state is not None:
                     candidate_state["candidates"] += 1
             render_pdf_progress_dashboard(
-                pdf_progress_placeholder, pdf_states, len(per_pdf_families)
+                pdf_progress_placeholder, pdf_states, max_family_steps
             )
 
             st.session_state.candidates = final_candidates
@@ -5716,13 +5912,14 @@ def main():
             )
             st.caption(
                 f"Audita režīms: {audit_depth}. "
-                "Valodas pārbaudes budžets vienam PDF: "
+                "Parastiem PDF valodas budžets: "
                 f"{audit_budget['grammar_max_chunks']} bloki / "
                 f"{audit_budget['grammar_total']} kandidāti. "
-                "Citu ģimeņu limits: "
-                f"{audit_budget['regular_family_limit']} kandidāti vienā PDF. "
-                "Kvalitātes atlases limits: "
-                f"{audit_budget['max_notes_per_pdf']} piezīmes vienam PDF."
+                "SA skaidrojošam aprakstam: tehniskās ģimenes vispirms, "
+                "C_dates_versions netiek palaista, valodas piezīmes beigās "
+                "ar limitu 12. "
+                "Citu ģimeņu parastais limits: "
+                f"{audit_budget['regular_family_limit']} kandidāti vienā PDF."
             )
             suppressed_total = sum(suppressed_by_pdf.values())
             if suppressed_total:
