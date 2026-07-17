@@ -6,6 +6,7 @@ import hmac
 import secrets
 import json
 import time
+import ssl
 import zipfile
 import traceback
 from datetime import datetime
@@ -43,7 +44,7 @@ except Exception:
     HttpError = Exception
 
 
-APP_VERSION = "v0.8.1"
+APP_VERSION = "v0.8.2"
 APP_TITLE = f"BP AI Audit Copilot {APP_VERSION}"
 
 REQUIRED_EXPORT_COLUMNS = [
@@ -263,8 +264,74 @@ def get_oauth_drive_service(config: Optional[Dict[str, str]] = None):
     return build("drive", "v3", credentials=credentials, cache_discovery=False)
 
 
+
+def drive_execute_with_retry(
+    request_factory: Any,
+    operation_name: str = "Google Drive pieprasījums",
+    max_attempts: int = 4,
+) -> Dict[str, Any]:
+    """Izpilda Drive API pieprasījumu ar atkārtojumiem īslaicīgām tīkla kļūdām."""
+    retryable_messages = (
+        "record_layer_failure",
+        "record layer failure",
+        "connection reset",
+        "connection aborted",
+        "remote end closed connection",
+        "timed out",
+        "timeout",
+        "temporarily unavailable",
+        "server disconnected",
+        "eof occurred in violation of protocol",
+        "bad record mac",
+    )
+    last_error: Optional[BaseException] = None
+
+    for attempt in range(1, max_attempts + 1):
+        try:
+            request = request_factory()
+            return request.execute(num_retries=2)
+        except HttpError as exc:
+            last_error = exc
+            status = getattr(getattr(exc, "resp", None), "status", None)
+            if status not in {408, 429, 500, 502, 503, 504}:
+                raise
+        except (
+            ssl.SSLError,
+            ConnectionResetError,
+            ConnectionAbortedError,
+            BrokenPipeError,
+            TimeoutError,
+            OSError,
+        ) as exc:
+            last_error = exc
+            message = clean_text(exc).casefold()
+            if not (
+                isinstance(exc, ssl.SSLError)
+                or any(token in message for token in retryable_messages)
+            ):
+                raise
+        except Exception as exc:
+            last_error = exc
+            message = clean_text(exc).casefold()
+            if not any(token in message for token in retryable_messages):
+                raise
+
+        if attempt < max_attempts:
+            time.sleep(min(8.0, 1.25 * (2 ** (attempt - 1))))
+
+    raise RuntimeError(
+        f"{operation_name} neizdevās pēc {max_attempts} mēģinājumiem. "
+        f"Pēdējā kļūda: {last_error}"
+    ) from last_error
+
+
 def get_oauth_user(service) -> Dict[str, str]:
-    about = service.about().get(fields="user(displayName,emailAddress)").execute()
+    about = drive_execute_with_retry(
+        lambda: service.about().get(
+            fields="user(displayName,emailAddress)"
+        ),
+        "OAuth lietotāja informācijas nolasīšana",
+    )
     user = about.get("user") or {}
     return {
         "email": clean_text(user.get("emailAddress")),
@@ -319,14 +386,18 @@ def drive_list_children(service, folder_id: str, mime_filter: Optional[str] = No
         q_parts.append(f"mimeType='{mime_filter}'")
     q = " and ".join(q_parts)
     while True:
-        resp = service.files().list(
-            q=q,
-            fields="nextPageToken, files(id, name, mimeType, modifiedTime, size)",
-            pageToken=page_token,
-            pageSize=1000,
-            supportsAllDrives=True,
-            includeItemsFromAllDrives=True,
-        ).execute()
+        current_page_token = page_token
+        resp = drive_execute_with_retry(
+            lambda: service.files().list(
+                q=q,
+                fields="nextPageToken, files(id, name, mimeType, modifiedTime, size)",
+                pageToken=current_page_token,
+                pageSize=1000,
+                supportsAllDrives=True,
+                includeItemsFromAllDrives=True,
+            ),
+            "Google Drive mapes satura nolasīšana",
+        )
         files.extend(resp.get("files", []))
         page_token = resp.get("nextPageToken")
         if not page_token:
@@ -335,12 +406,16 @@ def drive_list_children(service, folder_id: str, mime_filter: Optional[str] = No
 
 
 def drive_get_file_metadata(service, file_id: str) -> Dict[str, Any]:
-    """Nolasa Drive faila/mapes pamata metadatus, ieskaitot vecākmapes."""
-    return service.files().get(
-        fileId=file_id,
-        fields="id,name,mimeType,parents,modifiedTime",
-        supportsAllDrives=True,
-    ).execute()
+    """Nolasa Drive faila/mapes pamata metadatus ar tīkla atkārtojumiem."""
+    target_id = clean_text(file_id)
+    return drive_execute_with_retry(
+        lambda: service.files().get(
+            fileId=target_id,
+            fields="id,name,mimeType,parents,modifiedTime",
+            supportsAllDrives=True,
+        ),
+        "Google Drive mapes metadatu nolasīšana",
+    )
 
 
 def resolve_input_root(service, configured_folder_id: str, wanted_name: str = "01_Input") -> Dict[str, Any]:
@@ -3813,8 +3888,23 @@ def main():
                             st.warning(w)
             except Exception as e:
                 st.session_state.pdf_files = []
-                st.error("Neizdevās nolasīt PDF failus no 01_Input. Lietotne turpina darboties.")
-                st.code(str(e))
+                st.error(
+                    "Neizdevās nolasīt PDF failus no 01_Input. "
+                    "Lietotne turpina darboties."
+                )
+                error_text = clean_text(e)
+                if (
+                    "record_layer_failure" in error_text.casefold()
+                    or "record layer failure" in error_text.casefold()
+                    or isinstance(e, ssl.SSLError)
+                ):
+                    st.warning(
+                        "Google Drive savienojums īslaicīgi pārtrūka SSL līmenī. "
+                        "v0.8.2 pieprasījumu automātiski atkārto vairākas reizes. "
+                        "Ja kļūda saglabājas, pagaidi aptuveni minūti un nospied "
+                        "“Nolasīt PDF sarakstu” vēlreiz."
+                    )
+                st.code(error_text)
                 with st.expander("Pilns tehniskais traceback"):
                     st.code(traceback.format_exc())
 
