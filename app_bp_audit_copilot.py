@@ -44,7 +44,7 @@ except Exception:
     HttpError = Exception
 
 
-APP_VERSION = "v0.8.2"
+APP_VERSION = "v0.8.3"
 APP_TITLE = f"BP AI Audit Copilot {APP_VERSION}"
 
 REQUIRED_EXPORT_COLUMNS = [
@@ -403,6 +403,88 @@ def drive_list_children(service, folder_id: str, mime_filter: Optional[str] = No
         if not page_token:
             break
     return files
+
+
+
+def drive_list_folder_tree(
+    service,
+    root_id: str,
+    root_name: str,
+    max_depth: int = 6,
+) -> List[Dict[str, str]]:
+    """Rekursīvi nolasa 02_Results mapes un apakšmapes.
+
+    Katrā ierakstā saglabā:
+    - pilno ceļu izvēlnei;
+    - parent_id jaunas apakšmapes izveidei;
+    - top_level_name projekta identitātei.
+    """
+    root_id = clean_text(root_id)
+    root_name = clean_text(root_name) or "02_Results"
+
+    items: List[Dict[str, str]] = [{
+        "id": root_id,
+        "name": root_name,
+        "path": root_name,
+        "parent_id": "",
+        "depth": "0",
+        "top_level_name": "",
+    }]
+
+    visited = {root_id}
+
+    def walk(
+        parent_id: str,
+        parent_path: str,
+        depth: int,
+        top_level_name: str,
+    ) -> None:
+        if depth > max_depth:
+            return
+
+        children = drive_list_children(
+            service,
+            parent_id,
+            "application/vnd.google-apps.folder",
+        )
+        children = sorted(
+            children,
+            key=lambda item: clean_text(item.get("name")).casefold(),
+        )
+
+        for child in children:
+            child_id = clean_text(child.get("id"))
+            child_name = clean_text(child.get("name"))
+            if not child_id or child_id in visited:
+                continue
+
+            visited.add(child_id)
+            child_path = f"{parent_path}/{child_name}"
+            child_top_level = top_level_name or child_name
+
+            items.append({
+                "id": child_id,
+                "name": child_name,
+                "path": child_path,
+                "parent_id": parent_id,
+                "depth": str(depth),
+                "top_level_name": child_top_level,
+            })
+
+            walk(
+                child_id,
+                child_path,
+                depth + 1,
+                child_top_level,
+            )
+
+    walk(
+        root_id,
+        root_name,
+        1,
+        "",
+    )
+    return items
 
 
 def drive_get_file_metadata(service, file_id: str) -> Dict[str, Any]:
@@ -4866,22 +4948,15 @@ def main():
                 results_root_id = clean_text(results_root.get("id"))
                 results_root_name = clean_text(results_root.get("name")) or "02_Results"
 
-                # Galamērķu saraksts vienmēr sākas 02_Results saknē.
-                # Tas ļauj brīvi izvēlēties citu projektu neatkarīgi no auditējamā 01_Input projekta.
-                project_folders = drive_list_children(
-                    oauth_service, results_root_id, "application/vnd.google-apps.folder"
+                # Nolasa visu 02_Results mapju koku, lai var izvēlēties arī
+                # projekta disciplīnas apakšmapes, piemēram:
+                # 02_Results/02_C2-2/01_AR.
+                folder_options = drive_list_folder_tree(
+                    oauth_service,
+                    results_root_id,
+                    results_root_name,
+                    max_depth=6,
                 )
-                folder_options: List[Dict[str, str]] = [{
-                    "id": results_root_id,
-                    "name": results_root_name,
-                    "path": results_root_name,
-                }]
-                for folder in sorted(project_folders, key=lambda x: clean_text(x.get("name")).lower()):
-                    folder_options.append({
-                        "id": clean_text(folder.get("id")),
-                        "name": clean_text(folder.get("name")),
-                        "path": f"{results_root_name}/{clean_text(folder.get('name'))}",
-                    })
 
                 option_by_id = {item["id"]: item for item in folder_options}
                 pending_target_id = clean_text(st.session_state.pop("pending_drive_target_folder_id", ""))
@@ -4891,8 +4966,29 @@ def main():
                     if pending_target_id not in option_by_id:
                         item = {
                             "id": pending_target_id,
-                            "name": pending_name or "Jaunā projekta mape",
-                            "path": pending_path or f"{results_root_name}/{pending_name}",
+                            "name": pending_name or "Jaunā mape",
+                            "path": (
+                                pending_path
+                                or f"{results_root_name}/{pending_name}"
+                            ),
+                            "parent_id": clean_text(
+                                st.session_state.pop(
+                                    "pending_drive_target_parent_id",
+                                    "",
+                                )
+                            ),
+                            "depth": clean_text(
+                                st.session_state.pop(
+                                    "pending_drive_target_depth",
+                                    "1",
+                                )
+                            ),
+                            "top_level_name": clean_text(
+                                st.session_state.pop(
+                                    "pending_drive_target_top_level_name",
+                                    pending_name,
+                                )
+                            ),
                         }
                         folder_options.append(item)
                         option_by_id[pending_target_id] = item
@@ -4915,7 +5011,7 @@ def main():
                     )
 
                 selected_target_id = st.selectbox(
-                    "Kurā 02_Results projekta mapē saglabāt koriģētos PDF?",
+                    "Kurā 02_Results mapē vai apakšmapē saglabāt koriģētos PDF?",
                     options=[item["id"] for item in folder_options],
                     format_func=lambda folder_id: option_by_id[folder_id]["path"],
                     key="drive_target_folder_id",
@@ -4923,34 +5019,95 @@ def main():
                 selected_target = option_by_id[selected_target_id]
                 st.info(f"Izvēlētais PDF galamērķis: {selected_target['path']}")
 
-                with st.expander("+ Izveidot jaunu projekta mapi 02_Results", expanded=False):
-                    suggested_name = active_project_name if active_project_name and active_project_name != "01_Input sakne" else "Jauns_projekts"
+                with st.expander(
+                    "+ Izveidot jaunu apakšmapi izvēlētajā galamērķī",
+                    expanded=False,
+                ):
+                    suggested_name = (
+                        active_project_name
+                        if (
+                            selected_target_id == results_root_id
+                            and active_project_name
+                            and active_project_name != "01_Input sakne"
+                        )
+                        else "Jauna_apakšmape"
+                    )
                     new_folder_name = st.text_input(
-                        "Jaunās projekta mapes nosaukums",
+                        "Jaunās mapes nosaukums",
                         value=suggested_name,
                         key="new_drive_folder_name",
                     )
-                    st.caption(f"Jaunā mape tiks izveidota tieši zem: {results_root_name}")
+                    st.caption(
+                        "Jaunā mape tiks izveidota zem: "
+                        f"{selected_target['path']}"
+                    )
                     create_col, _ = st.columns([1, 4])
                     with create_col:
                         create_folder_clicked = st.button(
-                            "Izveidot projekta mapi",
+                            "Izveidot apakšmapi",
                             type="primary",
                             use_container_width=True,
                             key="create_new_drive_target_folder",
                         )
+
                     if create_folder_clicked:
-                        created = drive_create_folder(oauth_service, results_root_id, new_folder_name)
+                        created = drive_create_folder(
+                            oauth_service,
+                            selected_target_id,
+                            new_folder_name,
+                        )
                         created_id = clean_text(created.get("id"))
                         created_name = clean_text(created.get("name"))
-                        st.session_state["pending_drive_target_folder_id"] = created_id
-                        st.session_state["pending_drive_target_folder_name"] = created_name
-                        st.session_state["pending_drive_target_folder_path"] = f"{results_root_name}/{created_name}"
+                        created_path = (
+                            f"{selected_target['path']}/{created_name}"
+                        )
+                        selected_depth = int(
+                            clean_text(selected_target.get("depth")) or "0"
+                        )
+                        top_level_name = (
+                            clean_text(selected_target.get("top_level_name"))
+                            or (
+                                created_name
+                                if selected_target_id == results_root_id
+                                else clean_text(selected_target.get("name"))
+                            )
+                        )
+
+                        st.session_state[
+                            "pending_drive_target_folder_id"
+                        ] = created_id
+                        st.session_state[
+                            "pending_drive_target_folder_name"
+                        ] = created_name
+                        st.session_state[
+                            "pending_drive_target_folder_path"
+                        ] = created_path
+                        st.session_state[
+                            "pending_drive_target_parent_id"
+                        ] = selected_target_id
+                        st.session_state[
+                            "pending_drive_target_depth"
+                        ] = str(selected_depth + 1)
+                        st.session_state[
+                            "pending_drive_target_top_level_name"
+                        ] = top_level_name
                         st.rerun()
 
+                memory_project_name = (
+                    clean_text(
+                        st.session_state.get(
+                            "active_project_memory_code"
+                        )
+                    )
+                    or clean_text(
+                        selected_target.get("top_level_name")
+                    )
+                    or clean_text(selected_target.get("name"))
+                )
                 st.caption(
-                    f"Memory Excel projekta mape tiks sasaistīta ar izvēlēto rezultātu projektu: "
-                    f"{selected_target['name']}"
+                    "PDF tiks saglabāti izvēlētajā apakšmapē, bet Memory Excel "
+                    "tiks piesaistīts projekta līmenim: "
+                    f"{memory_project_name}"
                 )
 
                 action_col1, action_col2, _ = st.columns([1, 1.35, 3])
@@ -4991,10 +5148,7 @@ def main():
                                 oauth_service,
                                 results_target=selected_target,
                                 memory_folder_id=memory_folder_id.strip(),
-                                project_folder_name=(
-                                    clean_text(st.session_state.get("active_project_memory_code"))
-                                    or selected_target["name"]
-                                ),
+                                project_folder_name=memory_project_name,
                                 accepted_df=accepted_df,
                                 rejected_df=rejected_df,
                                 pdf_items=selected_pdf_items,
