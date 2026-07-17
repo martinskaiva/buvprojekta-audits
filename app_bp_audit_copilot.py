@@ -44,7 +44,7 @@ except Exception:
     HttpError = Exception
 
 
-APP_VERSION = "v0.9.1"
+APP_VERSION = "v0.9.2"
 APP_TITLE = f"BP AI Audit Copilot {APP_VERSION}"
 
 REQUIRED_EXPORT_COLUMNS = [
@@ -1960,6 +1960,701 @@ def split_text_for_grammar(pdf_item: Dict[str, Any], chunk_chars: int = 4000) ->
         if current:
             chunks.append({"page": page_no, "text": current})
     return chunks
+
+
+def candidate_blocked_by_feedback(
+    candidate: Dict[str, Any],
+    feedback_df: pd.DataFrame,
+) -> bool:
+    blocked = feedback_blocked_texts(feedback_df)
+    combined = " | ".join(
+        clean_text(candidate.get(col))
+        for col in ["title", "target_text", "problem", "designer_note", "evidence"]
+    )
+    return text_is_blocked_by_feedback(combined, blocked)
+
+
+def score_example(
+    row: pd.Series,
+    pdf_name: str,
+    pdf_text_sample: str,
+    family: str,
+    doc_role: str,
+    discipline: str,
+    project_code: str,
+) -> int:
+    """Novērtē globālā indeksa piemēra atbilstību konkrētajam auditam.
+
+    Project_code nekad nav filtrs. Citu projektu zelta piemēri vienmēr ir
+    pieejami. Tā paša projekta piemēram ir tikai neliels izšķirošais bonuss.
+    """
+    score = 0
+    if clean_text(row.get("normalized_family")) == family:
+        score += 100
+
+    if doc_role and clean_text(row.get("document_role")) == doc_role:
+        score += 25
+
+    row_discipline = clean_text(
+        row.get("discipline_final") or row.get("discipline")
+    )
+    if discipline and row_discipline.lower() == discipline.lower():
+        score += 20
+
+    tf = clean_text(row.get("target_file")).lower()
+    if discipline and discipline.lower() in tf:
+        score += 5
+
+    txt = clean_text(row.get("target_text"))
+    if txt and len(txt) > 3 and txt.lower() in pdf_text_sample.lower():
+        score += 20
+
+    # Izcelsmes projekts ir tikai vājš prioritātes bonuss, nevis robeža.
+    row_project = normalize_project_code(clean_text(row.get("project_code")))
+    wanted_project = normalize_project_code(project_code)
+    if wanted_project and row_project == wanted_project:
+        score += 5
+
+    return score
+
+
+def select_examples(
+    index_df: pd.DataFrame,
+    family: str,
+    pdf_name: str,
+    pdf_text: str,
+    max_examples: int,
+    project_code: str = "",
+) -> List[Dict[str, str]]:
+    """Atlasa piemērus no visa globālā indeksa.
+
+    Atlase nekad netiek ierobežota ar auditējamo projektu. Ja indeksā ir
+    piemēri no vairākiem projektiem, priekšroka tiek dota kvalitatīvi
+    atbilstošiem un vienlaikus dažādu projektu piemēriem.
+    """
+    if index_df.empty or max_examples <= 0:
+        return []
+
+    doc_role = infer_document_role(pdf_name)
+    discipline = infer_discipline_from_filename(pdf_name)
+    fam_df = index_df[index_df["normalized_family"].eq(family)].copy()
+    if fam_df.empty:
+        return []
+
+    sample = pdf_text[:10000]
+    fam_df["_score"] = fam_df.apply(
+        lambda r: score_example(
+            r,
+            pdf_name,
+            sample,
+            family,
+            doc_role,
+            discipline,
+            project_code,
+        ),
+        axis=1,
+    )
+    fam_df["_project_key"] = fam_df["project_code"].map(
+        lambda value: normalize_project_code(clean_text(value)) or "GLOBAL"
+    )
+    fam_df = fam_df.sort_values(
+        ["_score", "_project_key", "note_id"],
+        ascending=[False, True, True],
+    )
+
+    # Vispirms paņemam labāko piemēru no katra pieejamā projekta.
+    selected_indices: List[Any] = []
+    for _, group in fam_df.groupby("_project_key", sort=False):
+        if len(selected_indices) >= max_examples:
+            break
+        selected_indices.append(group.index[0])
+
+    # Atlikušās vietas aizpildām ar kopumā labākajiem piemēriem.
+    if len(selected_indices) < max_examples:
+        for row_index in fam_df.index:
+            if row_index in selected_indices:
+                continue
+            selected_indices.append(row_index)
+            if len(selected_indices) >= max_examples:
+                break
+
+    selected_df = fam_df.loc[selected_indices].sort_values(
+        "_score", ascending=False
+    )
+
+    examples: List[Dict[str, str]] = []
+    for _, row in selected_df.iterrows():
+        examples.append({
+            "note_id": clean_text(row.get("note_id")),
+            "family": clean_text(row.get("normalized_family")),
+            "scenario": clean_text(row.get("normalized_scenario")),
+            "target_area": clean_text(row.get("target_area")),
+            "target_text": clean_text(row.get("target_text")),
+            "comment_text": clean_text(row.get("comment_text")),
+            "issue_type": clean_text(row.get("issue_type")),
+            "comparison_evidence": clean_text(
+                row.get("comparison_evidence")
+            ),
+            "project_code": clean_text(row.get("project_code")),
+            "source_path": clean_text(row.get("source_path")),
+        })
+    return examples
+
+
+def make_negative_rules(feedback_df: pd.DataFrame, max_rules: int = 20) -> List[str]:
+    if feedback_df.empty:
+        return []
+    rules = []
+    for _, r in feedback_df.tail(max_rules).iterrows():
+        reason = clean_text(r.get("reject_reason") or r.get("reason") or r.get("noraidīšanas iemesls"))
+        text = clean_text(r.get("target_text") or r.get("title") or r.get("comment_text"))
+        do_not = clean_text(
+            r.get("do_not_show_similar")
+            or r.get("turpmāk līdzīgas piezīmes nerādīt")
+        ).lower()
+        is_reusable = do_not in {"true", "1", "yes", "jā", "ja"}
+        if is_reusable and (reason or text):
+            rules.append(f"Nerādīt līdzīgas piezīmes: {text}. Iemesls: {reason}.")
+    return rules
+
+
+def get_openai_client():
+    if OpenAI is None:
+        st.error("OpenAI Python bibliotēka nav pieejama.")
+        return None
+    api_key = get_secret("OPENAI_API_KEY", "openai_api_key")
+    if not api_key:
+        st.error("Nav atrasts OPENAI_API_KEY Streamlit secrets.")
+        return None
+    return OpenAI(api_key=api_key)
+
+
+def strip_json_fences(text: str) -> str:
+    text = text.strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*", "", text)
+        text = re.sub(r"\s*```$", "", text)
+    first = text.find("{")
+    last = text.rfind("}")
+    if first >= 0 and last > first:
+        return text[first:last + 1]
+    return text
+
+
+
+def extract_specific_values(text: str) -> List[str]:
+    """Atrod salīdzinājumam izmantojamas konkrētas vērtības/kodus.
+
+    Heiristika nav domāta tehniskai validācijai. Tā tikai palīdz atmest AI
+    formulējumus, kuros teikts "neatbilst", bet nav nosauktas abas puses.
+    """
+    text = clean_text(text)
+    values: List[str] = []
+
+    for match in re.findall(r'["“”\']([^"“”\']{2,120})["“”\']', text):
+        value = clean_text(match)
+        if value:
+            values.append(value.lower())
+
+    patterns = [
+        r"\b(?:DN|D|Ø)\s*\d{2,4}\b",
+        r"\b\d+(?:[.,]\d+)?\s*(?:mm|cm|m|m²|m2|m³|m3|MPa|kPa|bar|kW|W|V|A|l/s|m3/h)\b",
+        r"\b\d{4}[-./]\d{1,2}[-./]\d{1,2}\b",
+        r"\b(?:REV|R|V)\s*[-_.]?\s*\d+[A-Z]?\b",
+        r"\b[A-Z]{2,}(?:[-_][A-Z0-9]{2,})+\b",
+        r"\b[A-Z]{2,}\s*(?:SN\d+|SDR\d+|PN\d+)\b",
+        r"\b(?:PVC|PP|PE|HDPE|LDPE|BETONS|TĒRAUDS|ČUGUNS)\b",
+    ]
+    for pattern in patterns:
+        for match in re.findall(pattern, text, flags=re.I):
+            value = clean_text(match)
+            if value:
+                values.append(value.lower())
+
+    # Saglabā secību, izmetot dublikātus.
+    return list(dict.fromkeys(values))
+
+
+def _quoted_values(text: str) -> List[str]:
+    return [
+        clean_text(x)
+        for x in re.findall(r'["“”\']([^"“”\']{1,160})["“”\']', clean_text(text))
+        if clean_text(x)
+    ]
+
+
+def _value_kind(value: str) -> str:
+    value = clean_text(value)
+    compact = re.sub(r"\s+", "", value)
+    if re.fullmatch(r"\d{4}\s+\d{3}\s+\d{4}", value):
+        return "cadastral_number"
+    if re.fullmatch(r"RWC\d+(?:[-_][A-Z0-9]+)+", value, flags=re.I):
+        return "document_code"
+    if re.fullmatch(r"C\s*\d+(?:[-–]\d+)+", value, flags=re.I):
+        return "object_code"
+    if re.fullmatch(r"(?:DN|D|Ø)\s*\d{2,4}", value, flags=re.I):
+        return "diameter"
+    if re.fullmatch(r"\d{4}[-./]\d{1,2}[-./]\d{1,2}", value):
+        return "date"
+    if re.fullmatch(r"\d+(?:[.,]\d+)?\s*(?:mm|cm|m|m²|m2|m³|m3|MPa|Mpa|kPa|Kpa|bar|kW|Kw|W|V|A|l/s|m3/h)", value, flags=re.I):
+        return "technical_value"
+    if re.fullmatch(r"[A-Z]{2,}(?:[-_][A-Z0-9]{2,})+", compact, flags=re.I):
+        return "code"
+    return "text"
+
+
+def _candidate_says_no_issue(text: str) -> bool:
+    low = clean_text(text).lower()
+    phrases = [
+        "nav neatbilstības",
+        "neatbilstība nav konstatēta",
+        "atšķirība nav konstatēta",
+        "abi teksti sakrīt",
+        "vērtības sakrīt",
+        "vērtības ir vienādas",
+        "kļūda nav konstatēta",
+        "pretruna nav konstatēta",
+    ]
+    return any(p in low for p in phrases)
+
+
+def _comparison_types_conflict(text: str) -> bool:
+    values = _quoted_values(text)
+    if len(values) < 2:
+        return False
+    kinds = [_value_kind(v) for v in values[:4]]
+    known = [k for k in kinds if k != "text"]
+    if len(known) < 2:
+        return False
+    # Acīmredzami nesalīdzināmi datu lauki nedrīkst kļūt par neatbilstību.
+    incompatible = {
+        frozenset({"cadastral_number", "object_code"}),
+        frozenset({"cadastral_number", "document_code"}),
+        frozenset({"date", "document_code"}),
+        frozenset({"diameter", "date"}),
+    }
+    return any(frozenset({a, b}) in incompatible for a in known for b in known if a != b)
+
+
+ANCHOR_CODE_PATTERNS = [
+    r"\b[A-Za-z]{1,5}-[A-Za-z0-9]{1,8}(?:\.[A-Za-z0-9]{1,8})?\b",
+    r"\b(?:EI|REI|EW)\s*-?\s*\d{2,3}\b",
+    r"\b\d{4}\b",
+]
+
+GENERIC_NOTE_PHRASES = [
+    "nav saskaņots starp",
+    "nav saskaņota starp",
+    "nav saskaņoti starp",
+    "ir vienāds, bet",
+    "atšķiras starp dokumentiem",
+    "nav saskaņots ar",
+]
+
+
+def extract_anchor_tokens(text: str) -> List[str]:
+    text = clean_text(text)
+    out: List[str] = []
+    seen = set()
+
+    def add(value: str) -> None:
+        value = clean_text(value)
+        if not value:
+            return
+        value = re.sub(r"\s+", " ", value).strip(" ,;")
+        if len(value) < 2 or len(value) > 160:
+            return
+        key = value.casefold()
+        if key in seen:
+            return
+        seen.add(key)
+        out.append(value)
+
+    for x in re.findall(r'["“”\']([^"“”\']{2,160})["“”\']', text):
+        add(x)
+    for pattern in ANCHOR_CODE_PATTERNS:
+        for x in re.findall(pattern, text, flags=re.I):
+            add(x)
+    return out
+
+
+def infer_target_text_from_candidate(c: Dict[str, Any]) -> str:
+    existing = clean_text(c.get("target_text"))
+    if existing and existing != "MANUAL_PLACEMENT_REQUIRED":
+        return existing
+    pool = " | ".join([
+        clean_text(c.get("target_area")),
+        clean_text(c.get("where")),
+        clean_text(c.get("designer_note")),
+        clean_text(c.get("comment_text")),
+        clean_text(c.get("problem")),
+        clean_text(c.get("evidence")),
+    ])
+    anchors = extract_anchor_tokens(pool)
+    return anchors[0] if anchors else ""
+
+
+def build_target_text_candidates(c: Dict[str, Any]) -> List[str]:
+    seen = set()
+    candidates: List[str] = []
+
+    def add(value: str) -> None:
+        value = clean_text(value)
+        if not value or value == "MANUAL_PLACEMENT_REQUIRED":
+            return
+        value = re.sub(r"\s+", " ", value).strip(" ,;")
+        if len(value) < 2 or len(value) > 160:
+            return
+        key = value.casefold()
+        if key in seen:
+            return
+        seen.add(key)
+        candidates.append(value)
+
+    add(c.get("target_text"))
+    for field in ["target_area", "where", "designer_note", "comment_text", "problem", "evidence"]:
+        txt = clean_text(c.get(field))
+        if not txt:
+            continue
+        for x in re.findall(r'["“”\']([^"“”\']{2,160})["“”\']', txt):
+            add(x)
+        for x in extract_anchor_tokens(txt):
+            add(x)
+    return candidates
+
+
+def note_is_too_generic(text: str) -> bool:
+    text = clean_text(text)
+    if not text:
+        return True
+    low = text.lower()
+    specifics = extract_specific_values(text)
+    quoted = _quoted_values(text)
+    if len(specifics) >= 2 or len(quoted) >= 2:
+        return False
+    return any(p in low for p in GENERIC_NOTE_PHRASES)
+
+
+def choose_best_comment_text(c: Dict[str, Any]) -> str:
+    note = clean_text(c.get("designer_note") or c.get("comment_text"))
+    problem = clean_text(c.get("problem") or c.get("evidence"))
+    if not note:
+        return problem
+    if note_is_too_generic(note) and problem:
+        return problem
+    note_specifics = len(extract_specific_values(note)) + len(_quoted_values(note))
+    prob_specifics = len(extract_specific_values(problem)) + len(_quoted_values(problem))
+    if problem and prob_specifics > note_specifics:
+        return problem
+    return note
+
+
+def _normalize_anchor_word(value: Any) -> str:
+    value = clean_text(value).casefold()
+    value = value.replace("₂", "2").replace("²", "2").replace("³", "3")
+    value = re.sub(
+        r"^[^\wāčēģīķļņšūž±+/-]+|[^\wāčēģīķļņšūž±+/-]+$",
+        "",
+        value,
+    )
+    return value
+
+
+def _correction_left_sides(text: str) -> List[str]:
+    """No formulējumiem “kļūda” → “labojums” paņem kļūdaino tekstu."""
+    text = clean_text(text)
+    values: List[str] = []
+    patterns = [
+        r'["“”\']([^"“”\']{1,180})["“”\']\s*(?:→|->|=>)\s*["“”\']([^"“”\']{1,180})["“”\']',
+        r'([A-Za-zĀ-ž0-9./+\-]{2,80})\s*(?:→|->|=>)\s*([A-Za-zĀ-ž0-9./+\-]{2,80})',
+    ]
+    for pattern in patterns:
+        for match in re.finditer(pattern, text):
+            wrong = clean_text(match.group(1)).strip(" ,.;:")
+            if wrong:
+                values.append(wrong)
+    return values
+
+
+def row_anchor_candidates(row: Dict[str, Any]) -> List[str]:
+    """Izveido prioritāru kļūdainā teksta fragmentu sarakstu."""
+    out: List[str] = []
+    seen = set()
+
+    def add(value: Any) -> None:
+        value = clean_text(value)
+        if not value or value == "MANUAL_PLACEMENT_REQUIRED":
+            return
+        value = re.sub(r"\s+", " ", value).strip(" ,;")
+        if len(value) < 2 or len(value) > 220:
+            return
+        key = value.casefold()
+        if key in seen:
+            return
+        seen.add(key)
+        out.append(value)
+
+    raw_candidates = clean_text(row.get("target_text_candidates"))
+    if raw_candidates:
+        for part in raw_candidates.split("||"):
+            add(part)
+
+    add(row.get("target_text"))
+
+    text_fields = [
+        clean_text(row.get("comment_text")),
+        clean_text(row.get("comparison_evidence")),
+        clean_text(row.get("problem")),
+        clean_text(row.get("evidence")),
+    ]
+
+    for text_value in text_fields:
+        for value in _correction_left_sides(text_value):
+            add(value)
+
+    for text_value in text_fields:
+        for value in _quoted_values(text_value):
+            add(value)
+        for value in extract_anchor_tokens(text_value):
+            add(value)
+
+    add(row.get("target_area"))
+    return out
+
+
+def _word_sequence_matches(page: Any, candidate: str) -> List[Any]:
+    """Atrod frāzi arī tad, ja tā PDF tekstā sadalīta vairākās rindās."""
+    try:
+        words = page.get_text("words")
+    except Exception:
+        return []
+
+    candidate_tokens = [
+        _normalize_anchor_word(token)
+        for token in re.findall(r"\S+", clean_text(candidate))
+    ]
+    candidate_tokens = [token for token in candidate_tokens if token]
+    if not candidate_tokens:
+        return []
+
+    page_tokens = []
+    for word in words:
+        token = _normalize_anchor_word(word[4])
+        if token:
+            page_tokens.append((token, word))
+
+    token_count = len(candidate_tokens)
+    matches: List[Any] = []
+
+    for start_index in range(0, len(page_tokens) - token_count + 1):
+        sequence = [
+            page_tokens[start_index + offset][0]
+            for offset in range(token_count)
+        ]
+        if sequence != candidate_tokens:
+            continue
+
+        for offset in range(token_count):
+            word = page_tokens[start_index + offset][1]
+            matches.append(
+                fitz.Rect(word[0], word[1], word[2], word[3])
+            )
+
+    return matches
+
+
+def find_all_anchors_on_page(
+    page: Any,
+    row: Dict[str, Any],
+    max_anchors: int = 8,
+) -> Tuple[List[str], List[Any]]:
+    """Atrod vairākus kļūdainos vārdus vai frāzes vienai piezīmei."""
+    used_anchors: List[str] = []
+    all_matches: List[Any] = []
+    seen_rects = set()
+
+    for candidate in row_anchor_candidates(row):
+        try:
+            matches = page.search_for(candidate, quads=True)
+        except Exception:
+            matches = []
+
+        if not matches:
+            matches = _word_sequence_matches(page, candidate)
+
+        if not matches:
+            continue
+
+        added = False
+        for match in matches:
+            rect = fitz.Rect(
+                match.rect if hasattr(match, "rect") else match
+            )
+            rect_key = (
+                round(rect.x0, 1),
+                round(rect.y0, 1),
+                round(rect.x1, 1),
+                round(rect.y1, 1),
+            )
+            if rect_key in seen_rects:
+                continue
+            seen_rects.add(rect_key)
+            all_matches.append(match)
+            added = True
+
+        if added:
+            used_anchors.append(candidate)
+
+        if len(used_anchors) >= max_anchors:
+            break
+
+    return used_anchors, all_matches
+
+
+def find_best_anchor_on_page(
+    page: Any,
+    row: Dict[str, Any],
+) -> Tuple[str, List[Any]]:
+    anchors, matches = find_all_anchors_on_page(page, row)
+    return " | ".join(anchors), matches
+
+def normalize_candidate(c: Dict[str, Any], family: str) -> Dict[str, Any]:
+    """Normalizē kandidātu un sagatavo konkrētus PDF enkurtekstus."""
+    out = dict(c)
+    out["family"] = family
+    problem = clean_text(out.get("problem") or out.get("evidence"))
+    note = clean_text(out.get("designer_note") or out.get("comment_text"))
+    if not problem:
+        problem = note
+    out["problem"] = problem
+    out["designer_note"] = clean_text(note or problem)
+    inferred_target = infer_target_text_from_candidate(out)
+    if inferred_target:
+        out["target_text"] = inferred_target
+    elif not clean_text(out.get("target_text")):
+        out["target_text"] = "MANUAL_PLACEMENT_REQUIRED"
+    out["target_text_candidates"] = build_target_text_candidates(out)
+    return out
+
+
+def candidate_is_too_vague(c: Dict[str, Any]) -> bool:
+    problem = clean_text(c.get("problem"))
+    note = clean_text(c.get("designer_note") or c.get("comment_text"))
+    evidence = clean_text(c.get("evidence"))
+    target_area = clean_text(c.get("target_area") or c.get("where"))
+    text = " ".join([clean_text(c.get("title")), problem, note, evidence]).lower()
+
+    if not note and not problem:
+        return True
+    if _candidate_says_no_issue(text):
+        return True
+
+    speculative_phrases = [
+        "nav skaidrs, vai",
+        "nav zināms, vai",
+        "iespējams, ka",
+        "varētu būt",
+        "var neatbilst",
+        "var nebūt",
+        "iespējama neatbilstība",
+        "nepieciešams pārbaudīt",
+        "jāpārbauda ar citiem",
+    ]
+    if any(p in text for p in speculative_phrases):
+        return True
+
+    vague_phrases = [
+        "dažādos dokumentos",
+        "citiem projekta dokumentiem",
+        "jāsaskaņo ar citiem",
+        "pārbaudīt un saskaņot",
+        "pilnībā saskaņots",
+        "nav pilnībā saskaņots",
+    ]
+    comparison_phrases = [
+        " neatbilst ", " nesakrīt ", " atšķiras ", " pretrunā ",
+        " savukārt ", " salīdzinot ar ", " norādīts citādi ",
+    ]
+    has_vague = any(p in text for p in vague_phrases)
+    has_comparison = any(p in f" {text} " for p in comparison_phrases)
+    specifics = extract_specific_values(" ".join([problem, note, evidence]))
+    has_source_location = bool(target_area) or any(
+        source in text
+        for source in [
+            "titullauk", "faila nosauk", "galvenajā tekst", "tabulā", "profilā",
+            "plānā", "site plan", "specifikācijā", "aprakstā", "rasējumā", "lapā",
+        ]
+    )
+
+    if has_comparison and (len(specifics) < 2 or not has_source_location):
+        return True
+    if has_vague and len(specifics) < 2:
+        return True
+    if _comparison_types_conflict(" ".join([problem, note, evidence])):
+        return True
+
+    # B_lv_en salīdzinājumā identiski citāti nav kļūda.
+    if clean_text(c.get("family")) == "B_lv_en":
+        values = _quoted_values(problem)
+        if len(values) >= 2:
+            a = re.sub(r"\s+", " ", values[0]).strip().casefold()
+            b = re.sub(r"\s+", " ", values[1]).strip().casefold()
+            if a == b:
+                return True
+
+    return False
+
+
+def make_candidate_id(c: Dict[str, Any], audit_run_id: str, ordinal: int) -> str:
+    raw = "|".join([
+        audit_run_id,
+        clean_text(c.get("source_pdf_rel_path") or c.get("source_pdf")),
+        clean_text(c.get("family")),
+        clean_text(c.get("target_page")),
+        clean_text(c.get("target_text")),
+        clean_text(c.get("problem")),
+        str(ordinal),
+    ])
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:20]
+
+
+def clear_review_widget_state() -> None:
+    prefixes = ("designer_note_", "decision_", "reject_reason_", "do_not_show_")
+    for key in list(st.session_state.keys()):
+        if any(str(key).startswith(prefix) for prefix in prefixes):
+            del st.session_state[key]
+
+
+def detect_unit_case_candidates(pdf_item: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Deterministiski atrod biežākās SI mērvienību reģistra kļūdas."""
+    replacements = {
+        "Mpa": "MPa",
+        "Kpa": "kPa",
+        "Kw": "kW",
+    }
+    out: List[Dict[str, Any]] = []
+    for page_data in pdf_item.get("pages", []) or []:
+        page_no = int(page_data.get("page") or 1)
+        page_text = str(page_data.get("text") or "")
+        for wrong, correct in replacements.items():
+            if re.search(rf"(?<![A-Za-z]){re.escape(wrong)}(?![A-Za-z])", page_text):
+                out.append({
+                    "title": f"Mērvienības simbola pieraksts: {wrong}",
+                    "where": f"{page_no}. lapa",
+                    "target_page": page_no,
+                    "target_area": "teksts",
+                    "target_text": wrong,
+                    "status": "unit_symbol_case_error",
+                    "problem": f"{page_no}. lapā mērvienības simbols norādīts kā “{wrong}”; pareizais SI pieraksts ir “{correct}”.",
+                    "designer_note": f"{page_no}. lapā mērvienības simbols norādīts kā “{wrong}”; pareizais SI pieraksts ir “{correct}”.",
+                    "issue_type": "unit_symbol_case_error",
+                    "severity": "low",
+                    "markup_type": "highlight",
+                    "placement_confidence": "exact",
+                    "evidence": wrong,
+                    "family": "A_text_language",
+                })
+    return out
 
 
 def select_representative_grammar_chunks(chunks: List[Dict[str, Any]], max_chunks: int) -> List[Dict[str, Any]]:
