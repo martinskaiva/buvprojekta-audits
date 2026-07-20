@@ -44,7 +44,7 @@ except Exception:
     HttpError = Exception
 
 
-APP_VERSION = "v1.0.4"
+APP_VERSION = "v1.0.5"
 APP_TITLE = f"BP AI Audit Copilot {APP_VERSION}"
 
 REQUIRED_EXPORT_COLUMNS = [
@@ -77,8 +77,9 @@ DOCUMENT_REGISTRY_FILE = "document_registry.xlsx"
 PROJECT_FINDINGS_FILE = "project_findings.xlsx"
 
 DEFAULT_FAMILIES = [
-    "A_text_language",
+    "P_universal_drawing_consistency",
     "B_lv_en",
+    "A_text_language",
     "C_dates_versions",
     "D_document_identity",
     "E_drawing_list_references",
@@ -92,6 +93,7 @@ DEFAULT_FAMILIES = [
     "M_scope_or_discipline_boundary",
     "N_completeness_or_missing_content",
     "O_element_count_reconciliation",
+    "P_universal_drawing_consistency",
 ]
 
 FAMILY_INSTRUCTIONS = {
@@ -184,6 +186,13 @@ FAMILY_INSTRUCTIONS = {
         "look_for": "logu, durvju un lūku tipa apzīmējumu skaitu plānos un attiecīgo daudzumu summu specifikācijā",
         "report_if": "plānu un specifikācijas apjomi ir droši nolasāmi; uzrādi gan sakritību, gan konkrētu starpību",
         "do_not_report": "neziņo, ja PDF teksta slānis nav pietiekams, tipi nav droši identificējami vai pastāv būtisks dubultskaitīšanas risks",
+    },
+
+    "P_universal_drawing_consistency": {
+        "name": "Rasējuma apzīmējumu, modeļu, parametru un atsauču konsekvence",
+        "look_for": "vienā vai vairākās rasējuma vietās lietotu apzīmējumu, elementu kodu, modeļu, ražotāju, standartu, skaitļu, mērvienību, tehnisko terminu un konkrētu atsauču savstarpējas nesakritības",
+        "report_if": "auditējamā rasējumā ir divi konkrēti un savstarpēji salīdzināmi teksti vai vērtības, kas attiecas uz vienu elementu, bet nesakrīt; vai atsauce nosauc sadaļu, bet tai trūkst konkrēta rasējuma/dokumenta numura",
+        "do_not_report": "neziņo par stilistiku; neziņo tikai tāpēc, ka formulējumu varētu uzlabot; neziņo, ja nav iespējams nosaukt konkrēto kļūdaino tekstu un konkrēto salīdzināmo tekstu vai trūkstošo atsauces numuru",
     },
 
 }
@@ -3643,6 +3652,11 @@ def call_ai_for_family(
         "pdf_file": pdf_name,
         "family": family,
         "family_instruction": instr,
+        "universal_drawing_scenarios": (
+            UNIVERSAL_DRAWING_SCENARIOS
+            if family == "P_universal_drawing_consistency"
+            else []
+        ),
         "max_candidates": max_candidates,
         "precision_rules": [
             "Problēmas aprakstā jābūt konkrētai kļūdai, nevis vispārīgam riskam.",
@@ -3665,6 +3679,10 @@ def call_ai_for_family(
             "C_dates_versions piezīmi veido tikai vienas un tās pašas revīzijas diviem datumiem, aktuālās revīzijas numura konfliktam, nederīgam datumam vai placeholderam.",
             "D_document_identity: pilns rasējuma numurs rakstlaukā ir pietiekams; faila nosaukuma tekstuālais lapas satura apraksts nav jāatkārto rakstlaukā; Rev_1 un Rev.1 ir viena revīzija.",
             "D_document_identity kandidātu atgriez tikai tad, ja vari nosaukt divus atšķirīgus pilnus rasējuma numurus vai konkrēti pierādīt, ka viens numurs ir nepilnīgs.",
+            "P_universal_drawing_consistency darbojas visiem rasējumu tipiem, ne tikai mezgliem.",
+            "P ģimenes konflikta piezīmei obligāti citē divas konkrētas un atšķirīgas vērtības vai tekstus un paskaidro, kāpēc tie attiecas uz vienu elementu.",
+            "P ģimenes atsauces piezīmi drīkst veidot, ja dokumentā tieši ir atsauce uz konkrētu disciplīnu vai sadaļu, bet atsauces tekstā nav konkrēta rasējuma, specifikācijas vai dokumenta numura.",
+            "P ģimenē neziņo par stilu, sinonīmu izvēli vai tikai atšķirīgu noformējumu, ja tehniskā nozīme ir vienāda.",
             "Telpas numura vai secības piezīmei obligāti nosauc konkrēto kļūdaino telpas kodu target_text, konkrēto konfliktējošo vai sagaidāmo kodu un precīzu vietu plānā vai eksplikācijā; vispārīgu 'sakārtot telpu numurus' kandidātu neatgriez.",
         ],
         "similar_positive_examples": examples,
@@ -3719,6 +3737,11 @@ def call_ai_for_family(
                 ):
                     continue
                 if not room_number_candidate_is_precise(normalized):
+                    continue
+                if not universal_drawing_candidate_is_precise(
+                    normalized,
+                    pdf_text,
+                ):
                     continue
                 cleaned_candidates.append(normalized)
         return cleaned_candidates, ""
@@ -5892,6 +5915,234 @@ def drawing_number_for_candidate(
     return ""
 
 
+
+UNIVERSAL_DRAWING_SCENARIOS = [
+    {
+        "scenario": "identifier_or_number_conflict",
+        "look_for": (
+            "vienam elementam vienā rasējumā norādīti divi atšķirīgi "
+            "pozīcijas, detaļas, telpas, loga, durvju, lūkas vai cita "
+            "elementa numuri"
+        ),
+        "required_evidence": (
+            "citē abus numurus un abas vietas; nedrīkst rakstīt tikai "
+            "'pārbaudīt numerāciju'"
+        ),
+    },
+    {
+        "scenario": "product_model_or_manufacturer_variant",
+        "look_for": (
+            "vienam elementam lietoti divi līdzīgi, bet atšķirīgi modeļa "
+            "kodi, ražotāja nosaukumi vai produkta apzīmējumi"
+        ),
+        "required_evidence": (
+            "citē abus variantus, piemēram, modeli A un modeli B, un norādi, "
+            "kāpēc tie attiecas uz vienu elementu"
+        ),
+    },
+    {
+        "scenario": "lv_en_numeric_or_term_conflict",
+        "look_for": (
+            "latviešu un angļu tekstā vienam risinājumam ir atšķirīgs "
+            "skaits, parametrs, materiāls, elements vai tehniskā nozīme"
+        ),
+        "required_evidence": (
+            "citē konkrēto LV tekstu un konkrēto EN tekstu; stilistiski "
+            "atšķirīgs, bet tehniski vienāds tulkojums nav kļūda"
+        ),
+    },
+    {
+        "scenario": "numeric_unit_or_parameter_conflict",
+        "look_for": (
+            "vienam elementam norādītas divas atšķirīgas skaitliskas "
+            "vērtības, mērvienības, slīpumi, klases, biezumi vai izmēri"
+        ),
+        "required_evidence": (
+            "citē abas vērtības; tikai noformējuma atšķirība nav kļūda, "
+            "ja vērtības matemātiski un tehniski ir vienādas"
+        ),
+    },
+    {
+        "scenario": "reference_without_specific_document_number",
+        "look_for": (
+            "tekstā dota konkrēta atsauce uz AR, BK, AVK, EL vai citu sadaļu, "
+            "bet nav norādīts rasējuma, specifikācijas vai dokumenta numurs"
+        ),
+        "required_evidence": (
+            "citē pašu atsauci; komentāru formulē kā pārbaudāmu jautājumu, "
+            "piemēram, ka atsauce uz sadaļu ir, bet konkrēts dokumenta numurs "
+            "nav norādīts"
+        ),
+    },
+    {
+        "scenario": "drawing_table_or_specification_conflict",
+        "look_for": (
+            "rasējuma piezīmē, tabulā, leģendā vai specifikācijā viens un tas "
+            "pats tips, kods, modelis, daudzums vai nosaukums norādīts atšķirīgi"
+        ),
+        "required_evidence": (
+            "citē abas konfliktējošās vietas; neizdari secinājumu no grafikas, "
+            "ja tekstā nav droši nolasāma pierādījuma"
+        ),
+    },
+    {
+        "scenario": "standard_or_classification_reference_conflict",
+        "look_for": (
+            "vienā rasējumā vienam standartam, klasifikācijai vai ugunsdrošības "
+            "parametram norādīti divi atšķirīgi numuri vai apzīmējumi"
+        ),
+        "required_evidence": (
+            "citē abus apzīmējumus; neapgalvo, ka standarts ir novecojis vai "
+            "nepareizs, ja nav otra dokumentā atrodama salīdzinājuma"
+        ),
+    },
+]
+
+
+def _candidate_combined_text(
+    candidate: Dict[str, Any],
+) -> str:
+    return " ".join([
+        clean_text(candidate.get("title")),
+        clean_text(candidate.get("problem")),
+        clean_text(candidate.get("designer_note")),
+        clean_text(candidate.get("comment_text")),
+        clean_text(candidate.get("evidence")),
+        clean_text(candidate.get("target_text")),
+        clean_text(candidate.get("comparison_text")),
+    ])
+
+
+def _quoted_or_code_values(value: Any) -> List[str]:
+    raw = clean_text(value)
+    values = _quoted_values(raw)
+
+    code_patterns = [
+        r"\b[A-ZĀ-Ž]{1,8}[-_.]?\d{1,6}(?:[-_.][A-Z0-9]{1,8})*\b",
+        r"\b\d+(?:[.,]\d+)?\s*(?:mm|cm|m|m²|m³|%|°|kW|W|Pa|bar)\b",
+        r"\b(?:EN|LVS|ISO|DIN)\s*[-:]?\s*\d+(?:[-:]\d+)*\b",
+    ]
+    for pattern in code_patterns:
+        values.extend(
+            re.findall(
+                pattern,
+                raw,
+                flags=re.IGNORECASE,
+            )
+        )
+
+    normalized: List[str] = []
+    seen = set()
+    for value in values:
+        cleaned = clean_text(value)
+        key = re.sub(
+            r"\s+",
+            " ",
+            cleaned.casefold(),
+        ).strip(" ,.;:")
+        if cleaned and key not in seen:
+            normalized.append(cleaned)
+            seen.add(key)
+
+    return normalized
+
+
+def universal_drawing_candidate_is_precise(
+    candidate: Dict[str, Any],
+    pdf_text: str,
+) -> bool:
+    """Atmet vispārīgas P ģimenes piezīmes bez konkrēta pierādījuma."""
+    if (
+        clean_text(candidate.get("family"))
+        != "P_universal_drawing_consistency"
+    ):
+        return True
+
+    target_text = clean_text(candidate.get("target_text"))
+    combined = _candidate_combined_text(candidate)
+    combined_low = combined.casefold()
+
+    if (
+        not target_text
+        or target_text == "MANUAL_PLACEMENT_REQUIRED"
+        or target_text.casefold() not in clean_text(pdf_text).casefold()
+    ):
+        return False
+
+    forbidden_generic = [
+        "pārbaudīt numerāciju",
+        "pārbaudīt konsekvenci",
+        "pārbaudīt atbilstību",
+        "jāsaskaņo ar citiem rasējumiem",
+        "varētu būt nesakritība",
+        "iespējama neatbilstība",
+        "nav pietiekami detalizēts",
+        "ieteicams precizēt",
+    ]
+    if any(
+        phrase in combined_low
+        for phrase in forbidden_generic
+    ):
+        return False
+
+    issue_type = clean_text(
+        candidate.get("issue_type")
+    ).casefold()
+
+    reference_issue = any(
+        token in issue_type
+        for token in [
+            "reference",
+            "atsauce",
+            "traceability",
+        ]
+    ) or (
+        "atsauce" in combined_low
+        and any(
+            token in combined_low
+            for token in [
+                "nav norādīts rasējuma numurs",
+                "nav norādīts dokumenta numurs",
+                "bez rasējuma numura",
+                "bez dokumenta numura",
+            ]
+        )
+    )
+
+    if reference_issue:
+        section_markers = [
+            " ar ",
+            " bk ",
+            " avk ",
+            " el ",
+            " uk ",
+            " ts ",
+            " sadaļ",
+            "rasējum",
+            "dokument",
+            "specifikāc",
+        ]
+        return any(
+            marker in f" {target_text.casefold()} "
+            for marker in section_markers
+        )
+
+    values = _quoted_or_code_values(combined)
+    normalized_values = {
+        re.sub(
+            r"[^0-9a-zāčēģīķļņšūž%°]+",
+            "",
+            value.casefold(),
+        )
+        for value in values
+        if clean_text(value)
+    }
+    normalized_values.discard("")
+
+    # Konflikta piezīmei vajag vismaz divas konkrētas, atšķirīgas vērtības.
+    return len(normalized_values) >= 2
+
+
 def candidate_quality_score(candidate: Dict[str, Any]) -> float:
     """Piešķir prioritāti precīzām, pierādāmām un lietotāja importētām piezīmēm."""
     score = 0.0
@@ -7604,6 +7855,26 @@ def main():
                     selected_pdf_items,
                 ):
                     continue
+
+                if (
+                    clean_text(candidate.get("family"))
+                    == "P_universal_drawing_consistency"
+                ):
+                    source_item = _candidate_source_item(
+                        candidate,
+                        selected_pdf_items,
+                    )
+                    source_text = clean_text(
+                        source_item.get("text")
+                        if source_item
+                        else ""
+                    )
+                    if not universal_drawing_candidate_is_precise(
+                        candidate,
+                        source_text,
+                    ):
+                        continue
+
                 if is_initial_issue_vs_revision_date_false_positive(
                     candidate
                 ):
