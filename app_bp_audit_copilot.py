@@ -44,7 +44,7 @@ except Exception:
     HttpError = Exception
 
 
-APP_VERSION = "v0.9.9"
+APP_VERSION = "v1.0.0"
 APP_TITLE = f"BP AI Audit Copilot {APP_VERSION}"
 
 REQUIRED_EXPORT_COLUMNS = [
@@ -2965,6 +2965,8 @@ def call_ai_for_grammar_chunks(
                     continue
                 if is_style_only_language_candidate(candidate):
                     continue
+                if is_room_schedule_duplicate_false_positive(candidate):
+                    continue
                 if not language_candidate_has_real_correction(candidate):
                     continue
                 if (
@@ -4830,6 +4832,10 @@ def init_state():
         "audit_run_id": "",
         "drive_write_test_result": None,
         "drive_write_test_error": "",
+        "drive_incremental_status": [],
+        "drive_incremental_errors": [],
+        "manual_import_merged_file_name": "",
+        "bootstrap_messages": [],
         "oauth_user_email": "",
         "oauth_user_name": "",
         "oauth_error": "",
@@ -5140,6 +5146,172 @@ def limit_candidates_per_pdf(
     return kept, suppressed_by_pdf
 
 
+
+def bootstrap_project_context(service, memory_folder_id: str, input_folder_id: str, active_project_code: str) -> Dict[str, Any]:
+    result: Dict[str, Any] = {"index_df": pd.DataFrame(), "index_file": None, "index_messages": [], "input_root_info": None, "project_folders": [], "selected_project_name": "", "warnings": []}
+    if clean_text(memory_folder_id):
+        try:
+            df, index_file, messages = load_audit_examples_index(service, clean_text(memory_folder_id))
+            result["index_df"] = df
+            result["index_file"] = index_file
+            result["index_messages"] = messages
+        except Exception as exc:
+            result["warnings"].append(f"Zināšanu bāzi neizdevās nolasīt automātiski: {exc}")
+    if clean_text(input_folder_id):
+        try:
+            root = resolve_input_root(service, clean_text(input_folder_id), wanted_name="01_Input")
+            folders = drive_list_children(service, clean_text(root.get("id")), "application/vnd.google-apps.folder")
+            result["input_root_info"] = root
+            result["project_folders"] = [dict(x) for x in folders if isinstance(x, dict)]
+            wanted = normalize_project_code(active_project_code)
+            for folder in result["project_folders"]:
+                name = clean_text(folder.get("name"))
+                if normalize_project_code(name) == wanted:
+                    result["selected_project_name"] = name
+                    break
+        except Exception as exc:
+            result["warnings"].append(f"01_Input projektu sarakstu neizdevās nolasīt automātiski: {exc}")
+    return result
+
+
+def apply_bootstrap_context_to_session(bootstrap: Dict[str, Any]) -> None:
+    index_df = bootstrap.get("index_df")
+    if isinstance(index_df, pd.DataFrame) and not index_df.empty:
+        st.session_state.index_df = index_df
+        st.session_state.index_file = bootstrap.get("index_file")
+        st.session_state.feedback_df = pd.DataFrame()
+        st.session_state.feedback_project_code = ""
+        st.session_state.feedback_messages = []
+    if bootstrap.get("input_root_info"):
+        st.session_state.input_root_info = bootstrap["input_root_info"]
+        st.session_state.project_folders = bootstrap.get("project_folders", [])
+        st.session_state.pdf_files = []
+        st.session_state.loaded_input_project_id = ""
+        st.session_state.loaded_input_project_name = ""
+        st.session_state.loaded_input_project_pdf_count = 0
+        st.session_state.selected_subfolder_paths = []
+        st.session_state.selected_pdf_ids_ui = []
+        st.session_state.selected_pdf_items = []
+        selected_name = clean_text(bootstrap.get("selected_project_name"))
+        if selected_name:
+            st.session_state.selected_project_filter = selected_name
+    st.session_state.bootstrap_messages = bootstrap.get("index_messages", []) + bootstrap.get("warnings", [])
+
+
+def is_floor_plan_document(value: Any) -> bool:
+    low = clean_text(value).casefold()
+    return any(token in low for token in ["floor plan", "stāva plān", "stava plan", "ground floor", "1st floor", "2nd floor", "3rd floor", "4th floor", "5th floor", "6th floor", "_ra_11", "_ra_12"])
+
+
+def is_room_schedule_duplicate_false_positive(candidate: Dict[str, Any]) -> bool:
+    source = clean_text(candidate.get("source_pdf_rel_path") or candidate.get("source_pdf") or candidate.get("target_file"))
+    if not is_floor_plan_document(source):
+        return False
+    combined = " ".join([clean_text(candidate.get("title")), clean_text(candidate.get("problem")), clean_text(candidate.get("designer_note")), clean_text(candidate.get("evidence")), clean_text(candidate.get("target_area"))]).casefold()
+    room = ["telpu", "telpa", "room", "eksplikāc", "schedule"]
+    duplicate = ["dubl", "atkārto", "duplicate", "repeated", "vairākkārt"]
+    conflict = ["nesakrīt", "atšķirīg", "different", "mismatch", "cits nosaukums", "nav atrodams", "missing", "platība"]
+    return any(x in combined for x in room) and any(x in combined for x in duplicate) and not any(x in combined for x in conflict)
+
+
+def candidate_merge_key(candidate: Dict[str, Any]) -> Tuple[str, str, str, str]:
+    return (_canonical_drive_rel_path(candidate.get("source_pdf_rel_path") or candidate.get("source_pdf") or candidate.get("target_file")), clean_text(candidate.get("family")).casefold(), clean_text(candidate.get("target_page")).casefold(), re.sub(r"\s+", " ", clean_text(candidate.get("target_text") or candidate.get("problem") or candidate.get("designer_note")).casefold()).strip(" ,.;:"))
+
+
+def merge_candidates_preserving_existing(existing: List[Dict[str, Any]], additional: List[Dict[str, Any]], audit_run_id: str) -> List[Dict[str, Any]]:
+    merged=[dict(x) for x in (existing or [])]
+    seen={candidate_merge_key(x) for x in merged}
+    n=len(merged)
+    for raw in additional or []:
+        c=dict(raw); key=candidate_merge_key(c)
+        if key in seen: continue
+        n+=1
+        c["candidate_id"] = clean_text(c.get("candidate_id")) or make_candidate_id(c, audit_run_id, n)
+        c.setdefault("include_default", True); c.setdefault("reject_default", False)
+        merged.append(c); seen.add(key)
+    return merged
+
+
+def _extract_correction_pair(candidate: Dict[str, Any]) -> Tuple[str, str]:
+    combined=" ".join([clean_text(candidate.get("designer_note")),clean_text(candidate.get("problem")),clean_text(candidate.get("comment_text")),clean_text(candidate.get("evidence"))])
+    patterns=[r'["“”\']([^"“”\']{1,180})["“”\']\s*(?:→|->|=>|\buz\b)\s*["“”\']([^"“”\']{1,180})["“”\']', r'\b([A-Za-zĀ-ž0-9./+\-]{2,120})\s*(?:→|->|=>)\s*([A-Za-zĀ-ž0-9./+\-]{2,120})\b']
+    for p in patterns:
+        m=re.search(p,combined)
+        if m: return clean_text(m.group(1)),clean_text(m.group(2))
+    return "",""
+
+
+def _specific_related_documents(candidate: Dict[str, Any], selected_pdf_items: List[Dict[str, Any]]) -> List[str]:
+    explicit=clean_text(candidate.get("comparison_files"))
+    if explicit:
+        return list(dict.fromkeys([clean_text(v) for v in re.split(r"[;,\n]+",explicit) if clean_text(v)]))[:6]
+    target=clean_text(candidate.get("target_text")); source=_canonical_drive_rel_path(candidate.get("source_pdf_rel_path") or candidate.get("source_pdf"))
+    if not target or len(target)<8: return []
+    out=[]
+    for item in selected_pdf_items or []:
+        rel=clean_text(item.get("rel_path") or item.get("name"))
+        if _canonical_drive_rel_path(rel)==source: continue
+        if target.casefold() in clean_text(item.get("text")).casefold(): out.append(rel)
+    return list(dict.fromkeys(out))[:6]
+
+
+def build_concise_candidate_comment(candidate: Dict[str, Any], selected_pdf_items: Optional[List[Dict[str, Any]]] = None) -> str:
+    page=clean_text(candidate.get("target_page")); area=clean_text(candidate.get("target_area") or candidate.get("where"))
+    parts=[]
+    if page: parts.append(f"{page}. lapa")
+    if area and area.casefold() not in {"teksts","text"}: parts.append(area)
+    location=", ".join(parts)
+    wrong,correct=_extract_correction_pair(candidate)
+    target=clean_text(candidate.get("target_text")); base=clean_text(candidate.get("designer_note") or candidate.get("comment_text") or candidate.get("problem"))
+    if wrong and correct and wrong.casefold()!=correct.casefold(): task=f'labot “{wrong}” uz “{correct}”'
+    elif target and target!="MANUAL_PLACEMENT_REQUIRED": task=base or f'pārbaudīt tekstu “{target}”'
+    else: task=base or "pārbaudīt norādīto risinājumu"
+    task=re.sub(r"(?i)^lūdzu[,\s]+","",task).strip()
+    task=task[:1].lower()+task[1:] if task else task
+    comment=(f"{location}: {task}" if location else task).rstrip(" .")+"."
+    related=_specific_related_documents(candidate, selected_pdf_items or [])
+    if related: comment += " Izlabot arī konkrētajos saistītajos rasējumos: " + "; ".join(related) + "."
+    return comment
+
+
+def upload_audit_files_incrementally(service, results_target: Dict[str, Any], memory_folder_id: str, project_folder_name: str, accepted_df: pd.DataFrame, rejected_df: pd.DataFrame, pdf_items: List[Dict[str, Any]], progress_callback: Optional[Any]=None) -> Dict[str, Any]:
+    timestamp=datetime.now().strftime("%Y%m%d_%H%M%S"); results=[]; memory=[]; errors=[]
+    target_id=clean_text(results_target.get("id")); target_path=clean_text(results_target.get("path")); total=len(pdf_items or [])
+    for i,item in enumerate(pdf_items or [],1):
+        name=clean_text(item.get("name")); rel=clean_text(item.get("rel_path")) or name; raw=item.get("bytes")
+        try:
+            if not name or not raw: raise RuntimeError("Nav PDF nosaukuma vai baita satura.")
+            if progress_callback: progress_callback(i,total,rel,"annotating","")
+            rows=_select_rows_for_pdf(accepted_df,rel,name,pdf_items)
+            if rows.empty:
+                out,report=add_no_findings_banner(raw); status="no_findings"; verified=bool(report)
+            else:
+                out,report=annotate_pdf_bytes(raw,rows); status="findings"; verified=False
+            if not out: raise RuntimeError("Anotētais PDF netika izveidots.")
+            safe=re.sub(r"[^A-Za-z0-9_\-]+","_",os.path.splitext(name)[0])[:120]; out_name=f"annotated_{safe}.pdf"
+            if progress_callback: progress_callback(i,total,rel,"uploading",out_name)
+            up=drive_upsert_bytes(service,target_id,out_name,out,"application/pdf")
+            up.update({"destination_path":target_path,"source":rel,"audit_status":status,"accepted_count":int(len(rows)),"banner_verified":verified,"annotation_report":report or []}); results.append(up)
+            if progress_callback: progress_callback(i,total,rel,"saved",out_name)
+        except Exception as exc:
+            errors.append({"source":rel,"error":str(exc)})
+            if progress_callback: progress_callback(i,total,rel,"error",str(exc))
+    project=clean_text(project_folder_name) or clean_text(results_target.get("name")) or "Nezinams_projekts"
+    try:
+        if accepted_df is not None and not accepted_df.empty:
+            folder=ensure_memory_project_folder(service,memory_folder_id,PENDING_FOLDER_NAME,project)
+            name=f"accepted_candidates_{normalize_project_code(project) or 'project'}_{timestamp}.xlsx"
+            up=drive_upload_bytes(service,clean_text(folder.get("id")),name,dataframe_to_xlsx_bytes(accepted_df,"accepted_candidates"),"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+            up["destination_path"]=f"03_Memory/{PENDING_FOLDER_NAME}/{clean_text(folder.get('name'))}"; memory.append(up)
+        if rejected_df is not None and not rejected_df.empty:
+            folder=ensure_memory_project_folder(service,memory_folder_id,FEEDBACK_FOLDER_NAME,project)
+            name=f"rejected_patterns_{normalize_project_code(project) or 'project'}_{timestamp}.xlsx"
+            up=drive_upload_bytes(service,clean_text(folder.get("id")),name,dataframe_to_xlsx_bytes(rejected_df,"rejected_patterns"),"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+            up["destination_path"]=f"03_Memory/{FEEDBACK_FOLDER_NAME}/{clean_text(folder.get('name'))}"; memory.append(up)
+    except Exception as exc: errors.append({"source":"03_Memory","error":str(exc)})
+    return {"results_files":results,"memory_files":memory,"errors":errors,"target":results_target,"timestamp":timestamp}
+
+
 def main():
     st.set_page_config(page_title=APP_TITLE, layout="wide")
     init_state()
@@ -5334,6 +5506,13 @@ def main():
                     st.session_state.active_project_memory_code = normalize_project_code(activated.get("project_code"))
                     st.session_state.active_project_memory_name = clean_text(activated.get("project_name"))
                     st.session_state.active_project_memory_manifest = activated.get("manifest") or {}
+                    bootstrap = bootstrap_project_context(
+                        project_memory_service,
+                        memory_folder_id.strip(),
+                        input_folder_id.strip(),
+                        st.session_state.active_project_memory_code,
+                    )
+                    apply_bootstrap_context_to_session(bootstrap)
                     st.rerun()
             else:
                 st.info("Vēl nav izveidota neviena projekta atmiņa.")
@@ -5374,7 +5553,17 @@ def main():
                     st.session_state.active_project_memory_code = normalize_project_code(created.get("project_code"))
                     st.session_state.active_project_memory_name = clean_text(created.get("project_name"))
                     st.session_state.active_project_memory_manifest = created.get("manifest") or {}
+                    bootstrap = bootstrap_project_context(
+                        project_memory_service,
+                        memory_folder_id.strip(),
+                        input_folder_id.strip(),
+                        st.session_state.active_project_memory_code,
+                    )
+                    apply_bootstrap_context_to_session(bootstrap)
                     st.rerun()
+
+            for bootstrap_message in st.session_state.pop("bootstrap_messages", []):
+                st.info(clean_text(bootstrap_message))
 
             active_code = clean_text(st.session_state.get("active_project_memory_code"))
             active_name = clean_text(st.session_state.get("active_project_memory_name"))
@@ -5904,253 +6093,48 @@ def main():
 
                     apply_col, _ = st.columns([1, 4])
                     with apply_col:
-                        apply_pdf_selection = st.button(
-                            "Apstiprināt PDF izvēli",
+                        apply_and_read_clicked = st.button(
+                            "Apstiprināt izvēli un nolasīt PDF",
                             type="primary",
                             use_container_width=True,
-                            key=f"apply_pdf_selection_{selection_signature}",
+                            key=f"apply_and_read_pdf_selection_{selection_signature}",
                         )
-                    if apply_pdf_selection:
-                        st.session_state.selected_pdf_ids_ui = checked_ids
-
-                    selected_pdf_ids = [
-                        x for x in st.session_state.get("selected_pdf_ids_ui", [])
-                        if x in by_id
-                    ]
-                    selected_pdf_files = [by_id[x] for x in selected_pdf_ids]
-                    st.caption(f"Apstiprināti PDF: {len(selected_pdf_files)}")
-
+                    st.caption(f"Atzīmēti PDF: {len(checked_ids)}")
+                    selected_pdf_files=[by_id[x] for x in checked_ids if x in by_id]
                     if selected_pdf_files:
                         with st.expander("Izvēlētie PDF ceļi", expanded=False):
-                            for f in selected_pdf_files:
-                                st.write(clean_text(f.get("rel_path")))
-
-                        read_content_col, _ = st.columns([1, 4])
-                        with read_content_col:
-                            read_selected_clicked = st.button(
-                                "Nolasīt izvēlēto PDF saturu",
-                                type="primary",
-                                use_container_width=True,
-                                key="read_selected_pdf_content",
-                            )
-
-                        if read_selected_clicked:
-                            loaded_items: List[Dict[str, Any]] = []
-                            errors: List[str] = []
-                            progress = st.progress(0)
-                            status = st.empty()
-                            for i, selected_pdf in enumerate(selected_pdf_files, start=1):
+                            for item in selected_pdf_files: st.write(clean_text(item.get("rel_path")))
+                    if apply_and_read_clicked:
+                        if not selected_pdf_files:
+                            st.warning("Atzīmē vismaz vienu auditējamo PDF.")
+                        else:
+                            st.session_state.selected_pdf_ids_ui=checked_ids
+                            loaded_items=[]; errors=[]; progress=st.progress(0); status=st.empty()
+                            for i,item in enumerate(selected_pdf_files,1):
                                 try:
-                                    status.write(
-                                        f"Nolasu {i}/{len(selected_pdf_files)}: {selected_pdf.get('name')}"
-                                    )
-                                    pdf_bytes = drive_download_bytes(service, selected_pdf["id"])
-                                    pdf_text_value, pages, err = extract_pdf_text(pdf_bytes, max_context_chars)
-                                    if err:
-                                        errors.append(
-                                            f"{selected_pdf.get('rel_path', selected_pdf.get('name'))}: {err}"
-                                        )
-                                    else:
-                                        loaded_items.append({
-                                            "id": selected_pdf.get("id"),
-                                            "name": selected_pdf.get("name", "audit.pdf"),
-                                            "rel_path": selected_pdf.get("rel_path", selected_pdf.get("name", "audit.pdf")),
-                                            "bytes": pdf_bytes,
-                                            "text": pdf_text_value,
-                                            "pages": pages,
-                                        })
-                                except Exception as exc:
-                                    errors.append(
-                                        f"{selected_pdf.get('rel_path', selected_pdf.get('name'))}: {exc}"
-                                    )
-                                progress.progress(i / max(1, len(selected_pdf_files)))
-                            status.empty()
-                            progress.empty()
-
+                                    status.write(f"Nolasu {i}/{len(selected_pdf_files)}: {item.get('name')}")
+                                    raw=drive_download_bytes(service,item["id"])
+                                    value,pages,err=extract_pdf_text(raw,max_context_chars)
+                                    if err: errors.append(f"{item.get('rel_path',item.get('name'))}: {err}")
+                                    else: loaded_items.append({"id":item.get("id"),"name":item.get("name","audit.pdf"),"rel_path":item.get("rel_path",item.get("name","audit.pdf")),"bytes":raw,"text":value,"pages":pages})
+                                except Exception as exc: errors.append(f"{item.get('rel_path',item.get('name'))}: {exc}")
+                                progress.progress(i/max(1,len(selected_pdf_files)))
+                            status.empty(); progress.empty()
                             if loaded_items:
-                                st.session_state.selected_pdf_items = loaded_items
-                                first = loaded_items[0]
-                                st.session_state.selected_pdf_bytes = first.get("bytes")
-                                st.session_state.selected_pdf_name = clean_text(first.get("name"))
-                                st.session_state.selected_pdf_rel_path = clean_text(first.get("rel_path"))
-                                st.session_state.pdf_text = "\n\n".join(
-                                    f"===== PDF: {clean_text(item.get('rel_path'))} =====\n{clean_text(item.get('text'))}"
-                                    for item in loaded_items
-                                )[:max_context_chars]
-                                st.session_state.pdf_pages = [
-                                    page
-                                    for item in loaded_items
-                                    for page in item.get("pages", [])
-                                ]
-                                st.session_state.candidates = []
-                                st.session_state.ai_errors = []
-                                st.session_state.audit_run_id = ""
+                                st.session_state.selected_pdf_items=loaded_items; first=loaded_items[0]
+                                st.session_state.selected_pdf_bytes=first.get("bytes"); st.session_state.selected_pdf_name=clean_text(first.get("name")); st.session_state.selected_pdf_rel_path=clean_text(first.get("rel_path"))
+                                st.session_state.pdf_text="\n\n".join(f"===== PDF: {clean_text(x.get('rel_path'))} =====\n{clean_text(x.get('text'))}" for x in loaded_items)[:max_context_chars]
+                                st.session_state.pdf_pages=[p for x in loaded_items for p in x.get("pages",[])]
+                                st.session_state.candidates=[]; st.session_state.ai_errors=[]; st.session_state.audit_run_id=""
+                                st.session_state.manual_import_df=pd.DataFrame(columns=MANUAL_IMPORT_COLUMNS); st.session_state.manual_import_file_name=""; st.session_state.manual_import_merged_file_name=""
                                 st.success(f"Nolasīti PDF: {len(loaded_items)}")
                             if errors:
                                 with st.expander(f"PDF nolasīšanas kļūdas ({len(errors)})"):
-                                    for message in errors:
-                                        st.warning(message)
+                                    for msg in errors: st.warning(msg)
         except Exception as exc:
             st.error(f"PDF izvēles sadaļas kļūda: {exc}")
             with st.expander("PDF izvēles traceback"):
                 st.code(traceback.format_exc())
-
-
-    st.header("3B. Papildu piezīmju Excel imports")
-    st.caption(
-        "Šeit vari augšupielādēt ChatGPT vai cilvēka sagatavotu Excel. "
-        "Importētās rindas tiks pievienotas AI kandidātiem un būs jāpārskata "
-        "5. sadaļā tāpat kā rīka ģenerētās piezīmes. Nekas netiek automātiski "
-        "saglabāts Drive, kamēr piezīmes nav pārskatītas un audits nav saglabāts."
-    )
-
-    manual_upload = st.file_uploader(
-        "Augšupielādēt piezīmju Excel (.xlsx)",
-        type=["xlsx", "xlsm"],
-        key="manual_audit_notes_upload",
-        help=(
-            "Ieteicamais lapas nosaukums: audit_notes_import. "
-            "Failā jābūt source_file, family, issue_type, target_page, "
-            "target_area, target_text, problem un comment_text kolonnām."
-        ),
-    )
-
-    if manual_upload is not None:
-        upload_name = clean_text(getattr(manual_upload, "name", ""))
-        if upload_name != st.session_state.get("manual_import_file_name"):
-            manual_df, manual_errors = read_manual_import_excel(manual_upload)
-            st.session_state.manual_import_df = manual_df
-            st.session_state.manual_import_errors = manual_errors
-            st.session_state.manual_import_file_name = upload_name
-            st.session_state.manual_import_warnings = []
-
-    manual_df = st.session_state.get(
-        "manual_import_df",
-        pd.DataFrame(columns=MANUAL_IMPORT_COLUMNS),
-    )
-    manual_errors = st.session_state.get("manual_import_errors", [])
-
-    for message in manual_errors:
-        st.warning(message)
-
-    if manual_upload is None and st.session_state.get("manual_import_file_name"):
-        st.info(
-            "Iepriekš nolasītais importa fails šajā sesijā: "
-            f"{st.session_state.get('manual_import_file_name')}"
-        )
-
-    if manual_df is not None and not manual_df.empty:
-        st.success(
-            f"Importam sagatavotas piezīmes: {len(manual_df)}"
-        )
-        preview_columns = [
-            "note_number",
-            "source_file",
-            "family",
-            "target_page",
-            "target_text",
-            "comment_text",
-        ]
-        st.dataframe(
-            manual_df[preview_columns],
-            use_container_width=True,
-            hide_index=True,
-        )
-
-        selected_for_match = st.session_state.get(
-            "selected_pdf_items",
-            [],
-        )
-        if selected_for_match:
-            matched_count = 0
-            unmatched_sources = []
-            for source_value in manual_df["source_file"].tolist():
-                if match_manual_source_pdf(
-                    clean_text(source_value),
-                    selected_for_match,
-                ) is not None:
-                    matched_count += 1
-                else:
-                    unmatched_sources.append(clean_text(source_value))
-
-            if matched_count == len(manual_df):
-                st.success(
-                    f"PDF sasaistes pārbaude: visas {matched_count} Excel rindas "
-                    "atbilst auditā izvēlētajiem PDF."
-                )
-            else:
-                st.warning(
-                    f"PDF sasaistes pārbaude: atbilst {matched_count} no "
-                    f"{len(manual_df)} Excel rindām."
-                )
-                unique_unmatched = list(dict.fromkeys(unmatched_sources))
-                if unique_unmatched:
-                    st.caption(
-                        "Neatpazītie source_file: "
-                        + "; ".join(unique_unmatched[:8])
-                    )
-        else:
-            st.info(
-                "PDF sasaisti varēs pārbaudīt pēc auditējamo PDF izvēles "
-                "un to satura nolasīšanas 3. sadaļā."
-            )
-        clear_import_col, _ = st.columns([1, 4])
-        with clear_import_col:
-            if st.button(
-                "Noņemt importēto Excel",
-                use_container_width=True,
-                key="clear_manual_import",
-            ):
-                st.session_state.manual_import_df = pd.DataFrame(
-                    columns=MANUAL_IMPORT_COLUMNS
-                )
-                st.session_state.manual_import_errors = []
-                st.session_state.manual_import_warnings = []
-                st.session_state.manual_import_file_name = ""
-                st.rerun()
-
-        st.markdown("### Nākamie soļi")
-        kb_ready_for_import = not st.session_state.get(
-            "index_df",
-            pd.DataFrame(),
-        ).empty
-        pdfs_ready_for_import = bool(
-            st.session_state.get("selected_pdf_items", [])
-        )
-
-        step1_icon = "✅" if kb_ready_for_import else "⬜"
-        step2_icon = "✅" if pdfs_ready_for_import else "⬜"
-        step3_icon = "✅"
-
-        st.markdown(
-            f"{step1_icon} **1. Zināšanu bāze nolasīta**  \\n"
-            f"{step2_icon} **2. Auditējamie PDF izvēlēti un to saturs nolasīts**  \\n"
-            f"{step3_icon} **3. Papildu piezīmju Excel nolasīts**"
-        )
-
-        if not kb_ready_for_import:
-            st.warning(
-                "Atgriezies 1. sadaļā un nospied “Nolasīt zināšanu bāzi”."
-            )
-        if not pdfs_ready_for_import:
-            st.warning(
-                "Atgriezies 3. sadaļā, izvēlies PDF, apstiprini izvēli un "
-                "nospied “Nolasīt izvēlēto PDF saturu”."
-            )
-
-        if kb_ready_for_import and pdfs_ready_for_import:
-            st.success(
-                "Viss ir sagatavots. Ritini uz 4. sadaļu un nospied "
-                "“Analizēt izvēlētos PDF”. Importētās piezīmes tiks "
-                "pievienotas AI kandidātiem un parādīsies 5. sadaļā pārskatīšanai."
-            )
-        else:
-            st.info(
-                "Importētais Excel paliks šajā Streamlit sesijā. "
-                "Pēc trūkstošo soļu izpildes atgriezies 4. sadaļā."
-            )
-    else:
-        st.caption("Papildu piezīmju Excel nav ielādēts.")
 
 
     st.header("4. AI piezīmju ģenerēšana")
@@ -6165,7 +6149,7 @@ def main():
         if not selected_pdf_items:
             missing_steps.append(
                 "3. sadaļā jāizvēlas PDF un jānospiež "
-                "“Nolasīt izvēlēto PDF saturu”"
+                "“Apstiprināt izvēli un nolasīt PDF”"
             )
 
         st.warning(
@@ -6204,35 +6188,8 @@ def main():
             all_candidates: List[Dict[str, Any]] = []
             errors: List[Dict[str, Any]] = []
 
-            manual_candidates, manual_warnings = manual_import_rows_to_candidates(
-                st.session_state.get(
-                    "manual_import_df",
-                    pd.DataFrame(columns=MANUAL_IMPORT_COLUMNS),
-                ),
-                selected_pdf_items,
-            )
-
-            if manual_candidates:
-                status = st.empty()
-                status.write(
-                    "Precizē manuālā Excel piezīmes: tulko latviski un "
-                    "meklē precīzus teksta enkurus PDF lapās."
-                )
-                refined_manual, refine_warnings = refine_manual_import_candidates(
-                    client,
-                    model,
-                    manual_candidates,
-                    selected_pdf_items,
-                )
-                manual_candidates = refined_manual
-                manual_warnings.extend(refine_warnings)
-
-            all_candidates.extend(manual_candidates)
-            st.session_state.manual_import_warnings = manual_warnings
-
             progress = st.progress(0)
-            if "status" not in locals():
-                status = st.empty()
+            status = st.empty()
             pdf_progress_placeholder = st.empty()
 
             selected_family_set = set(selected_families)
@@ -6637,6 +6594,8 @@ def main():
                     continue
                 if is_style_only_language_candidate(candidate):
                     continue
+                if is_room_schedule_duplicate_false_positive(candidate):
+                    continue
                 if (
                     clean_text(candidate.get("family"))
                     == "A_text_language"
@@ -6716,16 +6675,41 @@ def main():
                     "Kvalitātes filtrs paslēpa "
                     f"{suppressed_total} zemākas prioritātes AI piezīmes."
                 )
-            if manual_candidates:
-                st.info(
-                    f"No manuālā Excel pievienoti kandidāti: {len(manual_candidates)}"
-                )
-            for warning in manual_warnings:
-                st.warning(warning)
 
     if st.session_state.ai_errors:
         with st.expander("AI batch kļūdas"):
             st.dataframe(pd.DataFrame(st.session_state.ai_errors), use_container_width=True)
+
+    candidates = st.session_state.candidates
+    if candidates:
+        st.header("4B. Papildu piezīmju Excel imports")
+        st.caption("Vispirms apskati OpenAI rezultātu. Ja trūkst piezīmju, augšupielādē Excel. OpenAI piezīmes netiks dzēstas.")
+        manual_upload=st.file_uploader("Augšupielādēt papildu piezīmju Excel (.xlsx)",type=["xlsx","xlsm"],key=f"manual_audit_notes_upload_{st.session_state.audit_run_id}")
+        if manual_upload is not None:
+            upload_name=clean_text(getattr(manual_upload,"name",""))
+            if upload_name and upload_name!=st.session_state.get("manual_import_merged_file_name"):
+                manual_df,manual_errors=read_manual_import_excel(manual_upload)
+                st.session_state.manual_import_df=manual_df; st.session_state.manual_import_errors=manual_errors; st.session_state.manual_import_file_name=upload_name
+                for msg in manual_errors: st.warning(msg)
+                if not manual_df.empty:
+                    manual_candidates,warnings=manual_import_rows_to_candidates(manual_df,st.session_state.get("selected_pdf_items",[]))
+                    client=get_openai_client()
+                    if client is not None and manual_candidates:
+                        with st.spinner("Precizēju Excel piezīmes un meklēju teksta enkurus PDF..."):
+                            manual_candidates,refine_warnings=refine_manual_import_candidates(client,model,manual_candidates,st.session_state.get("selected_pdf_items",[]))
+                        warnings.extend(refine_warnings)
+                    st.session_state.candidates=merge_candidates_preserving_existing(st.session_state.candidates,manual_candidates,clean_text(st.session_state.get("audit_run_id")))
+                    st.session_state.manual_import_warnings=warnings; st.session_state.manual_import_merged_file_name=upload_name
+                    st.success(f"Pievienoti Excel kandidāti: {len(manual_candidates)}. OpenAI piezīmes saglabātas.")
+                    st.rerun()
+        for warning in st.session_state.get("manual_import_warnings",[]): st.warning(warning)
+        imported_count=sum(1 for c in st.session_state.candidates if clean_text(c.get("candidate_source"))=="manual_excel_import")
+        if imported_count:
+            st.info(f"Sesijā ir {imported_count} Excel izcelsmes kandidāti.")
+            if st.button("Noņemt tikai importētā Excel piezīmes",key=f"remove_manual_candidates_{st.session_state.audit_run_id}"):
+                st.session_state.candidates=[c for c in st.session_state.candidates if clean_text(c.get("candidate_source"))!="manual_excel_import"]
+                st.session_state.manual_import_df=pd.DataFrame(columns=MANUAL_IMPORT_COLUMNS); st.session_state.manual_import_errors=[]; st.session_state.manual_import_warnings=[]; st.session_state.manual_import_file_name=""; st.session_state.manual_import_merged_file_name=""
+                st.rerun()
 
     candidates = st.session_state.candidates
     if candidates:
@@ -6769,21 +6753,9 @@ def main():
                     )
                 st.markdown(f"**Ģimene:** `{family}`")
                 if c.get("technical_review_question"):
-                    st.warning(
-                        "Pārbaudāms tehniskais jautājums — nav apstiprināta "
-                        "neatbilstība un pēc noklusējuma netiek iekļauts eksportā."
-                    )
-                st.markdown(f"**Kur:** {clean_text(c.get('where') or c.get('target_area'))}")
-                st.markdown(f"**Statuss:** {clean_text(c.get('status'))}")
-                st.markdown("**Problēma:**")
-                st.write(clean_text(c.get("problem")))
-                st.markdown("**PDF komentārs:**")
-                edited_note = st.text_area(
-                    "Labot īso komentāru",
-                    value=clean_text(c.get("designer_note") or c.get("problem") or c.get("comment_text")),
-                    key=f"designer_note_{audit_run_id}_{candidate_id}",
-                    height=140,
-                )
+                    st.warning("Pārbaudāms tehniskais jautājums — pēc noklusējuma netiek eksportēts.")
+                concise_default=build_concise_candidate_comment(c,st.session_state.get("selected_pdf_items",[]))
+                edited_note=st.text_area("Īsais uzdevums projektētājam",value=concise_default,key=f"designer_note_{audit_run_id}_{candidate_id}",height=100)
                 c["designer_note"] = edited_note
                 decision = st.radio(
                     "Lēmums par piezīmi",
@@ -7060,7 +7032,7 @@ def main():
                     )
                 with action_col2:
                     save_audit_clicked = st.button(
-                        "Saglabāt audita failus Google Drive",
+                        "Uzzīmēt piezīmes un saglabāt katru PDF Drive",
                         type="primary",
                         use_container_width=True,
                         key=f"save_audit_files_drive_{audit_run_id}",
@@ -7084,16 +7056,15 @@ def main():
                     try:
                         if not selected_pdf_items:
                             raise RuntimeError("Nav izvēlētu auditējamo PDF failu, ko saglabāt.")
-                        with st.spinner("Saglabāju PDF un Memory Excel Google Drive..."):
-                            result = upload_audit_files_to_drive(
-                                oauth_service,
-                                results_target=selected_target,
-                                memory_folder_id=memory_folder_id.strip(),
-                                project_folder_name=memory_project_name,
-                                accepted_df=accepted_df,
-                                rejected_df=rejected_df,
-                                pdf_items=selected_pdf_items,
-                            )
+                        progress_bar=st.progress(0); progress_text=st.empty(); incremental_rows=[]
+                        def save_progress_callback(file_index:int,file_total:int,source_path:str,phase:str,detail:str)->None:
+                            labels={"annotating":"uzzīmē piezīmes","uploading":"augšupielādē Drive","saved":"saglabāts Drive","error":"kļūda"}
+                            progress_text.write(f"{file_index}/{file_total} — {labels.get(phase,phase)} — {source_path}")
+                            progress_bar.progress(min(1.0,file_index/max(1,file_total)))
+                            if phase in {"saved","error"}: incremental_rows.append({"PDF":source_path,"Statuss":labels.get(phase,phase),"Detaļas":detail})
+                        result=upload_audit_files_incrementally(oauth_service,results_target=selected_target,memory_folder_id=memory_folder_id.strip(),project_folder_name=memory_project_name,accepted_df=accepted_df,rejected_df=rejected_df,pdf_items=selected_pdf_items,progress_callback=save_progress_callback)
+                        progress_text.empty(); progress_bar.empty()
+                        st.session_state.drive_incremental_status=incremental_rows; st.session_state.drive_incremental_errors=result.get("errors") or []
                         active_memory_id = clean_text(
                             st.session_state.get("active_project_memory_id")
                         )
@@ -7145,6 +7116,15 @@ def main():
                     "v0.7.1 tās pirms XLSX saglabāšanas automātiski iztīra."
                 )
             st.code(save_error)
+
+        incremental_status=st.session_state.get("drive_incremental_status",[])
+        if incremental_status:
+            st.markdown("#### Pakāpeniskās saglabāšanas statuss")
+            st.dataframe(pd.DataFrame(incremental_status),use_container_width=True,hide_index=True)
+        incremental_errors=st.session_state.get("drive_incremental_errors",[])
+        if incremental_errors:
+            st.warning(f"Neizdevās apstrādāt {len(incremental_errors)} failus. Iepriekš veiksmīgi saglabātie PDF paliek Google Drive.")
+            st.dataframe(pd.DataFrame(incremental_errors),use_container_width=True,hide_index=True)
 
         save_result = st.session_state.get("drive_save_result")
         if isinstance(save_result, dict) and save_result:
