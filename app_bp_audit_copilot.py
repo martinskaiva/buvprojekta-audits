@@ -44,7 +44,7 @@ except Exception:
     HttpError = Exception
 
 
-APP_VERSION = "v1.0.3"
+APP_VERSION = "v1.0.4"
 APP_TITLE = f"BP AI Audit Copilot {APP_VERSION}"
 
 REQUIRED_EXPORT_COLUMNS = [
@@ -115,9 +115,9 @@ FAMILY_INSTRUCTIONS = {
     },
     "D_document_identity": {
         "name": "Dokumenta identitāte, faila nosaukums, kods un titullauks",
-        "look_for": "faila nosaukuma, dokumenta numura, projekta koda, sadaļas koda, rasējuma nosaukuma un titullauka neatbilstības",
-        "report_if": "failā redzamais dokumenta numurs vai nosaukums neatbilst faila nosaukumam/titullaukam",
-        "do_not_report": "neziņo 2/2 kā lapu skaita kļūdu, ja tas apzīmē būvprojekta kārtu; neziņo tikai failu sistēmas zīmju atšķirības",
+        "look_for": "pilna rasējuma vai dokumenta numura reālas neatbilstības starp faila nosaukumu un rakstlauku",
+        "report_if": "faila nosaukumā un rakstlaukā ir divi atšķirīgi pilni rasējuma numuri vai viens no tiem ir nepilnīgs",
+        "do_not_report": "ja rakstlaukā ir pilns un korekts rasējuma numurs, neziņo par faila nosaukuma tekstuālo lapas satura aprakstu; Rev_1 un Rev.1 ir viena revīzija; neziņo 2/2 kā lapu skaita kļūdu, ja tas apzīmē būvprojekta kārtu",
     },
     "E_drawing_list_references": {
         "name": "Rasējumu saraksti un savstarpējās atsauces",
@@ -3663,6 +3663,8 @@ def call_ai_for_family(
             "Salīdzini tikai viena tipa laukus: kodu ar kodu, datumu ar datumu, diametru ar diametru, kadastra numuru ar kadastra numuru.",
             "C_dates_versions: sākotnējās izdošanas datums rakstlaukā drīkst atšķirties no vēlākas Rev.1, Rev.2, Rev.3 utt. rindas datuma; to nekad neziņo kā kļūdu.",
             "C_dates_versions piezīmi veido tikai vienas un tās pašas revīzijas diviem datumiem, aktuālās revīzijas numura konfliktam, nederīgam datumam vai placeholderam.",
+            "D_document_identity: pilns rasējuma numurs rakstlaukā ir pietiekams; faila nosaukuma tekstuālais lapas satura apraksts nav jāatkārto rakstlaukā; Rev_1 un Rev.1 ir viena revīzija.",
+            "D_document_identity kandidātu atgriez tikai tad, ja vari nosaukt divus atšķirīgus pilnus rasējuma numurus vai konkrēti pierādīt, ka viens numurs ir nepilnīgs.",
             "Telpas numura vai secības piezīmei obligāti nosauc konkrēto kļūdaino telpas kodu target_text, konkrēto konfliktējošo vai sagaidāmo kodu un precīzu vietu plānā vai eksplikācijā; vispārīgu 'sakārtot telpu numurus' kandidātu neatgriez.",
         ],
         "similar_positive_examples": examples,
@@ -5702,6 +5704,194 @@ def detect_element_count_reconciliation_candidates(
     return candidates
 
 
+
+DOCUMENT_NUMBER_PATTERN = re.compile(
+    r"\b([A-Z0-9]{2,}(?:[-_][A-Z0-9]{1,10}){4,}"
+    r"[-_](?:RA|SP|MS|TD|TS|AR|BK|EL|AVK|UK|VS|DOP|GP)"
+    r"[-_]\d{4,6})\b",
+    re.IGNORECASE,
+)
+
+
+def _normalise_document_number(value: Any) -> str:
+    return re.sub(
+        r"[^A-Za-z0-9]+",
+        "",
+        clean_text(value),
+    ).casefold()
+
+
+def _extract_document_numbers(value: Any) -> List[str]:
+    raw = clean_text(value)
+    result: List[str] = []
+
+    for match in DOCUMENT_NUMBER_PATTERN.finditer(raw):
+        value_found = clean_text(match.group(1))
+        if value_found:
+            result.append(value_found)
+
+    for match in re.finditer(
+        r"\b(RWC[A-Z0-9-]*(?:_[A-Z0-9-]+){4,}_\d{4,6})\b",
+        raw,
+        flags=re.IGNORECASE,
+    ):
+        value_found = clean_text(match.group(1))
+        if value_found:
+            result.append(value_found)
+
+    return list(dict.fromkeys(result))
+
+
+def _filename_document_number(value: Any) -> str:
+    name = clean_text(value).rsplit("/", 1)[-1]
+    name = re.sub(r"\.pdf$", "", name, flags=re.IGNORECASE)
+
+    numbers = _extract_document_numbers(name)
+    if numbers:
+        return numbers[0]
+
+    match = re.search(
+        r"^(.+?_[A-Z]{1,5}_\d{4,6})"
+        r"(?:[-_](?:Rev|REV)[._-]?\d+)?(?:-|$)",
+        name,
+    )
+    return clean_text(match.group(1)) if match else ""
+
+
+def _candidate_source_item(
+    candidate: Dict[str, Any],
+    selected_pdf_items: List[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    wanted_path = _canonical_drive_rel_path(
+        candidate.get("source_pdf_rel_path")
+        or candidate.get("source_pdf")
+        or candidate.get("target_file")
+    )
+    wanted_name = clean_text(
+        candidate.get("source_pdf")
+        or candidate.get("target_file")
+    ).rsplit("/", 1)[-1]
+
+    for item in selected_pdf_items or []:
+        rel_path = clean_text(
+            item.get("rel_path")
+            or item.get("name")
+        )
+        if _canonical_drive_rel_path(rel_path) == wanted_path:
+            return item
+        if wanted_name and clean_text(item.get("name")) == wanted_name:
+            return item
+
+    return None
+
+
+def is_document_identity_false_positive(
+    candidate: Dict[str, Any],
+    selected_pdf_items: List[Dict[str, Any]],
+) -> bool:
+    """Atmet D_document_identity piezīmi, ja pilnais numurs sakrīt."""
+    if clean_text(candidate.get("family")) != "D_document_identity":
+        return False
+
+    source_path = clean_text(
+        candidate.get("source_pdf_rel_path")
+        or candidate.get("source_pdf")
+        or candidate.get("target_file")
+    )
+    filename_number = _filename_document_number(source_path)
+    if not filename_number:
+        return False
+
+    source_item = _candidate_source_item(
+        candidate,
+        selected_pdf_items,
+    )
+    source_text = clean_text(
+        source_item.get("text")
+        if source_item
+        else ""
+    )
+
+    filename_key = _normalise_document_number(filename_number)
+    source_key = _normalise_document_number(source_text)
+    number_is_in_document = bool(
+        filename_key
+        and filename_key in source_key
+    )
+
+    combined = " ".join([
+        clean_text(candidate.get("title")),
+        clean_text(candidate.get("problem")),
+        clean_text(candidate.get("designer_note")),
+        clean_text(candidate.get("comment_text")),
+        clean_text(candidate.get("evidence")),
+        clean_text(candidate.get("target_text")),
+    ])
+
+    candidate_numbers = {
+        _normalise_document_number(number)
+        for number in _extract_document_numbers(combined)
+        if _normalise_document_number(number)
+    }
+
+    # Divi dažādi pilni numuri ir reāls kandidāts.
+    if len(candidate_numbers) >= 2:
+        return False
+
+    low = combined.casefold()
+    harmless_difference_markers = [
+        "tekstuāls apraksts",
+        "lapas satura apraksts",
+        "nav redzams pilns nosaukums",
+        "pilnīga atsauce",
+        "nav daļa no dokumenta numura",
+        "rev_1",
+        "rev.1",
+        "revīzijas numurs",
+        "faila nosaukums neatbilst",
+        "neatbilst dokumenta numuram titullaukā",
+    ]
+
+    return (
+        number_is_in_document
+        and (
+            len(candidate_numbers) <= 1
+            or any(
+                marker in low
+                for marker in harmless_difference_markers
+            )
+        )
+    )
+
+
+def drawing_number_for_candidate(
+    candidate: Dict[str, Any],
+    selected_pdf_items: List[Dict[str, Any]],
+) -> str:
+    source_path = clean_text(
+        candidate.get("source_pdf_rel_path")
+        or candidate.get("source_pdf")
+        or candidate.get("target_file")
+    )
+
+    number = _filename_document_number(source_path)
+    if number:
+        return number
+
+    source_item = _candidate_source_item(
+        candidate,
+        selected_pdf_items,
+    )
+    if source_item:
+        numbers = _extract_document_numbers(
+            source_item.get("text")
+        )
+        if numbers:
+            return numbers[0]
+
+    return ""
+
+
 def candidate_quality_score(candidate: Dict[str, Any]) -> float:
     """Piešķir prioritāti precīzām, pierādāmām un lietotāja importētām piezīmēm."""
     score = 0.0
@@ -6018,11 +6208,32 @@ def _specific_related_documents(candidate: Dict[str, Any], selected_pdf_items: L
 
 
 def build_concise_candidate_comment(candidate: Dict[str, Any], selected_pdf_items: Optional[List[Dict[str, Any]]] = None) -> str:
-    page=clean_text(candidate.get("target_page")); area=clean_text(candidate.get("target_area") or candidate.get("where"))
-    parts=[]
-    if page: parts.append(f"{page}. lapa")
-    if area and area.casefold() not in {"teksts","text"}: parts.append(area)
-    location=", ".join(parts)
+    selected_items = selected_pdf_items or []
+    page = clean_text(candidate.get("target_page"))
+    area = clean_text(
+        candidate.get("target_area")
+        or candidate.get("where")
+    )
+    drawing_number = drawing_number_for_candidate(
+        candidate,
+        selected_items,
+    )
+
+    parts = []
+    if drawing_number:
+        parts.append(f"Rasējums {drawing_number}")
+    elif page:
+        parts.append(f"PDF {page}. lapa")
+
+    if area and area.casefold() not in {
+        "teksts",
+        "text",
+        "1. lapa",
+        "lapa",
+    }:
+        parts.append(area)
+
+    location = ", ".join(parts)
     wrong,correct=_extract_correction_pair(candidate)
     target=clean_text(candidate.get("target_text")); base=clean_text(candidate.get("designer_note") or candidate.get("comment_text") or candidate.get("problem"))
     if wrong and correct and wrong.casefold()!=correct.casefold(): task=f'labot “{wrong}” uz “{correct}”'
@@ -6031,7 +6242,7 @@ def build_concise_candidate_comment(candidate: Dict[str, Any], selected_pdf_item
     task=re.sub(r"(?i)^lūdzu[,\s]+","",task).strip()
     task=task[:1].lower()+task[1:] if task else task
     comment=(f"{location}: {task}" if location else task).rstrip(" .")+"."
-    related=_specific_related_documents(candidate, selected_pdf_items or [])
+    related=_specific_related_documents(candidate, selected_items)
     if related: comment += " Izlabot arī konkrētajos saistītajos rasējumos: " + "; ".join(related) + "."
     return comment
 
@@ -7387,6 +7598,11 @@ def main():
                 if is_known_false_language_correction(candidate):
                     continue
                 if is_room_schedule_duplicate_false_positive(candidate):
+                    continue
+                if is_document_identity_false_positive(
+                    candidate,
+                    selected_pdf_items,
+                ):
                     continue
                 if is_initial_issue_vs_revision_date_false_positive(
                     candidate
