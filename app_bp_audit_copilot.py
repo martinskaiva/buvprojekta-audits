@@ -44,7 +44,7 @@ except Exception:
     HttpError = Exception
 
 
-APP_VERSION = "v1.0.0"
+APP_VERSION = "v1.0.1"
 APP_TITLE = f"BP AI Audit Copilot {APP_VERSION}"
 
 REQUIRED_EXPORT_COLUMNS = [
@@ -108,9 +108,9 @@ FAMILY_INSTRUCTIONS = {
     },
     "C_dates_versions": {
         "name": "Datumu, versiju un revīziju neatbilstības",
-        "look_for": "datumu, revīziju, versiju un izlaidumu konfliktus vienā dokumentā vai ar faila identitāti",
-        "report_if": "vienā dokumentā dažādās vietās redzami atšķirīgi datumi vai revīzijas tabula neatbilst titullaukam",
-        "do_not_report": "neziņo vēsturisku atsauces datumu, ja nav pierādījuma, ka tam jāsakrīt ar izlaiduma datumu",
+        "look_for": "vienas un tās pašas revīzijas numura vai datuma konfliktus, nederīgus datumus, placeholderus un aktuālās revīzijas identitātes pretrunas",
+        "report_if": "vienai un tai pašai revīzijai ir divi dažādi datumi, aktuālās revīzijas numurs nesakrīt ar revīziju tabulu vai datums ir acīmredzami nederīgs",
+        "do_not_report": "neziņo, ja rakstlaukā redzams sākotnējās izdošanas datums, bet Rev.1, Rev.2, Rev.3 utt. rindā ir vēlāks revīzijas datums — tā ir normāla dokumenta vēsture",
     },
     "D_document_identity": {
         "name": "Dokumenta identitāte, faila nosaukums, kods un titullauks",
@@ -3551,6 +3551,9 @@ def call_ai_for_family(
             "Ja abi salīdzinātie teksti vai skaitļi sakrīt, kandidātu neatgriez.",
             "Neizmanto spekulatīvas frāzes: nav skaidrs vai, iespējams, varētu būt.",
             "Salīdzini tikai viena tipa laukus: kodu ar kodu, datumu ar datumu, diametru ar diametru, kadastra numuru ar kadastra numuru.",
+            "C_dates_versions: sākotnējās izdošanas datums rakstlaukā drīkst atšķirties no vēlākas Rev.1, Rev.2, Rev.3 utt. rindas datuma; to nekad neziņo kā kļūdu.",
+            "C_dates_versions piezīmi veido tikai vienas un tās pašas revīzijas diviem datumiem, aktuālās revīzijas numura konfliktam, nederīgam datumam vai placeholderam.",
+            "Telpas numura vai secības piezīmei obligāti nosauc konkrēto kļūdaino telpas kodu target_text, konkrēto konfliktējošo vai sagaidāmo kodu un precīzu vietu plānā vai eksplikācijā; vispārīgu 'sakārtot telpu numurus' kandidātu neatgriez.",
         ],
         "similar_positive_examples": examples,
         "negative_rules_do_not_repeat": negative_rules,
@@ -3597,8 +3600,15 @@ def call_ai_for_family(
         for c in candidates:
             if isinstance(c, dict):
                 normalized = normalize_candidate(c, family)
-                if not candidate_is_too_vague(normalized):
-                    cleaned_candidates.append(normalized)
+                if candidate_is_too_vague(normalized):
+                    continue
+                if is_initial_issue_vs_revision_date_false_positive(
+                    normalized
+                ):
+                    continue
+                if not room_number_candidate_is_precise(normalized):
+                    continue
+                cleaned_candidates.append(normalized)
         return cleaned_candidates, ""
     except Exception as e:
         return [], str(e)
@@ -4941,6 +4951,130 @@ def is_sa_explanatory_candidate(candidate: Dict[str, Any]) -> bool:
         or candidate.get("source_pdf")
     )
 
+
+
+ROOM_NUMBER_GENERIC_PHRASES = [
+    "sakārtot telpu numurus",
+    "telpu numuru secība",
+    "telpas numura secības kļūda",
+    "pārbaudīt telpu numurus secīgi",
+    "telpu numuri nav secīgi",
+]
+
+
+def _extract_room_code_tokens(value: Any) -> List[str]:
+    text = clean_text(value)
+    patterns = [
+        r"\b[A-ZĀ-Ž]{1,4}-\d{1,3}(?:-\d{1,3})?(?:\.\d{1,3})?\b",
+        r"\b[A-ZĀ-Ž]{1,4}\d{1,3}(?:\.\d{1,3})?\b",
+        r"\b\d{1,3}\.\d{1,3}\b",
+    ]
+    found: List[str] = []
+    for pattern in patterns:
+        found.extend(re.findall(pattern, text, flags=re.IGNORECASE))
+    return list(dict.fromkeys(clean_text(item) for item in found if clean_text(item)))
+
+
+def room_number_candidate_is_precise(candidate: Dict[str, Any]) -> bool:
+    """Telpu numuru piezīmei jānosauc konkrētais kods un konflikta vieta/vērtība."""
+    combined = " ".join([
+        clean_text(candidate.get("title")),
+        clean_text(candidate.get("problem")),
+        clean_text(candidate.get("designer_note")),
+        clean_text(candidate.get("evidence")),
+        clean_text(candidate.get("target_text")),
+        clean_text(candidate.get("target_area")),
+    ])
+    low = combined.casefold()
+    concerns_room_number = (
+        ("telp" in low and any(word in low for word in ["numur", "kod", "secīb"]))
+        or ("room" in low and any(word in low for word in ["number", "code", "sequence"]))
+    )
+    if not concerns_room_number:
+        return True
+
+    if any(phrase in low for phrase in ROOM_NUMBER_GENERIC_PHRASES):
+        # Generic wording is allowed only when concrete identifiers are also present.
+        pass
+
+    room_codes = _extract_room_code_tokens(combined)
+    target_text = clean_text(candidate.get("target_text"))
+    target_codes = _extract_room_code_tokens(target_text)
+    comparison_files = clean_text(candidate.get("comparison_files"))
+    area = clean_text(candidate.get("target_area") or candidate.get("where"))
+
+    # At least one exact room code must be the PDF anchor.
+    if not target_codes:
+        return False
+
+    # A sequence/conflict claim needs at least two concrete codes, or one code plus
+    # an explicitly named comparison drawing/table location.
+    if len(room_codes) >= 2:
+        return True
+    if room_codes and comparison_files and area:
+        return True
+
+    # A single code may be accepted only for an explicit missing-code claim.
+    missing_phrases = [
+        "nav atrodams",
+        "nav eksplikācijā",
+        "nav plānā",
+        "missing from",
+        "not found in",
+    ]
+    return any(phrase in low for phrase in missing_phrases) and bool(area)
+
+
+def is_initial_issue_vs_revision_date_false_positive(
+    candidate: Dict[str, Any],
+) -> bool:
+    """Bloķē normālu sākotnējās izdošanas datuma un vēlākas Rev.n datuma atšķirību."""
+    if clean_text(candidate.get("family")) != "C_dates_versions":
+        return False
+
+    combined = " ".join([
+        clean_text(candidate.get("title")),
+        clean_text(candidate.get("problem")),
+        clean_text(candidate.get("designer_note")),
+        clean_text(candidate.get("evidence")),
+        clean_text(candidate.get("target_area")),
+    ]).casefold()
+
+    titleblock_terms = [
+        "rakstlauk",
+        "titullap",
+        "title block",
+        "titleblock",
+        "sheet date",
+        "izdošanas datums",
+        "issue date",
+    ]
+    revision_terms = [
+        "rev.1", "rev.2", "rev.3", "rev.4", "rev.5",
+        "rev 1", "rev 2", "rev 3", "revīzij", "revision",
+    ]
+    same_revision_conflict_terms = [
+        "vienai un tai pašai revīzijai",
+        "same revision",
+        "divi dažādi datumi pie rev",
+        "aktuālā revīzija nesakrīt",
+        "revision number mismatch",
+        "revīzijas numurs nesakrīt",
+    ]
+
+    if any(term in combined for term in same_revision_conflict_terms):
+        return False
+
+    has_titleblock = any(term in combined for term in titleblock_terms)
+    has_revision = any(term in combined for term in revision_terms)
+    date_values = re.findall(
+        r"\b(?:0?[1-9]|[12]\d|3[01])[./-](?:0?[1-9]|1[0-2])[./-](?:\d{2}|\d{4})\b",
+        combined,
+    )
+
+    # The common false positive explicitly compares the original sheet/title-block
+    # issue date with the date of a later revision entry.
+    return has_titleblock and has_revision and len(set(date_values)) >= 2
 
 def candidate_quality_score(candidate: Dict[str, Any]) -> float:
     """Piešķir prioritāti precīzām, pierādāmām un lietotāja importētām piezīmēm."""
@@ -6595,6 +6729,12 @@ def main():
                 if is_style_only_language_candidate(candidate):
                     continue
                 if is_room_schedule_duplicate_false_positive(candidate):
+                    continue
+                if is_initial_issue_vs_revision_date_false_positive(
+                    candidate
+                ):
+                    continue
+                if not room_number_candidate_is_precise(candidate):
                     continue
                 if (
                     clean_text(candidate.get("family"))
