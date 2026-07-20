@@ -44,7 +44,7 @@ except Exception:
     HttpError = Exception
 
 
-APP_VERSION = "v1.0.1"
+APP_VERSION = "v1.0.3"
 APP_TITLE = f"BP AI Audit Copilot {APP_VERSION}"
 
 REQUIRED_EXPORT_COLUMNS = [
@@ -91,6 +91,7 @@ DEFAULT_FAMILIES = [
     "L_fire_safety_or_regulatory_logic",
     "M_scope_or_discipline_boundary",
     "N_completeness_or_missing_content",
+    "O_element_count_reconciliation",
 ]
 
 FAMILY_INSTRUCTIONS = {
@@ -178,6 +179,13 @@ FAMILY_INSTRUCTIONS = {
         "report_if": "dokumentā redzams tukšs obligāts lauks, nepabeigts teksts/apzīmējums vai satura rādītāja neatbilstība faktiskajam saturam",
         "do_not_report": "neziņo, ja nav skaidrs, ka laukam jābūt aizpildītam vai saturs var būt citā pielikumā",
     },
+    "O_element_count_reconciliation": {
+        "name": "Apjoma pārbaude",
+        "look_for": "logu, durvju un lūku tipa apzīmējumu skaitu plānos un attiecīgo daudzumu summu specifikācijā",
+        "report_if": "plānu un specifikācijas apjomi ir droši nolasāmi; uzrādi gan sakritību, gan konkrētu starpību",
+        "do_not_report": "neziņo, ja PDF teksta slānis nav pietiekams, tipi nav droši identificējami vai pastāv būtisks dubultskaitīšanas risks",
+    },
+
 }
 
 
@@ -2208,12 +2216,22 @@ def _candidate_says_no_issue(text: str) -> bool:
     phrases = [
         "nav neatbilstības",
         "neatbilstība nav konstatēta",
+        "nav konstatēta neatbilstība",
+        "nav konstatētas neatbilstības",
         "atšķirība nav konstatēta",
+        "nav konstatēta atšķirība",
         "abi teksti sakrīt",
+        "teksti sakrīt",
         "vērtības sakrīt",
         "vērtības ir vienādas",
+        "vērtība ir vienāda",
+        "ir vienāda kadastra apzīmējuma vērtība",
+        "nav atšķirības starp",
         "kļūda nav konstatēta",
         "pretruna nav konstatēta",
+        "nav konstatēta pretruna",
+        "atbilst latviešu un angļu tekstā",
+        "neatšķiras latviešu un angļu tekstā",
     ]
     return any(p in low for p in phrases)
 
@@ -2540,6 +2558,14 @@ def normalize_candidate(c: Dict[str, Any], family: str) -> Dict[str, Any]:
 def candidate_is_too_vague(c: Dict[str, Any]) -> bool:
     problem = clean_text(c.get("problem"))
     note = clean_text(c.get("designer_note") or c.get("comment_text"))
+
+    if (
+        clean_text(c.get("family"))
+        == "O_element_count_reconciliation"
+        and clean_text(c.get("candidate_source"))
+        == "project_deterministic_rule"
+    ):
+        return not bool(problem or note)
     evidence = clean_text(c.get("evidence"))
     target_area = clean_text(c.get("target_area") or c.get("where"))
     text = " ".join([clean_text(c.get("title")), problem, note, evidence]).lower()
@@ -2593,9 +2619,17 @@ def candidate_is_too_vague(c: Dict[str, Any]) -> bool:
     if _comparison_types_conflict(" ".join([problem, note, evidence])):
         return True
 
-    # B_lv_en salīdzinājumā identiski citāti nav kļūda.
+    # B_lv_en salīdzinājumā identiski citāti vai pozitīvs secinājums nav kļūda.
     if clean_text(c.get("family")) == "B_lv_en":
-        values = _quoted_values(problem)
+        bilingual_text = " ".join([
+            clean_text(c.get("title")),
+            problem,
+            note,
+            evidence,
+        ])
+        if _candidate_says_no_issue(bilingual_text):
+            return True
+        values = _quoted_values(" ".join([problem, note, evidence]))
         if len(values) >= 2:
             a = re.sub(r"\s+", " ", values[0]).strip().casefold()
             b = re.sub(r"\s+", " ", values[1]).strip().casefold()
@@ -2784,6 +2818,77 @@ def language_candidate_has_real_correction(
     return False
 
 
+
+PROTECTED_CORRECT_ARCHITECTURAL_PHRASES = {
+    "ailas marka",
+    "vērtne",
+    "palodzes tips",
+    "izmaiņu apraksts",
+}
+
+PROTECTED_LANGUAGE_CORRECTION_PAIRS = {
+    ("izmaiņu", "izmaiņas"),
+    ("ailas marka", "ailu marka"),
+    ("vērtne", "vērte"),
+    ("palodzes tips", "palodzes veids"),
+}
+
+
+def _normalise_language_phrase(value: Any) -> str:
+    return re.sub(
+        r"\s+",
+        " ",
+        clean_text(value).casefold(),
+    ).strip(" \t\r\n.,;:!?\"'“”")
+
+
+def is_known_false_language_correction(
+    candidate: Dict[str, Any],
+) -> bool:
+    """Atmet zināmus korektu arhitektūras terminu viltus labojumus."""
+    if clean_text(candidate.get("family")) != "A_text_language":
+        return False
+
+    combined = " ".join([
+        clean_text(candidate.get("title")),
+        clean_text(candidate.get("problem")),
+        clean_text(candidate.get("designer_note")),
+        clean_text(candidate.get("comment_text")),
+        clean_text(candidate.get("evidence")),
+        clean_text(candidate.get("target_area")),
+        clean_text(candidate.get("target_text")),
+    ])
+    combined_norm = _normalise_language_phrase(combined)
+
+    # "Izmaiņu" ir pareizi frāzē "Izmaiņu apraksts".
+    if "izmaiņu aprakst" in combined_norm:
+        return True
+
+    target_norm = _normalise_language_phrase(
+        candidate.get("target_text")
+    )
+    if target_norm in PROTECTED_CORRECT_ARCHITECTURAL_PHRASES:
+        return True
+
+    wrong, correct = _extract_correction_pair(candidate)
+    pair = (
+        _normalise_language_phrase(wrong),
+        _normalise_language_phrase(correct),
+    )
+    if pair in PROTECTED_LANGUAGE_CORRECTION_PAIRS:
+        return True
+
+    # Arī tad, ja modelis citē korektu pilno terminu tikai skaidrojumā.
+    if any(
+        phrase in combined_norm
+        for phrase in PROTECTED_CORRECT_ARCHITECTURAL_PHRASES
+    ):
+        if pair in PROTECTED_LANGUAGE_CORRECTION_PAIRS:
+            return True
+
+    return False
+
+
 def is_style_only_language_candidate(candidate: Dict[str, Any]) -> bool:
     """Atmet stila ieteikumus, saglabājot konkrētas vārdu un galotņu kļūdas."""
     if clean_text(candidate.get("family")) != "A_text_language":
@@ -2897,6 +3002,9 @@ def call_ai_for_grammar_chunks(
             "nepareizu lielo/mazo burtu lietojumu un acīmredzamu pieturzīmju kļūdu. "
             "NEKAD neziņo par stilu, neveiklu formulējumu, skaidrību, lasāmību, "
             "sinonīmu izvēli, teikuma pārfrāzēšanu vai redakcionālu gaumi. "
+            "Uzskati par korektiem arhitektūras terminus un frāzes "
+            "“Izmaiņu apraksts”, “Ailas marka”, “Vērtne” un “Palodzes tips”; "
+            "tos nelabo un nepiedāvā sinonīmus. "
             "Kandidātu drīkst atgriezt tikai tad, ja vari norādīt konkrētu kļūdaino "
             "vārdu vai īsu frāzi un konkrētu pareizo formu. "
             "target_text ir burtiski blokā atrodams kļūdainais teksts, nevis viss teikums. "
@@ -2964,6 +3072,8 @@ def call_ai_for_grammar_chunks(
                 if candidate_is_too_vague(candidate):
                     continue
                 if is_style_only_language_candidate(candidate):
+                    continue
+                if is_known_false_language_correction(candidate):
                     continue
                 if is_room_schedule_duplicate_false_positive(candidate):
                     continue
@@ -3717,6 +3827,11 @@ def candidate_to_export_row(c: Dict[str, Any], idx: int, pdf_name: str, discipli
     target_text = clean_text(c.get("target_text")) or "MANUAL_PLACEMENT_REQUIRED"
     placement = clean_text(c.get("placement_confidence")) or "manual_needed"
     markup = clean_text(c.get("markup_type"))
+
+    if clean_text(c.get("family")) == "O_element_count_reconciliation":
+        target_text = "MANUAL_PLACEMENT_REQUIRED"
+        placement = "manual_needed"
+        markup = "page_note"
     if not markup:
         markup = "highlight" if placement == "exact" and target_text != "MANUAL_PLACEMENT_REQUIRED" else "page_note"
     problem = clean_text(c.get("problem"))
@@ -3794,6 +3909,9 @@ def shorten_pdf_comment(text: str) -> str:
 def make_pdf_comment(row: Dict[str, Any]) -> str:
     comment = clean_text(row.get("comment_text")) or clean_text(row.get("comparison_evidence"))
     comment = shorten_pdf_comment(comment)
+
+    if clean_text(row.get("issue_type")) == "element_count_reconciliation":
+        return f"Apjoma pārbaude\n{comment}"
     area = clean_text(row.get("target_area"))
     page = clean_text(row.get("target_page"))
     prefix = area or (f"{page}. lapa" if page else "")
@@ -3818,9 +3936,34 @@ def safe_int_page(value: Any, page_count: int) -> int:
 def add_page_note(page: Any, row: Dict[str, Any], comment: str) -> None:
     try:
         rect = page.rect
-        point = fitz.Point(rect.x1 - 36, rect.y0 + 36)
-        annot = page.add_text_annot(point, comment)
-        annot.set_info(title="AI būvprojekta audits", content=comment)
+        point = fitz.Point(
+            rect.x1 - 36,
+            rect.y0 + 36,
+        )
+        annot = page.add_text_annot(
+            point,
+            comment,
+            icon="Note",
+        )
+        is_volume_check = (
+            clean_text(row.get("issue_type"))
+            == "element_count_reconciliation"
+        )
+        annot.set_info(
+            title="AI būvprojekta audits",
+            subject=(
+                "Apjoma pārbaude"
+                if is_volume_check
+                else "Konstatētā nepilnība"
+            ),
+            content=comment,
+        )
+        try:
+            annot.set_colors(
+                stroke=(1.0, 0.82, 0.0),
+            )
+        except Exception:
+            pass
         annot.update()
     except Exception:
         pass
@@ -5076,6 +5219,489 @@ def is_initial_issue_vs_revision_date_false_positive(
     # issue date with the date of a later revision entry.
     return has_titleblock and has_revision and len(set(date_values)) >= 2
 
+
+ELEMENT_COUNT_CONFIG: Dict[str, Dict[str, Any]] = {
+    "windows": {
+        "label": "logu",
+        "unit_label": "logu pozīcijas",
+        "filename_tokens": [
+            "window",
+            "logu",
+            "logs",
+            "sp_42000",
+            "sp_42001",
+        ],
+        "prefixes": {"w", "wi", "win", "log", "l"},
+    },
+    "doors": {
+        "label": "durvju",
+        "unit_label": "durvju pozīcijas",
+        "filename_tokens": ["door", "durv"],
+        "prefixes": {
+            "d",
+            "dw",
+            "diw",
+            "dim",
+            "dem",
+            "hwd",
+            "hd",
+        },
+    },
+    "hatches": {
+        "label": "lūku",
+        "unit_label": "lūku pozīcijas",
+        "filename_tokens": [
+            "hatch",
+            "lūku",
+            "luka",
+            "lūka",
+            "luku",
+        ],
+        "prefixes": {"h", "lu", "luk", "luka"},
+    },
+}
+
+ELEMENT_CODE_PATTERN = re.compile(
+    r"\b([A-Za-zĀ-ž]{1,6}[-_.]?\d{1,3}"
+    r"(?:[-_.][A-Za-z0-9]{1,5})?)\b"
+)
+
+
+def _normalise_element_code(value: Any) -> str:
+    return re.sub(
+        r"[^0-9a-zāčēģīķļņšūž]+",
+        "",
+        clean_text(value).casefold(),
+    )
+
+
+def _element_code_prefix(value: Any) -> str:
+    match = re.match(
+        r"([A-Za-zĀ-ž]+)",
+        clean_text(value),
+    )
+    return (
+        _normalise_element_code(match.group(1))
+        if match
+        else ""
+    )
+
+
+def _element_category_for_spec(
+    item: Dict[str, Any],
+) -> str:
+    name = clean_text(
+        item.get("rel_path")
+        or item.get("name")
+    ).casefold()
+
+    is_spec = any(
+        token in name
+        for token in [
+            "schedule",
+            "specification",
+            "specifikāc",
+            "specifikac",
+            "_sp_",
+        ]
+    )
+    if not is_spec:
+        return ""
+
+    for category, config in ELEMENT_COUNT_CONFIG.items():
+        if any(
+            token in name
+            for token in config["filename_tokens"]
+        ):
+            return category
+    return ""
+
+
+def _is_element_plan(
+    item: Dict[str, Any],
+) -> bool:
+    name = clean_text(
+        item.get("rel_path")
+        or item.get("name")
+    ).casefold()
+
+    if any(
+        token in name
+        for token in [
+            "schedule",
+            "specification",
+            "specifikāc",
+            "specifikac",
+            "_sp_",
+        ]
+    ):
+        return False
+
+    return any(
+        token in name
+        for token in [
+            "plan",
+            "plān",
+            "plans",
+            "_ra_",
+        ]
+    )
+
+
+def _floor_key_from_name(value: Any) -> str:
+    low = clean_text(value).casefold()
+    floor_patterns = [
+        (
+            "ground",
+            [
+                "ground floor",
+                "pagrab",
+                "1. stāv",
+                "1st floor",
+                "_zz_01_",
+                "_01_ra_",
+            ],
+        ),
+        (
+            "2",
+            [
+                "2nd floor",
+                "2. stāv",
+                "_zz_02_",
+                "_02_ra_",
+            ],
+        ),
+        (
+            "3",
+            [
+                "3rd floor",
+                "3. stāv",
+                "_zz_03_",
+                "_03_ra_",
+            ],
+        ),
+        (
+            "4",
+            [
+                "4th floor",
+                "4. stāv",
+                "_zz_04_",
+                "_04_ra_",
+            ],
+        ),
+        (
+            "5",
+            [
+                "5th floor",
+                "5. stāv",
+                "_zz_05_",
+                "_05_ra_",
+            ],
+        ),
+        (
+            "6",
+            [
+                "6th floor",
+                "6. stāv",
+                "_zz_06_",
+                "_06_ra_",
+            ],
+        ),
+        (
+            "7",
+            [
+                "7th floor",
+                "7. stāv",
+                "_zz_07_",
+                "_07_ra_",
+            ],
+        ),
+        (
+            "8",
+            [
+                "8th floor",
+                "8. stāv",
+                "_zz_08_",
+                "_08_ra_",
+            ],
+        ),
+    ]
+    for key, tokens in floor_patterns:
+        if any(token in low for token in tokens):
+            return key
+    return ""
+
+
+def _extract_spec_element_quantities(
+    item: Dict[str, Any],
+    category: str,
+) -> Dict[str, Dict[str, Any]]:
+    config = ELEMENT_COUNT_CONFIG[category]
+    prefixes = config["prefixes"]
+    result: Dict[str, Dict[str, Any]] = {}
+
+    source_text = clean_text(item.get("text"))
+    for raw_line in source_text.splitlines():
+        line = clean_text(raw_line)
+        if not line:
+            continue
+
+        for match in ELEMENT_CODE_PATTERN.finditer(line):
+            raw_code = clean_text(match.group(1))
+            prefix = _element_code_prefix(raw_code)
+            if prefix not in prefixes:
+                continue
+
+            tail = line[match.end():]
+            quantities = [
+                int(value)
+                for value in re.findall(
+                    r"\b\d{1,4}\b",
+                    tail,
+                )
+                if 0 < int(value) <= 999
+            ]
+            if not quantities:
+                continue
+
+            quantity = quantities[-1]
+            code_key = _normalise_element_code(raw_code)
+            current = result.get(code_key)
+            if (
+                current is None
+                or quantity > int(current["quantity"])
+            ):
+                result[code_key] = {
+                    "code": raw_code,
+                    "quantity": quantity,
+                    "line": line,
+                }
+
+    return result
+
+
+def _count_element_codes_in_plan_pdf(
+    item: Dict[str, Any],
+    spec_codes: Dict[str, Dict[str, Any]],
+) -> Dict[str, int]:
+    counts = {
+        code: 0
+        for code in spec_codes
+    }
+    pdf_bytes = item.get("bytes")
+
+    if fitz is None or not pdf_bytes or not spec_codes:
+        return counts
+
+    try:
+        doc = fitz.open(
+            stream=pdf_bytes,
+            filetype="pdf",
+        )
+        for page in doc:
+            rect = page.rect
+            for word in page.get_text("words") or []:
+                x0, y0, x1, y1, token = word[:5]
+
+                # Ignorē rakstlauka un labās malas leģendu zonas.
+                if x0 > rect.x1 * 0.88:
+                    continue
+                if y0 > rect.y1 * 0.92:
+                    continue
+
+                key = _normalise_element_code(token)
+                if key in counts:
+                    counts[key] += 1
+        doc.close()
+    except Exception:
+        return {
+            code: 0
+            for code in spec_codes
+        }
+
+    return counts
+
+
+def detect_element_count_reconciliation_candidates(
+    pdf_items: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Salīdzina logu, durvju un lūku marķējumus ar specifikāciju."""
+    candidates: List[Dict[str, Any]] = []
+    plan_items = [
+        item
+        for item in pdf_items or []
+        if _is_element_plan(item)
+    ]
+
+    if not plan_items:
+        return candidates
+
+    for spec_item in pdf_items or []:
+        category = _element_category_for_spec(
+            spec_item
+        )
+        if not category:
+            continue
+
+        spec_quantities = (
+            _extract_spec_element_quantities(
+                spec_item,
+                category,
+            )
+        )
+
+        # Mazāk par diviem tipiem nav pietiekami droša tabulas atpazīšana.
+        if len(spec_quantities) < 2:
+            continue
+
+        spec_floor = _floor_key_from_name(
+            spec_item.get("rel_path")
+            or spec_item.get("name")
+        )
+
+        matching_plans = [
+            item
+            for item in plan_items
+            if (
+                not spec_floor
+                or _floor_key_from_name(
+                    item.get("rel_path")
+                    or item.get("name")
+                ) == spec_floor
+            )
+        ]
+
+        if not matching_plans:
+            matching_plans = plan_items
+
+        total_counts = {
+            code: 0
+            for code in spec_quantities
+        }
+        used_plan_paths: List[str] = []
+
+        for plan_item in matching_plans:
+            item_counts = (
+                _count_element_codes_in_plan_pdf(
+                    plan_item,
+                    spec_quantities,
+                )
+            )
+            if sum(item_counts.values()) <= 0:
+                continue
+
+            used_plan_paths.append(
+                clean_text(
+                    plan_item.get("rel_path")
+                    or plan_item.get("name")
+                )
+            )
+            for code, count in item_counts.items():
+                total_counts[code] += count
+
+        plan_total = sum(total_counts.values())
+        spec_total = sum(
+            int(value["quantity"])
+            for value in spec_quantities.values()
+        )
+
+        if plan_total <= 0 or spec_total <= 0:
+            continue
+
+        config = ELEMENT_COUNT_CONFIG[category]
+        spec_path = clean_text(
+            spec_item.get("rel_path")
+            or spec_item.get("name")
+        )
+        comparison_files = list(
+            dict.fromkeys(
+                used_plan_paths + [spec_path]
+            )
+        )
+
+        if plan_total == spec_total:
+            comment = (
+                f"Veikta {config['label']} marķējumu un "
+                f"specifikācijas apjomu pārbaude. "
+                f"Plānos kopā atrastas {plan_total} "
+                f"{config['unit_label']}, un specifikācijā "
+                f"uzrādīto tipu daudzumu summa arī ir "
+                f"{spec_total} gab.; apjomi sakrīt."
+            )
+            status = "volume_check_match"
+            severity = "low"
+        else:
+            difference = plan_total - spec_total
+            direction = (
+                f"plānos ir par {abs(difference)} vairāk"
+                if difference > 0
+                else (
+                    f"specifikācijā ir par "
+                    f"{abs(difference)} vairāk"
+                )
+            )
+            comment = (
+                f"Veikta {config['label']} marķējumu un "
+                f"specifikācijas apjomu pārbaude. "
+                f"Plānos kopā atrastas {plan_total} "
+                f"{config['unit_label']}, bet specifikācijā "
+                f"uzrādīto tipu daudzumu summa ir "
+                f"{spec_total} gab.; {direction}. "
+                "Pārbaudīt apjomu starpību."
+            )
+            status = "volume_check_mismatch"
+            severity = "medium"
+
+        candidates.append({
+            "title": "Apjoma pārbaude",
+            "family": (
+                "O_element_count_reconciliation"
+            ),
+            "issue_type": (
+                "element_count_reconciliation"
+            ),
+            "source_pdf": clean_text(
+                spec_item.get("name")
+            ),
+            "source_pdf_rel_path": spec_path,
+            "target_file": spec_path,
+            "target_page": "1",
+            "target_area": (
+                "lapas augšējais labais stūris"
+            ),
+            "target_text": (
+                "MANUAL_PLACEMENT_REQUIRED"
+            ),
+            "problem": comment,
+            "designer_note": comment,
+            "evidence": (
+                f"Plānu skaits: {plan_total}; "
+                f"specifikācijas summa: {spec_total}."
+            ),
+            "comparison_files": "; ".join(
+                comparison_files
+            ),
+            "comparison_pages": "",
+            "markup_type": "page_note",
+            "placement_confidence": "manual_needed",
+            "severity": severity,
+            "status": status,
+            "candidate_source": (
+                "project_deterministic_rule"
+            ),
+            "include_default": True,
+            "reject_default": False,
+            "volume_check_details": {
+                "category": category,
+                "plan_total": plan_total,
+                "spec_total": spec_total,
+                "type_count": len(spec_quantities),
+            },
+        })
+
+    return candidates
+
+
 def candidate_quality_score(candidate: Dict[str, Any]) -> float:
     """Piešķir prioritāti precīzām, pierādāmām un lietotāja importētām piezīmēm."""
     score = 0.0
@@ -5085,6 +5711,8 @@ def candidate_quality_score(candidate: Dict[str, Any]) -> float:
         score += 100.0
     elif source == "project_deterministic_rule":
         score += 80.0
+        if family == "O_element_count_reconciliation":
+            score += 30.0
     elif source == "sa_technical_sections":
         score += 35.0
         if candidate.get("technical_review_question"):
@@ -6651,6 +7279,34 @@ def main():
                         pdf_progress_placeholder, pdf_states, max_family_steps
                     )
 
+            if (
+                "O_element_count_reconciliation"
+                in selected_family_set
+            ):
+                status.write(
+                    "Deterministiska apjoma pārbaude: "
+                    "logi, durvis un lūkas"
+                )
+                volume_candidates = (
+                    detect_element_count_reconciliation_candidates(
+                        selected_pdf_items
+                    )
+                )
+                all_candidates.extend(
+                    volume_candidates
+                )
+
+                for candidate in volume_candidates:
+                    target_state = state_by_path.get(
+                        _canonical_drive_rel_path(
+                            candidate.get(
+                                "source_pdf_rel_path"
+                            )
+                        )
+                    )
+                    if target_state is not None:
+                        target_state["candidates"] += 1
+
             if run_cross_document:
                 step += 1
                 status.write(
@@ -6727,6 +7383,8 @@ def main():
                 if candidate_is_too_vague(candidate):
                     continue
                 if is_style_only_language_candidate(candidate):
+                    continue
+                if is_known_false_language_correction(candidate):
                     continue
                 if is_room_schedule_duplicate_false_positive(candidate):
                     continue
@@ -6863,6 +7521,8 @@ def main():
             candidate_id = clean_text(c.get("candidate_id")) or make_candidate_id(c, audit_run_id, idx)
             title = clean_text(c.get("title")) or f"Piezīme {idx}"
             family = clean_text(c.get("family"))
+            if family == "O_element_count_reconciliation":
+                title = "Apjoma pārbaude"
             with st.container(border=True):
                 st.markdown(f"### {idx}. {title}")
                 source_pdf = clean_text(c.get("source_pdf")) or st.session_state.selected_pdf_name
