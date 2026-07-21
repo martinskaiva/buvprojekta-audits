@@ -45,7 +45,7 @@ except Exception:
     HttpError = Exception
 
 
-APP_VERSION = "v1.0.8"
+APP_VERSION = "v1.0.9"
 APP_TITLE = f"BP AI Audit Copilot {APP_VERSION}"
 
 REQUIRED_EXPORT_COLUMNS = [
@@ -3855,6 +3855,7 @@ def call_ai_for_family(
             "D_document_identity kandidātu atgriez tikai tad, ja vari nosaukt divus atšķirīgus pilnus rasējuma numurus vai konkrēti pierādīt, ka viens numurs ir nepilnīgs.",
             "Projektēšanas rakstlaukos un revīziju blokos vārds 'IZMAIŅA' vienskaitlī un divvalodu virsraksts 'IZMAIŅA REVISION' ir pieņemams; tos nelabo uz 'IZMAIŅAS' un neuzskati par placeholder.",
             "O_element_count_reconciliation pārbaudē drīkst summēt konkrētu elementu daudzumus, aprēķināt daudzums reiz vienības garums un pārbaudīt taisnstūra platību no izmēriem; komentārā obligāti uzrādi aprēķina locekļus, aprēķināto rezultātu un dokumentā norādīto rezultātu.",
+            "Platības pārbaudi veido tikai tad, ja elementa kods, abi izmēri un norādītā m² vērtība atrodas vienā tabulas rindā vai vienā skaidri identificētā pozīcijā; tuvāko citā rindā atrasto m² vērtību nedrīkst piesaistīt izmēriem.",
             "Q_cross_document_property_reconciliation salīdzina viena un tā paša tipa vai elementa koda īpašības starp vairākiem dokumentiem.",
             "Q ģimenes piezīmei obligāti norādi vienu elementa kodu, vienu īpašību, abus failus, abas vietas un abas konkrētās vērtības.",
             "Q ģimenē drīkst ziņot, ka tips ir vienā dokumentā, bet nav attiecīgajā kopsavilkumā vai specifikācijā, tikai ja salīdzinājums ir tieši pierādāms.",
@@ -5956,9 +5957,22 @@ QTY_LENGTH_RE = re.compile(
     re.IGNORECASE,
 )
 
-DIMENSION_AREA_RE = re.compile(
+STRICT_DIMENSION_AREA_ROW_RE = re.compile(
+    r"\b([A-Za-zĀ-ž]{1,8}[-_.]?\d{1,4}"
+    r"(?:[-_.][A-Za-z0-9]{1,6})?)\b"
+    r".{0,80}?"
     r"(?<!\d)(\d{2,5})\s*[x×]\s*(\d{2,5})\s*mm"
-    r".{0,120}?\b(\d+(?:[.,]\d+)?)\s*m[²2]\b",
+    r".{0,80}?"
+    r"\b(\d+(?:[.,]\d+)?)\s*m[²2]\b",
+    re.IGNORECASE,
+)
+
+QTY_LENGTH_WITH_CODE_RE = re.compile(
+    r"\b([A-Za-zĀ-ž]{1,8}[-_.]?\d{1,4}"
+    r"(?:[-_.][A-Za-z0-9]{1,6})?)\b"
+    r".{0,80}?"
+    r"(?<!\d)(\d{1,4})\s*(?:gab\.?|pcs\.?|pieces?|gb\.)"
+    r"\s*[x×]\s*(\d+(?:[.,]\d+)?)\s*(mm|cm|m)\b",
     re.IGNORECASE,
 )
 
@@ -6043,6 +6057,61 @@ def _make_volume_candidate(
     }
 
 
+
+def _element_group_prefix(value: Any) -> str:
+    match = re.match(
+        r"([A-Za-zĀ-ž]+)",
+        clean_text(value),
+    )
+    return (
+        _normalise_element_code(match.group(1))
+        if match
+        else ""
+    )
+
+
+def _same_element_family(codes: List[str]) -> bool:
+    prefixes = {
+        _element_group_prefix(code)
+        for code in codes
+        if _element_group_prefix(code)
+    }
+    return len(prefixes) == 1
+
+
+def _volume_diagnostics_for_pdf(
+    item: Dict[str, Any],
+) -> Dict[str, Any]:
+    source_text = clean_text(item.get("text"))
+    lines = [
+        clean_text(line)
+        for line in source_text.splitlines()
+        if clean_text(line)
+    ]
+    codes = {
+        _normalise_element_code(match.group(1))
+        for line in lines
+        for match in GENERIC_ELEMENT_CODE_RE.finditer(line)
+    }
+    return {
+        "file": clean_text(item.get("rel_path") or item.get("name")),
+        "codes": len(codes),
+        "quantity_rows": sum(
+            1 for line in lines if QTY_RE.search(line)
+        ),
+        "quantity_length_rows": sum(
+            1
+            for line in lines
+            if QTY_LENGTH_WITH_CODE_RE.search(line)
+        ),
+        "strict_area_rows": sum(
+            1
+            for line in lines
+            if STRICT_DIMENSION_AREA_ROW_RE.search(line)
+        ),
+    }
+
+
 def detect_internal_quantity_arithmetic_candidates(
     pdf_items: List[Dict[str, Any]],
 ) -> List[Dict[str, Any]]:
@@ -6092,7 +6161,15 @@ def detect_internal_quantity_arithmetic_candidates(
                     pair_seen.add(key)
 
             stated_qty = STATED_TOTAL_QTY_RE.search(block)
-            if len(unique_pairs) >= 2 and stated_qty:
+            pair_codes = [
+                pair["code"]
+                for pair in unique_pairs
+            ]
+            if (
+                len(unique_pairs) >= 2
+                and stated_qty
+                and _same_element_family(pair_codes)
+            ):
                 calculated = sum(pair["qty"] for pair in unique_pairs)
                 stated = int(stated_qty.group(1))
                 codes = ", ".join(
@@ -6141,20 +6218,32 @@ def detect_internal_quantity_arithmetic_candidates(
                     )
 
             # B. Daudzums × vienības garums.
-            length_terms = list(QTY_LENGTH_RE.finditer(block))
+            length_terms = list(
+                QTY_LENGTH_WITH_CODE_RE.finditer(block)
+            )
             stated_length = STATED_TOTAL_LENGTH_RE.search(block)
-            if length_terms and stated_length:
+            length_codes = [
+                clean_text(match.group(1))
+                for match in length_terms
+            ]
+            if (
+                length_terms
+                and stated_length
+                and _same_element_family(length_codes)
+            ):
                 terms = []
                 calculated_m = 0.0
                 for match in length_terms:
-                    qty = int(match.group(1))
-                    value = _to_float(match.group(2))
-                    unit = clean_text(match.group(3))
+                    code = clean_text(match.group(1))
+                    qty = int(match.group(2))
+                    value = _to_float(match.group(3))
+                    unit = clean_text(match.group(4))
                     if value is None:
                         continue
                     calculated_m += qty * _length_to_m(value, unit)
                     terms.append(
-                        f"{qty} gab. × {_format_decimal_lv(value)} {unit}"
+                        f"{code}: {qty} gab. × "
+                        f"{_format_decimal_lv(value)} {unit}"
                     )
 
                 stated_value = _to_float(stated_length.group(1))
@@ -6210,19 +6299,33 @@ def detect_internal_quantity_arithmetic_candidates(
                         )
 
             # C. Platība no izmēriem.
-            for match in DIMENSION_AREA_RE.finditer(block):
-                width_mm = float(match.group(1))
-                height_mm = float(match.group(2))
-                stated_area = _to_float(match.group(3))
+            # Atļauta tikai vienā oriģinālā PDF teksta rindā,
+            # kur vienlaikus ir elementa kods, izmēri un m² vērtība.
+            if block not in raw_lines:
+                continue
+
+            for match in STRICT_DIMENSION_AREA_ROW_RE.finditer(block):
+                element_code = clean_text(match.group(1))
+                width_mm = float(match.group(2))
+                height_mm = float(match.group(3))
+                stated_area = _to_float(match.group(4))
                 if stated_area is None:
                     continue
 
-                calculated_area = width_mm * height_mm / 1_000_000.0
-                tolerance = max(0.02, calculated_area * 0.03)
-                matches = abs(calculated_area - stated_area) <= tolerance
+                calculated_area = (
+                    width_mm * height_mm / 1_000_000.0
+                )
+                tolerance = max(
+                    0.02,
+                    calculated_area * 0.03,
+                )
+                matches = abs(
+                    calculated_area - stated_area
+                ) <= tolerance
                 key = (
                     clean_text(item.get("rel_path")),
-                    "area",
+                    "strict_area",
+                    _normalise_element_code(element_code),
                     width_mm,
                     height_mm,
                     round(stated_area, 4),
@@ -6234,20 +6337,24 @@ def detect_internal_quantity_arithmetic_candidates(
                 if matches:
                     comment = (
                         "Veikta elementa platības pārbaude. "
-                        f"Pie izmēriem {int(width_mm)} × {int(height_mm)} mm "
+                        f"{element_code}: pie izmēriem "
+                        f"{int(width_mm)} × {int(height_mm)} mm "
                         f"aprēķinātā platība ir "
-                        f"{_format_decimal_lv(calculated_area)} m²; tabulā "
-                        f"norādītie {_format_decimal_lv(stated_area)} m² "
+                        f"{_format_decimal_lv(calculated_area)} m²; "
+                        f"tajā pašā tabulas rindā norādītie "
+                        f"{_format_decimal_lv(stated_area)} m² "
                         "atbilst aprēķinam."
                     )
                     status = "volume_check_match"
                 else:
                     comment = (
                         "Veikta elementa platības pārbaude. "
-                        f"Pie izmēriem {int(width_mm)} × {int(height_mm)} mm "
+                        f"{element_code}: pie izmēriem "
+                        f"{int(width_mm)} × {int(height_mm)} mm "
                         f"aprēķinātā platība ir "
-                        f"{_format_decimal_lv(calculated_area)} m², bet tabulā "
-                        f"norādīti {_format_decimal_lv(stated_area)} m². "
+                        f"{_format_decimal_lv(calculated_area)} m², "
+                        f"bet tajā pašā tabulas rindā norādīti "
+                        f"{_format_decimal_lv(stated_area)} m². "
                         "Pārbaudīt norādīto platību."
                     )
                     status = "volume_check_mismatch"
@@ -6260,7 +6367,8 @@ def detect_internal_quantity_arithmetic_candidates(
                         clean_text(match.group(0)),
                         status,
                         {
-                            "check": "rectangle_area",
+                            "check": "strict_rectangle_area",
+                            "element_code": element_code,
                             "width_mm": width_mm,
                             "height_mm": height_mm,
                             "calculated_m2": calculated_area,
@@ -8153,6 +8261,9 @@ def main():
             selected_family_set.add(
                 "O_element_count_reconciliation"
             )
+            selected_family_set.add(
+                "Q_cross_document_property_reconciliation"
+            )
             family_plan_by_pdf = {
                 _canonical_drive_rel_path(
                     item.get("rel_path") or item.get("name")
@@ -8503,10 +8614,20 @@ def main():
                     internal_volume_candidates
                 )
 
+                volume_diagnostics = [
+                    _volume_diagnostics_for_pdf(item)
+                    for item in selected_pdf_items
+                ]
+                st.session_state.volume_diagnostics = (
+                    volume_diagnostics
+                )
+
                 status.write(
                     "Apjoma pārbaudes kandidāti: "
-                    f"plāni/specifikācijas {len(volume_candidates) - len(internal_volume_candidates)}, "
-                    f"iekšējie aprēķini {len(internal_volume_candidates)}."
+                    f"plāni/specifikācijas "
+                    f"{len(volume_candidates) - len(internal_volume_candidates)}, "
+                    f"iekšējie aprēķini "
+                    f"{len(internal_volume_candidates)}."
                 )
 
                 deduplicated_volume_candidates = []
@@ -8558,8 +8679,8 @@ def main():
                         pdf_items=selected_pdf_items,
                         negative_rules=negative_rules,
                         max_candidates=max(
-                            8,
-                            audit_budget["regular_family_limit"] * 3,
+                            16,
+                            audit_budget["regular_family_limit"] * 5,
                         ),
                     )
                 )
@@ -8839,6 +8960,21 @@ def main():
 
     candidates = st.session_state.candidates
     if candidates:
+        volume_diagnostics = st.session_state.get(
+            "volume_diagnostics",
+            [],
+        )
+        if volume_diagnostics:
+            with st.expander(
+                "Apjoma pārbaudes diagnostika",
+                expanded=False,
+            ):
+                st.dataframe(
+                    pd.DataFrame(volume_diagnostics),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
         st.header("5. Piezīmju pārskatīšana")
         st.caption("Noklusēti piezīme ir iekļauta Excel/markup. Ja noraidi, ieraksti iemeslu; vari atzīmēt arī 'turpmāk līdzīgas nerādīt'.")
         accepted_rows = []
