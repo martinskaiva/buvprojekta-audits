@@ -9,6 +9,7 @@ import time
 import ssl
 import zipfile
 import traceback
+from difflib import SequenceMatcher
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -44,7 +45,7 @@ except Exception:
     HttpError = Exception
 
 
-APP_VERSION = "v1.0.7"
+APP_VERSION = "v1.0.8"
 APP_TITLE = f"BP AI Audit Copilot {APP_VERSION}"
 
 REQUIRED_EXPORT_COLUMNS = [
@@ -1870,21 +1871,82 @@ def feedback_blocked_texts(feedback_df: pd.DataFrame) -> List[str]:
             default=False,
         ):
             continue
-        for col in ["target_text", "comment_text", "problem", "title"]:
+        for col in [
+            "target_text",
+            "comment_text",
+            "designer_note",
+            "problem",
+            "title",
+            "evidence",
+            "issue_type",
+            "reject_reason",
+        ]:
             value = clean_text(row.get(col))
-            if value and value.casefold() not in {v.casefold() for v in values}:
+            if (
+                value
+                and value.casefold()
+                not in {v.casefold() for v in values}
+            ):
                 values.append(value)
     return values
 
 
-def text_is_blocked_by_feedback(text: Any, blocked_values: List[str]) -> bool:
-    low = clean_text(text).casefold()
-    if not low:
+def _feedback_normalized_text(value: Any) -> str:
+    return re.sub(
+        r"[^0-9a-zāčēģīķļņšūž]+",
+        " ",
+        clean_text(value).casefold(),
+    ).strip()
+
+
+def _feedback_token_set(value: Any) -> set:
+    return {
+        token
+        for token in _feedback_normalized_text(value).split()
+        if len(token) >= 3
+    }
+
+
+def text_is_blocked_by_feedback(
+    text: Any,
+    blocked_values: List[str],
+) -> bool:
+    normalized = _feedback_normalized_text(text)
+    if not normalized:
         return False
+
+    tokens = _feedback_token_set(normalized)
+
     for blocked in blocked_values:
-        b = clean_text(blocked).casefold()
-        if len(b) >= 4 and (b in low or low in b):
+        blocked_normalized = _feedback_normalized_text(blocked)
+        if len(blocked_normalized) < 4:
+            continue
+
+        if (
+            blocked_normalized in normalized
+            or normalized in blocked_normalized
+        ):
             return True
+
+        blocked_tokens = _feedback_token_set(blocked_normalized)
+        if tokens and blocked_tokens:
+            intersection = len(tokens & blocked_tokens)
+            union = len(tokens | blocked_tokens)
+            jaccard = intersection / max(1, union)
+            if jaccard >= 0.72:
+                return True
+
+        if (
+            len(normalized) >= 20
+            and len(blocked_normalized) >= 20
+            and SequenceMatcher(
+                None,
+                normalized,
+                blocked_normalized,
+            ).ratio() >= 0.82
+        ):
+            return True
+
     return False
 
 
@@ -1993,9 +2055,21 @@ def candidate_blocked_by_feedback(
     blocked = feedback_blocked_texts(feedback_df)
     combined = " | ".join(
         clean_text(candidate.get(col))
-        for col in ["title", "target_text", "problem", "designer_note", "evidence"]
+        for col in [
+            "title",
+            "family",
+            "issue_type",
+            "target_text",
+            "problem",
+            "designer_note",
+            "comment_text",
+            "evidence",
+        ]
     )
-    return text_is_blocked_by_feedback(combined, blocked)
+    return text_is_blocked_by_feedback(
+        combined,
+        blocked,
+    )
 
 
 def score_example(
@@ -2918,6 +2992,7 @@ def is_protected_revision_label_false_positive(
     family = clean_text(candidate.get("family"))
     if family not in {
         "A_text_language",
+        "B_lv_en",
         "K_solution_or_graphic_clarity",
         "N_completeness_or_missing_content",
         "P_universal_drawing_consistency",
@@ -2935,7 +3010,19 @@ def is_protected_revision_label_false_positive(
     ])
     normalized = _normalise_language_phrase(combined)
 
-    if not re.search(r"\bizmaiņ[au]\b", normalized):
+    has_revision_label = any(
+        phrase in normalized
+        for phrase in [
+            "izmaiņa revision",
+            "izmaiņas revision",
+            "izmaiņu revision",
+        ]
+    )
+    has_change_word = bool(
+        re.search(r"\bizmaiņ(?:a|as|u)\b", normalized)
+    )
+
+    if not has_revision_label and not has_change_word:
         return False
 
     wrong, correct = _extract_correction_pair(candidate)
@@ -2954,6 +3041,25 @@ def is_protected_revision_label_false_positive(
         "izmaiņa revision",
         "izmaiņas revision",
     ]
+
+    if has_revision_label:
+        revision_false_claims = [
+            "locījuma kļūda",
+            "genitīva",
+            "ģenitīva",
+            "nominatīva",
+            "nepabeigts",
+            "placeholder",
+            "pareizi būtu",
+            "jālabo",
+            "aizvietot",
+            "izmaiņas revision",
+        ]
+        if any(
+            claim in normalized
+            for claim in revision_false_claims
+        ):
+            return True
 
     return (
         pair in {
@@ -8041,6 +8147,12 @@ def main():
             pdf_progress_placeholder = st.empty()
 
             selected_family_set = set(selected_families)
+            # Apjoma pārbaude ir pamata deterministiska pārbaude.
+            # Tā tiek palaista arī tad, ja Streamlit sesijā saglabājusies
+            # veca ģimeņu izvēle bez jaunās O ģimenes.
+            selected_family_set.add(
+                "O_element_count_reconciliation"
+            )
             family_plan_by_pdf = {
                 _canonical_drive_rel_path(
                     item.get("rel_path") or item.get("name")
@@ -8371,10 +8483,7 @@ def main():
                         pdf_progress_placeholder, pdf_states, max_family_steps
                     )
 
-            if (
-                "O_element_count_reconciliation"
-                in selected_family_set
-            ):
+            if selected_pdf_items:
                 status.write(
                     "Deterministiska apjoma pārbaude: "
                     "elementu skaits, kopgarums, platība, "
@@ -8385,10 +8494,19 @@ def main():
                         selected_pdf_items
                     )
                 )
-                volume_candidates.extend(
+                internal_volume_candidates = (
                     detect_internal_quantity_arithmetic_candidates(
                         selected_pdf_items
                     )
+                )
+                volume_candidates.extend(
+                    internal_volume_candidates
+                )
+
+                status.write(
+                    "Apjoma pārbaudes kandidāti: "
+                    f"plāni/specifikācijas {len(volume_candidates) - len(internal_volume_candidates)}, "
+                    f"iekšējie aprēķini {len(internal_volume_candidates)}."
                 )
 
                 deduplicated_volume_candidates = []
@@ -8566,6 +8684,10 @@ def main():
                 if is_style_only_language_candidate(candidate):
                     continue
                 if is_known_false_language_correction(candidate):
+                    continue
+                if is_protected_revision_label_false_positive(
+                    candidate
+                ):
                     continue
                 if is_room_schedule_duplicate_false_positive(candidate):
                     continue
