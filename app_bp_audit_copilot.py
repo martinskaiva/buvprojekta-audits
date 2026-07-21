@@ -44,7 +44,7 @@ except Exception:
     HttpError = Exception
 
 
-APP_VERSION = "v1.0.5"
+APP_VERSION = "v1.0.6"
 APP_TITLE = f"BP AI Audit Copilot {APP_VERSION}"
 
 REQUIRED_EXPORT_COLUMNS = [
@@ -77,6 +77,7 @@ DOCUMENT_REGISTRY_FILE = "document_registry.xlsx"
 PROJECT_FINDINGS_FILE = "project_findings.xlsx"
 
 DEFAULT_FAMILIES = [
+    "Q_cross_document_property_reconciliation",
     "P_universal_drawing_consistency",
     "B_lv_en",
     "A_text_language",
@@ -93,7 +94,6 @@ DEFAULT_FAMILIES = [
     "M_scope_or_discipline_boundary",
     "N_completeness_or_missing_content",
     "O_element_count_reconciliation",
-    "P_universal_drawing_consistency",
 ]
 
 FAMILY_INSTRUCTIONS = {
@@ -193,6 +193,13 @@ FAMILY_INSTRUCTIONS = {
         "look_for": "vienā vai vairākās rasējuma vietās lietotu apzīmējumu, elementu kodu, modeļu, ražotāju, standartu, skaitļu, mērvienību, tehnisko terminu un konkrētu atsauču savstarpējas nesakritības",
         "report_if": "auditējamā rasējumā ir divi konkrēti un savstarpēji salīdzināmi teksti vai vērtības, kas attiecas uz vienu elementu, bet nesakrīt; vai atsauce nosauc sadaļu, bet tai trūkst konkrēta rasējuma/dokumenta numura",
         "do_not_report": "neziņo par stilistiku; neziņo tikai tāpēc, ka formulējumu varētu uzlabot; neziņo, ja nav iespējams nosaukt konkrēto kļūdaino tekstu un konkrēto salīdzināmo tekstu vai trūkstošo atsauces numuru",
+    },
+
+    "Q_cross_document_property_reconciliation": {
+        "name": "Starpdokumentu elementu īpašību saskaņošana",
+        "look_for": "viena un tā paša elementa vai tipa koda biezumu, slāņu, materiālu, modeļu, klašu, daudzumu, platību un citu īpašību nesakritības starp diviem vai vairākiem dokumentiem",
+        "report_if": "abos avotos ir viens un tas pats konkrētais elementa vai tipa kods un viena un tā pati konkrētā īpašība, bet vērtības, materiāls vai esamība nesakrīt; vai tips ir definēts vienā dokumentā, bet nav attiecīgajā kopsavilkumā/specifikācijā",
+        "do_not_report": "neziņo tikai par atšķirīgu formulējumu; neziņo, ja nav viena un tā paša elementa koda; neziņo, ja īpašības nav tieši salīdzināmas; neziņo bez abiem avota failiem, abām vietām un abām konkrētajām vērtībām",
     },
 
 }
@@ -3679,6 +3686,10 @@ def call_ai_for_family(
             "C_dates_versions piezīmi veido tikai vienas un tās pašas revīzijas diviem datumiem, aktuālās revīzijas numura konfliktam, nederīgam datumam vai placeholderam.",
             "D_document_identity: pilns rasējuma numurs rakstlaukā ir pietiekams; faila nosaukuma tekstuālais lapas satura apraksts nav jāatkārto rakstlaukā; Rev_1 un Rev.1 ir viena revīzija.",
             "D_document_identity kandidātu atgriez tikai tad, ja vari nosaukt divus atšķirīgus pilnus rasējuma numurus vai konkrēti pierādīt, ka viens numurs ir nepilnīgs.",
+            "Q_cross_document_property_reconciliation salīdzina viena un tā paša tipa vai elementa koda īpašības starp vairākiem dokumentiem.",
+            "Q ģimenes piezīmei obligāti norādi vienu elementa kodu, vienu īpašību, abus failus, abas vietas un abas konkrētās vērtības.",
+            "Q ģimenē drīkst ziņot, ka tips ir vienā dokumentā, bet nav attiecīgajā kopsavilkumā vai specifikācijā, tikai ja salīdzinājums ir tieši pierādāms.",
+            "Q ģimenē neziņo par atšķirīgu formulējumu, ja tehniskā vērtība vai materiāls faktiski sakrīt.",
             "P_universal_drawing_consistency darbojas visiem rasējumu tipiem, ne tikai mezgliem.",
             "P ģimenes konflikta piezīmei obligāti citē divas konkrētas un atšķirīgas vērtības vai tekstus un paskaidro, kāpēc tie attiecas uz vienu elementu.",
             "P ģimenes atsauces piezīmi drīkst veidot, ja dokumentā tieši ir atsauce uz konkrētu disciplīnu vai sadaļu, bet atsauces tekstā nav konkrēta rasējuma, specifikācijas vai dokumenta numura.",
@@ -3846,6 +3857,215 @@ def call_ai_for_cross_document_family(
         return cleaned, ""
     except Exception as e:
         return [], str(e)
+
+
+
+def call_ai_for_cross_document_property_reconciliation(
+    client,
+    model: str,
+    pdf_items: List[Dict[str, Any]],
+    negative_rules: List[str],
+    max_candidates: int,
+) -> Tuple[List[Dict[str, Any]], str]:
+    """Salīdzina viena tipa/elementa īpašības starp vairākiem dokumentiem."""
+    family = "Q_cross_document_property_reconciliation"
+
+    docs: List[str] = []
+    total_chars = 0
+    for item in pdf_items:
+        rel_path = clean_text(item.get("rel_path") or item.get("name"))
+        content = clean_text(item.get("text"))[:26000]
+        if not rel_path or not content:
+            continue
+        block = f"===== FILE: {rel_path} =====\n{content}"
+        if total_chars + len(block) > 150000:
+            break
+        docs.append(block)
+        total_chars += len(block)
+
+    if len(docs) < 2:
+        return [], (
+            "Q_cross_document_property_reconciliation vajag vismaz "
+            "divus nolasītus PDF."
+        )
+
+    system = (
+        "Tu esi būvprojekta rasējumu un specifikāciju starpdokumentu auditors. "
+        "Meklē tikai konkrētas viena un tā paša elementa vai tipa koda īpašību "
+        "nesakritības starp failiem. Piemēri īpašībām: slāņa biezums, kopējais "
+        "biezums, materiāls, produkts, modelis, klase, daudzums, platība, "
+        "ugunsdrošības vai akustiskais parametrs. "
+        "Kandidātam obligāti jābūt vienam un tam pašam elementa/tipa kodam "
+        "abos avotos, piemēram, F201, F202.2, W03, D12. "
+        "Obligāti nosauc abus failus, abas vietas, abas konkrētās vērtības "
+        "un precīzus citātus. "
+        "Drīksti ziņot arī tad, ja tips ir definēts vienā dokumentā, bet nav "
+        "attiecīgajā kopsavilkumā vai specifikācijā, ja šo neesamību vari "
+        "pamatot ar konkrētu salīdzinājumu. "
+        "Neradi piezīmi tikai par atšķirīgu formulējumu vai stilu. "
+        "Nesalīdzini dažādus tipa kodus. "
+        "Ja pierādījums nav pietiekams, kandidātu neradi. "
+        "Komentāram jābūt īsam, latviešu valodā un kā uzdevumam projektētājam. "
+        "Atbildi tikai derīgā JSON."
+    )
+
+    payload = {
+        "family": family,
+        "max_candidates": max_candidates,
+        "rules": [
+            "same_element_code obligāti ir viens konkrēts kods, kas sastopams abos salīdzināmajos avotos, izņemot skaidri pierādāmu missing-in-summary gadījumu.",
+            "property_name obligāti nosauc vienu īpašību: biezums, kopējais biezums, materiāls, modelis, klase, daudzums, platība vai cita tieši salīdzināma īpašība.",
+            "target_text ir īss burtisks citāts no target faila.",
+            "comparison_target_text ir īss burtisks citāts no comparison faila.",
+            "problem un designer_note nosauc elementa kodu, abas vērtības un abus failus.",
+            "Ja salīdzinātās vērtības ir vienādas vai tikai citādi noformētas, kandidātu neradi.",
+            "Ja viena vērtība ir slāņu summa, skaidri parādi summas sastāvdaļas vai avota tekstu.",
+            "Vispārīgu 'pārbaudīt saskaņotību' piezīmi bez abām vērtībām neradi.",
+        ],
+        "negative_rules_do_not_repeat": negative_rules,
+        "documents": "\n\n".join(docs),
+        "required_json_schema": {
+            "candidates": [{
+                "title": "īss virsraksts ar elementa kodu un īpašību",
+                "same_element_code": "piemēram F201",
+                "property_name": "piemēram flīžu biezums",
+                "target_file": "fails, kurā ievietot piezīmi",
+                "target_page": 1,
+                "target_area": "konkrētā vieta target failā",
+                "target_text": "precīzs citāts target failā",
+                "target_value": "konkrētā vērtība target failā",
+                "comparison_files": "salīdzināmais fails",
+                "comparison_pages": "salīdzināmā faila lapa",
+                "comparison_target_text": "precīzs citāts otrā failā",
+                "comparison_value": "konkrētā vērtība otrā failā",
+                "problem": "konkrēta nesakritība ar abām vērtībām",
+                "designer_note": "īss uzdevums projektētājam ar abām vērtībām",
+                "issue_type": "property_mismatch|missing_in_summary|material_mismatch|model_mismatch|quantity_mismatch",
+                "severity": "low|medium|high",
+                "markup_type": "highlight|page_note",
+                "placement_confidence": "exact|approximate|manual_needed",
+                "evidence": "abi citāti un abi faili",
+            }]
+        },
+    }
+
+    try:
+        response = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": system},
+                {
+                    "role": "user",
+                    "content": json.dumps(
+                        payload,
+                        ensure_ascii=False,
+                    ),
+                },
+            ],
+            temperature=0.1,
+            response_format={"type": "json_object"},
+        )
+        data = json.loads(
+            strip_json_fences(
+                response.choices[0].message.content or "{}"
+            )
+        )
+        raw_candidates = data.get("candidates", [])
+        if not isinstance(raw_candidates, list):
+            return [], "AI JSON laukam candidates nav saraksta tips."
+
+        valid_paths = {
+            clean_text(item.get("rel_path") or item.get("name"))
+            for item in pdf_items
+        }
+        text_by_path = {
+            clean_text(item.get("rel_path") or item.get("name")):
+            clean_text(item.get("text"))
+            for item in pdf_items
+        }
+
+        cleaned: List[Dict[str, Any]] = []
+        for raw in raw_candidates:
+            if not isinstance(raw, dict):
+                continue
+
+            candidate = normalize_candidate(raw, family)
+            target_file = clean_text(candidate.get("target_file"))
+            comparison_file = clean_text(
+                candidate.get("comparison_files")
+            ).split(";")[0].strip()
+
+            if target_file not in valid_paths:
+                continue
+            if comparison_file not in valid_paths:
+                continue
+
+            element_code = clean_text(
+                raw.get("same_element_code")
+            )
+            property_name = clean_text(
+                raw.get("property_name")
+            )
+            target_text = clean_text(
+                candidate.get("target_text")
+            )
+            comparison_text = clean_text(
+                candidate.get("comparison_target_text")
+                or raw.get("comparison_target_text")
+            )
+            target_value = clean_text(raw.get("target_value"))
+            comparison_value = clean_text(
+                raw.get("comparison_value")
+            )
+
+            if not element_code or not property_name:
+                continue
+            if not target_text or not comparison_text:
+                continue
+            if (
+                target_text.casefold()
+                not in text_by_path[target_file].casefold()
+            ):
+                continue
+            if (
+                comparison_text.casefold()
+                not in text_by_path[comparison_file].casefold()
+            ):
+                continue
+
+            if (
+                target_value
+                and comparison_value
+                and re.sub(r"\s+", "", target_value.casefold())
+                == re.sub(r"\s+", "", comparison_value.casefold())
+            ):
+                continue
+
+            combined = " ".join([
+                clean_text(candidate.get("problem")),
+                clean_text(candidate.get("designer_note")),
+                clean_text(candidate.get("evidence")),
+            ])
+            if element_code.casefold() not in combined.casefold():
+                continue
+
+            candidate["same_element_code"] = element_code
+            candidate["property_name"] = property_name
+            candidate["target_value"] = target_value
+            candidate["comparison_value"] = comparison_value
+            candidate["comparison_target_text"] = comparison_text
+            candidate["candidate_source"] = "cross_document_property_ai"
+            candidate["include_default"] = True
+            candidate["reject_default"] = False
+
+            if candidate_is_too_vague(candidate):
+                continue
+
+            cleaned.append(candidate)
+
+        return cleaned, ""
+    except Exception as exc:
+        return [], str(exc)
 
 
 def candidate_to_export_row(c: Dict[str, Any], idx: int, pdf_name: str, discipline: str) -> Dict[str, Any]:
@@ -5076,7 +5296,10 @@ def families_for_pdf(
     regular = [
         family
         for family in selected_families
-        if family != "J_cross_document_traceability"
+        if family not in {
+            "J_cross_document_traceability",
+            "Q_cross_document_property_reconciliation",
+        }
     ]
 
     pdf_name = clean_text(
@@ -6487,9 +6710,14 @@ def build_concise_candidate_comment(candidate: Dict[str, Any], selected_pdf_item
     location = ", ".join(parts)
     wrong,correct=_extract_correction_pair(candidate)
     target=clean_text(candidate.get("target_text")); base=clean_text(candidate.get("designer_note") or candidate.get("comment_text") or candidate.get("problem"))
-    if wrong and correct and wrong.casefold()!=correct.casefold(): task=f'labot “{wrong}” uz “{correct}”'
-    elif target and target!="MANUAL_PLACEMENT_REQUIRED": task=base or f'pārbaudīt tekstu “{target}”'
-    else: task=base or "pārbaudīt norādīto risinājumu"
+    if clean_text(candidate.get("family")) == "Q_cross_document_property_reconciliation":
+        task = base or clean_text(candidate.get("problem"))
+    elif wrong and correct and wrong.casefold()!=correct.casefold():
+        task=f'labot “{wrong}” uz “{correct}”'
+    elif target and target!="MANUAL_PLACEMENT_REQUIRED":
+        task=base or f'pārbaudīt tekstu “{target}”'
+    else:
+        task=base or "pārbaudīt norādīto risinājumu"
     task=re.sub(r"(?i)^lūdzu[,\s]+","",task).strip()
     task=task[:1].lower()+task[1:] if task else task
     comment=(f"{location}: {task}" if location else task).rstrip(" .")+"."
@@ -7434,6 +7662,11 @@ def main():
                 "J_cross_document_traceability" in selected_family_set
                 and len(selected_pdf_items) >= 2
             )
+            run_property_reconciliation = (
+                "Q_cross_document_property_reconciliation"
+                in selected_family_set
+                and len(selected_pdf_items) >= 2
+            )
             negative_rules = make_negative_rules(
                 st.session_state.feedback_df,
                 max_rules=100,
@@ -7452,7 +7685,8 @@ def main():
                     len(families)
                     for families in family_plan_by_pdf.values()
                 )
-                + (1 if run_cross_document else 0),
+                + (1 if run_cross_document else 0)
+                + (1 if run_property_reconciliation else 0),
             )
             step = 0
 
@@ -7768,6 +8002,68 @@ def main():
                     )
                     if target_state is not None:
                         target_state["candidates"] += 1
+
+            if run_property_reconciliation:
+                step += 1
+                status.write(
+                    f"Starpdokumentu īpašību pārbaude "
+                    f"{step}/{total_steps}: "
+                    "Q_cross_document_property_reconciliation"
+                )
+                property_candidates, property_error = (
+                    call_ai_for_cross_document_property_reconciliation(
+                        client=client,
+                        model=model,
+                        pdf_items=selected_pdf_items,
+                        negative_rules=negative_rules,
+                        max_candidates=max(
+                            8,
+                            audit_budget["regular_family_limit"] * 3,
+                        ),
+                    )
+                )
+                if property_error:
+                    errors.append({
+                        "pdf": "MULTI_PDF",
+                        "family": (
+                            "Q_cross_document_property_reconciliation"
+                        ),
+                        "error": property_error,
+                    })
+
+                for candidate in property_candidates:
+                    rel_path = clean_text(
+                        candidate.get("target_file")
+                    )
+                    matched = next(
+                        (
+                            item
+                            for item in selected_pdf_items
+                            if _canonical_drive_rel_path(
+                                clean_text(
+                                    item.get("rel_path")
+                                    or item.get("name")
+                                )
+                            )
+                            == _canonical_drive_rel_path(rel_path)
+                        ),
+                        None,
+                    )
+                    candidate["source_pdf"] = (
+                        clean_text(matched.get("name"))
+                        if matched
+                        else rel_path.rsplit("/", 1)[-1]
+                    )
+                    candidate["source_pdf_rel_path"] = rel_path
+                    all_candidates.append(candidate)
+
+                    target_state = state_by_path.get(
+                        _canonical_drive_rel_path(rel_path)
+                    )
+                    if target_state is not None:
+                        target_state["candidates"] += 1
+
+                progress.progress(step / total_steps)
 
             if run_cross_document:
                 step += 1
