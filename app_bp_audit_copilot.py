@@ -44,7 +44,7 @@ except Exception:
     HttpError = Exception
 
 
-APP_VERSION = "v1.0.6"
+APP_VERSION = "v1.0.7"
 APP_TITLE = f"BP AI Audit Copilot {APP_VERSION}"
 
 REQUIRED_EXPORT_COLUMNS = [
@@ -2839,11 +2839,16 @@ PROTECTED_CORRECT_ARCHITECTURAL_PHRASES = {
     "ailas marka",
     "vērtne",
     "palodzes tips",
+    "izmaiņa",
+    "izmaiņa revision",
+    "izmaiņas revision",
     "izmaiņu apraksts",
 }
 
 PROTECTED_LANGUAGE_CORRECTION_PAIRS = {
     ("izmaiņu", "izmaiņas"),
+    ("izmaiņa", "izmaiņas"),
+    ("izmaiņa revision", "izmaiņas revision"),
     ("ailas marka", "ailu marka"),
     ("vērtne", "vērte"),
     ("palodzes tips", "palodzes veids"),
@@ -2903,6 +2908,60 @@ def is_known_false_language_correction(
             return True
 
     return False
+
+
+
+def is_protected_revision_label_false_positive(
+    candidate: Dict[str, Any],
+) -> bool:
+    """Atmet piezīmes par projektēšanā pieņemto “IZMAIŅA” marķējumu."""
+    family = clean_text(candidate.get("family"))
+    if family not in {
+        "A_text_language",
+        "K_solution_or_graphic_clarity",
+        "N_completeness_or_missing_content",
+        "P_universal_drawing_consistency",
+    }:
+        return False
+
+    combined = " ".join([
+        clean_text(candidate.get("title")),
+        clean_text(candidate.get("problem")),
+        clean_text(candidate.get("designer_note")),
+        clean_text(candidate.get("comment_text")),
+        clean_text(candidate.get("evidence")),
+        clean_text(candidate.get("target_text")),
+        clean_text(candidate.get("target_area")),
+    ])
+    normalized = _normalise_language_phrase(combined)
+
+    if not re.search(r"\bizmaiņ[au]\b", normalized):
+        return False
+
+    wrong, correct = _extract_correction_pair(candidate)
+    pair = (
+        _normalise_language_phrase(wrong),
+        _normalise_language_phrase(correct),
+    )
+
+    false_claims = [
+        "genitīva locījuma kļūda",
+        "ģenitīva locījuma kļūda",
+        "nepabeigts apzīmējums",
+        "placeholder",
+        "jālabo uz izmaiņas",
+        "aizvietot izmaiņa ar izmaiņas",
+        "izmaiņa revision",
+        "izmaiņas revision",
+    ]
+
+    return (
+        pair in {
+            ("izmaiņa", "izmaiņas"),
+            ("izmaiņa revision", "izmaiņas revision"),
+        }
+        or any(claim in normalized for claim in false_claims)
+    )
 
 
 def is_style_only_language_candidate(candidate: Dict[str, Any]) -> bool:
@@ -3090,6 +3149,8 @@ def call_ai_for_grammar_chunks(
                 if is_style_only_language_candidate(candidate):
                     continue
                 if is_known_false_language_correction(candidate):
+                    continue
+                if is_protected_revision_label_false_positive(candidate):
                     continue
                 if is_room_schedule_duplicate_false_positive(candidate):
                     continue
@@ -3686,6 +3747,8 @@ def call_ai_for_family(
             "C_dates_versions piezīmi veido tikai vienas un tās pašas revīzijas diviem datumiem, aktuālās revīzijas numura konfliktam, nederīgam datumam vai placeholderam.",
             "D_document_identity: pilns rasējuma numurs rakstlaukā ir pietiekams; faila nosaukuma tekstuālais lapas satura apraksts nav jāatkārto rakstlaukā; Rev_1 un Rev.1 ir viena revīzija.",
             "D_document_identity kandidātu atgriez tikai tad, ja vari nosaukt divus atšķirīgus pilnus rasējuma numurus vai konkrēti pierādīt, ka viens numurs ir nepilnīgs.",
+            "Projektēšanas rakstlaukos un revīziju blokos vārds 'IZMAIŅA' vienskaitlī un divvalodu virsraksts 'IZMAIŅA REVISION' ir pieņemams; tos nelabo uz 'IZMAIŅAS' un neuzskati par placeholder.",
+            "O_element_count_reconciliation pārbaudē drīkst summēt konkrētu elementu daudzumus, aprēķināt daudzums reiz vienības garums un pārbaudīt taisnstūra platību no izmēriem; komentārā obligāti uzrādi aprēķina locekļus, aprēķināto rezultātu un dokumentā norādīto rezultātu.",
             "Q_cross_document_property_reconciliation salīdzina viena un tā paša tipa vai elementa koda īpašības starp vairākiem dokumentiem.",
             "Q ģimenes piezīmei obligāti norādi vienu elementa kodu, vienu īpašību, abus failus, abas vietas un abas konkrētās vērtības.",
             "Q ģimenē drīkst ziņot, ka tips ir vienā dokumentā, bet nav attiecīgajā kopsavilkumā vai specifikācijā, tikai ja salīdzinājums ir tieši pierādāms.",
@@ -5768,6 +5831,339 @@ def _count_element_codes_in_plan_pdf(
         }
 
     return counts
+
+
+
+GENERIC_ELEMENT_CODE_RE = re.compile(
+    r"\b([A-Za-zĀ-ž]{1,8}[-_.]?\d{1,4}"
+    r"(?:[-_.][A-Za-z0-9]{1,6})?)\b"
+)
+
+QTY_RE = re.compile(
+    r"(?<!\d)(\d{1,4})\s*(?:gab\.?|pcs\.?|pieces?|gb\.)\b",
+    re.IGNORECASE,
+)
+
+QTY_LENGTH_RE = re.compile(
+    r"(?<!\d)(\d{1,4})\s*(?:gab\.?|pcs\.?|pieces?|gb\.)"
+    r"\s*[x×]\s*(\d+(?:[.,]\d+)?)\s*(mm|cm|m)\b",
+    re.IGNORECASE,
+)
+
+DIMENSION_AREA_RE = re.compile(
+    r"(?<!\d)(\d{2,5})\s*[x×]\s*(\d{2,5})\s*mm"
+    r".{0,120}?\b(\d+(?:[.,]\d+)?)\s*m[²2]\b",
+    re.IGNORECASE,
+)
+
+STATED_TOTAL_QTY_RE = re.compile(
+    r"\b(?:kopā|total|summa)\s*[:=-]?\s*(\d{1,5})"
+    r"\s*(?:gab\.?|pcs\.?|pieces?|gb\.)\b",
+    re.IGNORECASE,
+)
+
+STATED_TOTAL_LENGTH_RE = re.compile(
+    r"\b(?:kopgarums|total\s+length|kopā|total)\s*[:=-]?\s*"
+    r"(\d+(?:[.,]\d+)?)\s*(mm|cm|m)\b",
+    re.IGNORECASE,
+)
+
+
+def _to_float(value: Any) -> Optional[float]:
+    try:
+        return float(clean_text(value).replace(",", "."))
+    except Exception:
+        return None
+
+
+def _length_to_m(value: float, unit: str) -> float:
+    unit_low = clean_text(unit).casefold()
+    if unit_low == "mm":
+        return value / 1000.0
+    if unit_low == "cm":
+        return value / 100.0
+    return value
+
+
+def _format_decimal_lv(value: float, digits: int = 2) -> str:
+    formatted = f"{value:.{digits}f}".rstrip("0").rstrip(".")
+    return formatted.replace(".", ",")
+
+
+def _first_pdf_page_with_text(
+    item: Dict[str, Any],
+    target_text: str,
+) -> str:
+    pages = item.get("pages") or []
+    target_low = clean_text(target_text).casefold()
+    for idx, page_text in enumerate(pages, start=1):
+        if target_low and target_low in clean_text(page_text).casefold():
+            return str(idx)
+    return "1"
+
+
+def _make_volume_candidate(
+    item: Dict[str, Any],
+    comment: str,
+    evidence: str,
+    target_text: str,
+    status: str,
+    details: Dict[str, Any],
+) -> Dict[str, Any]:
+    rel_path = clean_text(item.get("rel_path") or item.get("name"))
+    return {
+        "title": "Apjoma pārbaude",
+        "family": "O_element_count_reconciliation",
+        "issue_type": "element_count_reconciliation",
+        "source_pdf": clean_text(item.get("name")),
+        "source_pdf_rel_path": rel_path,
+        "target_file": rel_path,
+        "target_page": _first_pdf_page_with_text(item, target_text),
+        "target_area": "lapas augšējais labais stūris",
+        "target_text": "MANUAL_PLACEMENT_REQUIRED",
+        "problem": comment,
+        "designer_note": comment,
+        "evidence": evidence,
+        "comparison_files": rel_path,
+        "comparison_pages": "",
+        "markup_type": "page_note",
+        "placement_confidence": "manual_needed",
+        "severity": "medium" if "mismatch" in status else "low",
+        "status": status,
+        "candidate_source": "project_deterministic_rule",
+        "include_default": True,
+        "reject_default": False,
+        "volume_check_details": details,
+    }
+
+
+def detect_internal_quantity_arithmetic_candidates(
+    pdf_items: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Vienas lapas/tabulas elementu skaita, kopgaruma un platības pārbaude."""
+    results: List[Dict[str, Any]] = []
+    seen = set()
+
+    for item in pdf_items or []:
+        source_text = clean_text(item.get("text"))
+        if not source_text:
+            continue
+
+        raw_lines = [
+            clean_text(line)
+            for line in source_text.splitlines()
+            if clean_text(line)
+        ]
+        blocks: List[str] = []
+        for index in range(len(raw_lines)):
+            blocks.append(raw_lines[index])
+            if index + 1 < len(raw_lines):
+                blocks.append(f"{raw_lines[index]} {raw_lines[index + 1]}")
+            if index + 2 < len(raw_lines):
+                blocks.append(
+                    f"{raw_lines[index]} {raw_lines[index + 1]} "
+                    f"{raw_lines[index + 2]}"
+                )
+
+        for block in blocks:
+            # A. Pozīciju daudzumu summa.
+            pairs = []
+            for match in GENERIC_ELEMENT_CODE_RE.finditer(block):
+                nearby = block[match.end(): min(len(block), match.end() + 80)]
+                qty_match = QTY_RE.search(nearby)
+                if qty_match:
+                    pairs.append({
+                        "code": clean_text(match.group(1)),
+                        "qty": int(qty_match.group(1)),
+                    })
+
+            unique_pairs = []
+            pair_seen = set()
+            for pair in pairs:
+                key = (_normalise_element_code(pair["code"]), pair["qty"])
+                if key not in pair_seen:
+                    unique_pairs.append(pair)
+                    pair_seen.add(key)
+
+            stated_qty = STATED_TOTAL_QTY_RE.search(block)
+            if len(unique_pairs) >= 2 and stated_qty:
+                calculated = sum(pair["qty"] for pair in unique_pairs)
+                stated = int(stated_qty.group(1))
+                codes = ", ".join(
+                    f"{pair['code']} – {pair['qty']} gab."
+                    for pair in unique_pairs[:12]
+                )
+                key = (
+                    clean_text(item.get("rel_path")),
+                    "qty_sum",
+                    codes,
+                    calculated,
+                    stated,
+                )
+                if key not in seen:
+                    seen.add(key)
+                    if calculated == stated:
+                        comment = (
+                            "Veikta elementu skaita pārbaude. "
+                            f"{codes}; kopā {calculated} gab. "
+                            "Norādītā kopsumma sakrīt."
+                        )
+                        status = "volume_check_match"
+                    else:
+                        comment = (
+                            "Veikta elementu skaita pārbaude. "
+                            f"{codes}; aprēķinātā summa ir {calculated} gab., "
+                            f"bet dokumentā norādīti {stated} gab. "
+                            f"Pārbaudīt {abs(calculated - stated)} pozīciju starpību."
+                        )
+                        status = "volume_check_mismatch"
+
+                    results.append(
+                        _make_volume_candidate(
+                            item,
+                            comment,
+                            block,
+                            block,
+                            status,
+                            {
+                                "check": "quantity_sum",
+                                "calculated": calculated,
+                                "stated": stated,
+                                "codes": [pair["code"] for pair in unique_pairs],
+                            },
+                        )
+                    )
+
+            # B. Daudzums × vienības garums.
+            length_terms = list(QTY_LENGTH_RE.finditer(block))
+            stated_length = STATED_TOTAL_LENGTH_RE.search(block)
+            if length_terms and stated_length:
+                terms = []
+                calculated_m = 0.0
+                for match in length_terms:
+                    qty = int(match.group(1))
+                    value = _to_float(match.group(2))
+                    unit = clean_text(match.group(3))
+                    if value is None:
+                        continue
+                    calculated_m += qty * _length_to_m(value, unit)
+                    terms.append(
+                        f"{qty} gab. × {_format_decimal_lv(value)} {unit}"
+                    )
+
+                stated_value = _to_float(stated_length.group(1))
+                if terms and stated_value is not None:
+                    stated_m = _length_to_m(
+                        stated_value,
+                        stated_length.group(2),
+                    )
+                    tolerance = max(0.02, abs(stated_m) * 0.002)
+                    matches = abs(calculated_m - stated_m) <= tolerance
+                    key = (
+                        clean_text(item.get("rel_path")),
+                        "length_sum",
+                        tuple(terms),
+                        round(calculated_m, 4),
+                        round(stated_m, 4),
+                    )
+                    if key not in seen:
+                        seen.add(key)
+                        if matches:
+                            comment = (
+                                "Veikta elementu skaita un kopgaruma pārbaude. "
+                                f"{' un '.join(terms)}; aprēķinātais kopgarums ir "
+                                f"{_format_decimal_lv(calculated_m)} m, kas sakrīt "
+                                f"ar dokumentā norādītajiem "
+                                f"{_format_decimal_lv(stated_m)} m."
+                            )
+                            status = "volume_check_match"
+                        else:
+                            comment = (
+                                "Veikta elementu skaita un kopgaruma pārbaude. "
+                                f"{' un '.join(terms)}; aprēķinātais kopgarums ir "
+                                f"{_format_decimal_lv(calculated_m)} m, bet dokumentā "
+                                f"norādīti {_format_decimal_lv(stated_m)} m. "
+                                "Pārbaudīt kopgarumu."
+                            )
+                            status = "volume_check_mismatch"
+
+                        results.append(
+                            _make_volume_candidate(
+                                item,
+                                comment,
+                                block,
+                                block,
+                                status,
+                                {
+                                    "check": "quantity_length",
+                                    "calculated_m": calculated_m,
+                                    "stated_m": stated_m,
+                                    "terms": terms,
+                                },
+                            )
+                        )
+
+            # C. Platība no izmēriem.
+            for match in DIMENSION_AREA_RE.finditer(block):
+                width_mm = float(match.group(1))
+                height_mm = float(match.group(2))
+                stated_area = _to_float(match.group(3))
+                if stated_area is None:
+                    continue
+
+                calculated_area = width_mm * height_mm / 1_000_000.0
+                tolerance = max(0.02, calculated_area * 0.03)
+                matches = abs(calculated_area - stated_area) <= tolerance
+                key = (
+                    clean_text(item.get("rel_path")),
+                    "area",
+                    width_mm,
+                    height_mm,
+                    round(stated_area, 4),
+                )
+                if key in seen:
+                    continue
+                seen.add(key)
+
+                if matches:
+                    comment = (
+                        "Veikta elementa platības pārbaude. "
+                        f"Pie izmēriem {int(width_mm)} × {int(height_mm)} mm "
+                        f"aprēķinātā platība ir "
+                        f"{_format_decimal_lv(calculated_area)} m²; tabulā "
+                        f"norādītie {_format_decimal_lv(stated_area)} m² "
+                        "atbilst aprēķinam."
+                    )
+                    status = "volume_check_match"
+                else:
+                    comment = (
+                        "Veikta elementa platības pārbaude. "
+                        f"Pie izmēriem {int(width_mm)} × {int(height_mm)} mm "
+                        f"aprēķinātā platība ir "
+                        f"{_format_decimal_lv(calculated_area)} m², bet tabulā "
+                        f"norādīti {_format_decimal_lv(stated_area)} m². "
+                        "Pārbaudīt norādīto platību."
+                    )
+                    status = "volume_check_mismatch"
+
+                results.append(
+                    _make_volume_candidate(
+                        item,
+                        comment,
+                        clean_text(match.group(0)),
+                        clean_text(match.group(0)),
+                        status,
+                        {
+                            "check": "rectangle_area",
+                            "width_mm": width_mm,
+                            "height_mm": height_mm,
+                            "calculated_m2": calculated_area,
+                            "stated_m2": stated_area,
+                        },
+                    )
+                )
+
+    return results
 
 
 def detect_element_count_reconciliation_candidates(
@@ -7981,6 +8377,7 @@ def main():
             ):
                 status.write(
                     "Deterministiska apjoma pārbaude: "
+                    "elementu skaits, kopgarums, platība, "
                     "logi, durvis un lūkas"
                 )
                 volume_candidates = (
@@ -7988,9 +8385,35 @@ def main():
                         selected_pdf_items
                     )
                 )
-                all_candidates.extend(
-                    volume_candidates
+                volume_candidates.extend(
+                    detect_internal_quantity_arithmetic_candidates(
+                        selected_pdf_items
+                    )
                 )
+
+                deduplicated_volume_candidates = []
+                volume_seen = set()
+                for volume_candidate in volume_candidates:
+                    volume_key = (
+                        _canonical_drive_rel_path(
+                            volume_candidate.get("source_pdf_rel_path")
+                        ),
+                        clean_text(volume_candidate.get("status")),
+                        re.sub(
+                            r"\s+",
+                            " ",
+                            clean_text(
+                                volume_candidate.get("designer_note")
+                            ).casefold(),
+                        ),
+                    )
+                    if volume_key in volume_seen:
+                        continue
+                    volume_seen.add(volume_key)
+                    deduplicated_volume_candidates.append(volume_candidate)
+
+                volume_candidates = deduplicated_volume_candidates
+                all_candidates.extend(volume_candidates)
 
                 for candidate in volume_candidates:
                     target_state = state_by_path.get(
