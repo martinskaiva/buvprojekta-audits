@@ -45,7 +45,7 @@ except Exception:
     HttpError = Exception
 
 
-APP_VERSION = "v1.0.9"
+APP_VERSION = "v1.0.10"
 APP_TITLE = f"BP AI Audit Copilot {APP_VERSION}"
 
 REQUIRED_EXPORT_COLUMNS = [
@@ -2989,16 +2989,6 @@ def is_protected_revision_label_false_positive(
     candidate: Dict[str, Any],
 ) -> bool:
     """Atmet piezīmes par projektēšanā pieņemto “IZMAIŅA” marķējumu."""
-    family = clean_text(candidate.get("family"))
-    if family not in {
-        "A_text_language",
-        "B_lv_en",
-        "K_solution_or_graphic_clarity",
-        "N_completeness_or_missing_content",
-        "P_universal_drawing_consistency",
-    }:
-        return False
-
     combined = " ".join([
         clean_text(candidate.get("title")),
         clean_text(candidate.get("problem")),
@@ -3855,7 +3845,9 @@ def call_ai_for_family(
             "D_document_identity kandidātu atgriez tikai tad, ja vari nosaukt divus atšķirīgus pilnus rasējuma numurus vai konkrēti pierādīt, ka viens numurs ir nepilnīgs.",
             "Projektēšanas rakstlaukos un revīziju blokos vārds 'IZMAIŅA' vienskaitlī un divvalodu virsraksts 'IZMAIŅA REVISION' ir pieņemams; tos nelabo uz 'IZMAIŅAS' un neuzskati par placeholder.",
             "O_element_count_reconciliation pārbaudē drīkst summēt konkrētu elementu daudzumus, aprēķināt daudzums reiz vienības garums un pārbaudīt taisnstūra platību no izmēriem; komentārā obligāti uzrādi aprēķina locekļus, aprēķināto rezultātu un dokumentā norādīto rezultātu.",
-            "Platības pārbaudi veido tikai tad, ja elementa kods, abi izmēri un norādītā m² vērtība atrodas vienā tabulas rindā vai vienā skaidri identificētā pozīcijā; tuvāko citā rindā atrasto m² vērtību nedrīkst piesaistīt izmēriem.",
+            "Platības pārbaude pagaidām ir atslēgta, jo PDF teksta rindas nedod drošu tabulas šūnu sasaisti; neveido piezīmes, salīdzinot izmērus ar tuvumā atrastu m² vērtību.",
+            "Atsauce uz IN, AR, BK, AVK, EL, UK vai citu disciplīnas daļu bez konkrēta rasējuma numura pati par sevi nav kļūda, ja elementa kods un atsauces jēga ir saprotama.",
+            "Zvaigznītes apzīmējumu neuzskati par nepilnīgu, ja piezīmē skaidrots, ka apjomi ir provizoriski vai precizējami pēc ražotāja tehniskās dokumentācijas.",
             "Q_cross_document_property_reconciliation salīdzina viena un tā paša tipa vai elementa koda īpašības starp vairākiem dokumentiem.",
             "Q ģimenes piezīmei obligāti norādi vienu elementa kodu, vienu īpašību, abus failus, abas vietas un abas konkrētās vērtības.",
             "Q ģimenē drīkst ziņot, ka tips ir vienā dokumentā, bet nav attiecīgajā kopsavilkumā vai specifikācijā, tikai ja salīdzinājums ir tieši pierādāms.",
@@ -5589,7 +5581,7 @@ def room_number_candidate_is_precise(candidate: Dict[str, Any]) -> bool:
 def is_initial_issue_vs_revision_date_false_positive(
     candidate: Dict[str, Any],
 ) -> bool:
-    """Bloķē normālu sākotnējās izdošanas datuma un vēlākas Rev.n datuma atšķirību."""
+    """C_dates_versions piezīmes atļauj tikai ar ļoti konkrētu pierādījumu."""
     if clean_text(candidate.get("family")) != "C_dates_versions":
         return False
 
@@ -5597,45 +5589,91 @@ def is_initial_issue_vs_revision_date_false_positive(
         clean_text(candidate.get("title")),
         clean_text(candidate.get("problem")),
         clean_text(candidate.get("designer_note")),
+        clean_text(candidate.get("comment_text")),
         clean_text(candidate.get("evidence")),
         clean_text(candidate.get("target_area")),
     ]).casefold()
 
-    titleblock_terms = [
-        "rakstlauk",
-        "titullap",
-        "title block",
-        "titleblock",
-        "sheet date",
-        "izdošanas datums",
-        "issue date",
-    ]
-    revision_terms = [
-        "rev.1", "rev.2", "rev.3", "rev.4", "rev.5",
-        "rev 1", "rev 2", "rev 3", "revīzij", "revision",
-    ]
-    same_revision_conflict_terms = [
+    # Atļauti tikai šie gadījumi: viena un tā pati revīzija ar diviem
+    # datumiem, divi dažādi aktuālās revīzijas numuri, nederīgs datums
+    # vai nepārprotams placeholder.
+    allowed_markers = [
         "vienai un tai pašai revīzijai",
         "same revision",
         "divi dažādi datumi pie rev",
         "aktuālā revīzija nesakrīt",
         "revision number mismatch",
         "revīzijas numurs nesakrīt",
+        "nederīgs datums",
+        "invalid date",
+        "dd.mm.yyyy",
+        "00.00.0000",
+        "placeholder",
     ]
-
-    if any(term in combined for term in same_revision_conflict_terms):
+    if any(marker in combined for marker in allowed_markers):
         return False
 
-    has_titleblock = any(term in combined for term in titleblock_terms)
-    has_revision = any(term in combined for term in revision_terms)
-    date_values = re.findall(
-        r"\b(?:0?[1-9]|[12]\d|3[01])[./-](?:0?[1-9]|1[0-2])[./-](?:\d{2}|\d{4})\b",
-        combined,
+    # Visi pārējie C_dates_versions kandidāti tiek atmesti. Tas ietver
+    # normālu sākotnējās izdošanas datuma un Rev.1/Rev.2 datuma atšķirību.
+    return True
+
+
+
+def is_discipline_reference_without_number_false_positive(
+    candidate: Dict[str, Any],
+) -> bool:
+    """Atsauce uz disciplīnu bez konkrēta rasējuma numura pati par sevi nav kļūda."""
+    combined = " ".join([
+        clean_text(candidate.get("title")),
+        clean_text(candidate.get("problem")),
+        clean_text(candidate.get("designer_note")),
+        clean_text(candidate.get("comment_text")),
+        clean_text(candidate.get("evidence")),
+        clean_text(candidate.get("target_text")),
+    ]).casefold()
+    complaint_markers = [
+        "bez precīza rasējuma numura",
+        "bez konkrēta rasējuma numura",
+        "nav norādīts rasējuma numurs",
+        "nav norādīts dokumenta numurs",
+        "bez precīzas norādes uz",
+        "nav precizēts, kur tieši",
+        "atsauci uz in daļu bez",
+        "atsauce uz in daļu bez",
+        "atsauci uz ar daļu bez",
+        "atsauce uz ar daļu bez",
+    ]
+    discipline_markers = [
+        " in daļ", " ar daļ", " bk daļ", " avk daļ", " el daļ",
+        " uk daļ", " sadaļu", "disciplīn",
+    ]
+    return (
+        any(marker in combined for marker in complaint_markers)
+        and any(marker in combined for marker in discipline_markers)
     )
 
-    # The common false positive explicitly compares the original sheet/title-block
-    # issue date with the date of a later revision entry.
-    return has_titleblock and has_revision and len(set(date_values)) >= 2
+
+def is_asterisk_or_provisional_note_false_positive(
+    candidate: Dict[str, Any],
+) -> bool:
+    """Zvaigznīte ar skaidrojumu par provizoriskiem apjomiem nav kļūda."""
+    combined = " ".join([
+        clean_text(candidate.get("title")),
+        clean_text(candidate.get("problem")),
+        clean_text(candidate.get("designer_note")),
+        clean_text(candidate.get("comment_text")),
+        clean_text(candidate.get("evidence")),
+        clean_text(candidate.get("target_text")),
+    ]).casefold()
+    has_asterisk_claim = any(x in combined for x in [
+        "apzīmējums ar zvaigznīti", "zvaigznīt", "asterisk",
+    ])
+    has_valid_explanation = any(x in combined for x in [
+        "apjomi ir provizoriski", "apjomi precizējami",
+        "precizēt pēc ražotāja", "ražotāja tehniskās dokumentācijas",
+        "provisional quantities", "to be confirmed by manufacturer",
+    ])
+    return has_asterisk_claim and has_valid_explanation
 
 
 ELEMENT_COUNT_CONFIG: Dict[str, Dict[str, Any]] = {
@@ -6104,11 +6142,7 @@ def _volume_diagnostics_for_pdf(
             for line in lines
             if QTY_LENGTH_WITH_CODE_RE.search(line)
         ),
-        "strict_area_rows": sum(
-            1
-            for line in lines
-            if STRICT_DIMENSION_AREA_ROW_RE.search(line)
-        ),
+        "strict_area_rows": 0,
     }
 
 
@@ -6298,84 +6332,10 @@ def detect_internal_quantity_arithmetic_candidates(
                             )
                         )
 
-            # C. Platība no izmēriem.
-            # Atļauta tikai vienā oriģinālā PDF teksta rindā,
-            # kur vienlaikus ir elementa kods, izmēri un m² vērtība.
-            if block not in raw_lines:
-                continue
-
-            for match in STRICT_DIMENSION_AREA_ROW_RE.finditer(block):
-                element_code = clean_text(match.group(1))
-                width_mm = float(match.group(2))
-                height_mm = float(match.group(3))
-                stated_area = _to_float(match.group(4))
-                if stated_area is None:
-                    continue
-
-                calculated_area = (
-                    width_mm * height_mm / 1_000_000.0
-                )
-                tolerance = max(
-                    0.02,
-                    calculated_area * 0.03,
-                )
-                matches = abs(
-                    calculated_area - stated_area
-                ) <= tolerance
-                key = (
-                    clean_text(item.get("rel_path")),
-                    "strict_area",
-                    _normalise_element_code(element_code),
-                    width_mm,
-                    height_mm,
-                    round(stated_area, 4),
-                )
-                if key in seen:
-                    continue
-                seen.add(key)
-
-                if matches:
-                    comment = (
-                        "Veikta elementa platības pārbaude. "
-                        f"{element_code}: pie izmēriem "
-                        f"{int(width_mm)} × {int(height_mm)} mm "
-                        f"aprēķinātā platība ir "
-                        f"{_format_decimal_lv(calculated_area)} m²; "
-                        f"tajā pašā tabulas rindā norādītie "
-                        f"{_format_decimal_lv(stated_area)} m² "
-                        "atbilst aprēķinam."
-                    )
-                    status = "volume_check_match"
-                else:
-                    comment = (
-                        "Veikta elementa platības pārbaude. "
-                        f"{element_code}: pie izmēriem "
-                        f"{int(width_mm)} × {int(height_mm)} mm "
-                        f"aprēķinātā platība ir "
-                        f"{_format_decimal_lv(calculated_area)} m², "
-                        f"bet tajā pašā tabulas rindā norādīti "
-                        f"{_format_decimal_lv(stated_area)} m². "
-                        "Pārbaudīt norādīto platību."
-                    )
-                    status = "volume_check_mismatch"
-
-                results.append(
-                    _make_volume_candidate(
-                        item,
-                        comment,
-                        clean_text(match.group(0)),
-                        clean_text(match.group(0)),
-                        status,
-                        {
-                            "check": "strict_rectangle_area",
-                            "element_code": element_code,
-                            "width_mm": width_mm,
-                            "height_mm": height_mm,
-                            "calculated_m2": calculated_area,
-                            "stated_m2": stated_area,
-                        },
-                    )
-                )
+            # C. Platības pārbaude pagaidām ir atslēgta.
+            # PDF teksta rindas nenodrošina pietiekami drošu tabulas šūnu
+            # sasaisti, tāpēc izmērus nedrīkst salīdzināt ar tuvumā atrastu m².
+            pass
 
     return results
 
@@ -7293,6 +7253,21 @@ def _specific_related_documents(candidate: Dict[str, Any], selected_pdf_items: L
 
 def build_concise_candidate_comment(candidate: Dict[str, Any], selected_pdf_items: Optional[List[Dict[str, Any]]] = None) -> str:
     selected_items = selected_pdf_items or []
+    combined_lower = " ".join([
+        clean_text(candidate.get("title")),
+        clean_text(candidate.get("problem")),
+        clean_text(candidate.get("designer_note")),
+        clean_text(candidate.get("comment_text")),
+    ]).casefold()
+    if "audita rezultātā neatbilstības nav konstatētas" in combined_lower:
+        page = clean_text(candidate.get("target_page")) or "1"
+        area = clean_text(candidate.get("target_area") or candidate.get("where"))
+        if not area or area.casefold() in {"teksts", "text", "lapa", "1. lapa"}:
+            area = "Vizualizācijas lapa"
+        return (
+            f"PDF {page}. lapa, {area}: "
+            "audita rezultātā neatbilstības nav konstatētas."
+        )
     page = clean_text(candidate.get("target_page"))
     area = clean_text(
         candidate.get("target_area")
@@ -8137,6 +8112,29 @@ def main():
                         if short_folder.startswith(prefix):
                             short_folder = short_folder[len(prefix):]
                         with st.expander(f"{short_folder} ({len(folder_items)} PDF)", expanded=True):
+                            folder_key = hashlib.sha1(
+                                f"{selection_signature}|{folder}".encode("utf-8")
+                            ).hexdigest()[:12]
+                            folder_all_col, folder_clear_col, _ = st.columns([1, 1, 3])
+                            folder_select_all = folder_all_col.button(
+                                "Atzīmēt visus šajā mapē",
+                                key=f"select_all_folder_{folder_key}",
+                            )
+                            folder_clear_all = folder_clear_col.button(
+                                "Noņemt visus šajā mapē",
+                                key=f"clear_all_folder_{folder_key}",
+                            )
+                            folder_ids = {
+                                clean_text(item.get("id"))
+                                for item in folder_items
+                            }
+                            if folder_select_all:
+                                stored_ids = list(set(stored_ids) | folder_ids)
+                                st.session_state.selected_pdf_ids_ui = stored_ids
+                            if folder_clear_all:
+                                stored_ids = [x for x in stored_ids if x not in folder_ids]
+                                st.session_state.selected_pdf_ids_ui = stored_ids
+
                             for item in folder_items:
                                 file_id = clean_text(item.get("id"))
                                 rel_path = clean_text(item.get("rel_path"))
@@ -8144,10 +8142,15 @@ def main():
                                 key_hash = hashlib.sha1(
                                     f"{selection_signature}|{file_id}".encode("utf-8")
                                 ).hexdigest()[:16]
+                                widget_key = f"pdf_check_multi_{key_hash}"
+                                if folder_select_all:
+                                    st.session_state[widget_key] = True
+                                elif folder_clear_all:
+                                    st.session_state[widget_key] = False
                                 checked = st.checkbox(
                                     file_name,
                                     value=file_id in stored_ids,
-                                    key=f"pdf_check_multi_{key_hash}",
+                                    key=widget_key,
                                     help=rel_path,
                                 )
                                 if checked:
@@ -8807,6 +8810,14 @@ def main():
                 if is_known_false_language_correction(candidate):
                     continue
                 if is_protected_revision_label_false_positive(
+                    candidate
+                ):
+                    continue
+                if is_discipline_reference_without_number_false_positive(
+                    candidate
+                ):
+                    continue
+                if is_asterisk_or_provisional_note_false_positive(
                     candidate
                 ):
                     continue
