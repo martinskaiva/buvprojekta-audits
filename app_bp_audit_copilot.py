@@ -45,7 +45,7 @@ except Exception:
     HttpError = Exception
 
 
-APP_VERSION = "v1.0.10"
+APP_VERSION = "v1.0.11"
 APP_TITLE = f"BP AI Audit Copilot {APP_VERSION}"
 
 REQUIRED_EXPORT_COLUMNS = [
@@ -3843,6 +3843,9 @@ def call_ai_for_family(
             "C_dates_versions piezīmi veido tikai vienas un tās pašas revīzijas diviem datumiem, aktuālās revīzijas numura konfliktam, nederīgam datumam vai placeholderam.",
             "D_document_identity: pilns rasējuma numurs rakstlaukā ir pietiekams; faila nosaukuma tekstuālais lapas satura apraksts nav jāatkārto rakstlaukā; Rev_1 un Rev.1 ir viena revīzija.",
             "D_document_identity kandidātu atgriez tikai tad, ja vari nosaukt divus atšķirīgus pilnus rasējuma numurus vai konkrēti pierādīt, ka viens numurs ir nepilnīgs.",
+            "Ja faila nosaukumā pilnajam rasējuma numuram pievienots telpas, tipa vai lapas apraksts, bet rakstlaukā tas pats pilnais numurs un tips ir atsevišķos laukos, tā nav neatbilstība.",
+            "Nekad neatgriez kandidātu, kura pamatojumā pats secini, ka numuri sakrīt, neatbilstība nav konstatēta vai konkrēta problēma nav atrasta.",
+            "G_material_type_model ģimenē vispārīga prasība materiālus saskaņot ar interjera dizaineri nav kļūda; kandidātam obligāti jānosauc divi konkrēti konfliktējoši materiāli, modeļi, kodi vai parametri.",
             "Projektēšanas rakstlaukos un revīziju blokos vārds 'IZMAIŅA' vienskaitlī un divvalodu virsraksts 'IZMAIŅA REVISION' ir pieņemams; tos nelabo uz 'IZMAIŅAS' un neuzskati par placeholder.",
             "O_element_count_reconciliation pārbaudē drīkst summēt konkrētu elementu daudzumus, aprēķināt daudzums reiz vienības garums un pārbaudīt taisnstūra platību no izmēriem; komentārā obligāti uzrādi aprēķina locekļus, aprēķināto rezultātu un dokumentā norādīto rezultātu.",
             "Platības pārbaude pagaidām ir atslēgta, jo PDF teksta rindas nedod drošu tabulas šūnu sasaisti; neveido piezīmes, salīdzinot izmērus ar tuvumā atrastu m² vērtību.",
@@ -6601,6 +6604,124 @@ def _candidate_source_item(
     return None
 
 
+
+def candidate_explicitly_says_no_issue(
+    candidate: Dict[str, Any],
+) -> bool:
+    """Atmet AI kandidātu, kura pamatojumā skaidri pateikts, ka kļūdas nav."""
+    combined = " ".join([
+        clean_text(candidate.get("title")),
+        clean_text(candidate.get("problem")),
+        clean_text(candidate.get("designer_note")),
+        clean_text(candidate.get("comment_text")),
+        clean_text(candidate.get("evidence")),
+        clean_text(candidate.get("target_text")),
+        clean_text(candidate.get("status")),
+    ])
+    normalized = re.sub(
+        r"\s+",
+        " ",
+        combined.casefold(),
+    )
+
+    no_issue_phrases = [
+        "nav konstatēta neatbilstība",
+        "nav konstatētas neatbilstības",
+        "neatbilstība nav konstatēta",
+        "neatbilstības nav konstatētas",
+        "neatbilstība nav atrasta",
+        "neatbilstības nav atrastas",
+        "nav atrasta neatbilstība",
+        "nav atrastas neatbilstības",
+        "numuri sakrīt",
+        "rasējuma numuri sakrīt",
+        "pilnie rasējuma numuri sakrīt",
+        "nav divu atšķirīgu pilnu rasējuma numuru",
+        "nav divi atšķirīgi pilni rasējuma numuri",
+        "nav konstatēta situācija, kur",
+        "atšķirība nav konstatēta",
+        "no mismatch was found",
+        "no discrepancy was found",
+        "no issue was found",
+        "numbers match",
+    ]
+    return any(
+        phrase in normalized
+        for phrase in no_issue_phrases
+    )
+
+
+def candidate_is_generic_material_coordination_requirement(
+    candidate: Dict[str, Any],
+) -> bool:
+    """Atmet vispārīgu prasību kaut ko saskaņot, ja nav divu konfliktējošu faktu."""
+    if clean_text(candidate.get("family")) != "G_material_type_model":
+        return False
+
+    combined = " ".join([
+        clean_text(candidate.get("title")),
+        clean_text(candidate.get("problem")),
+        clean_text(candidate.get("designer_note")),
+        clean_text(candidate.get("comment_text")),
+        clean_text(candidate.get("evidence")),
+        clean_text(candidate.get("target_text")),
+    ])
+    normalized = re.sub(
+        r"\s+",
+        " ",
+        combined.casefold(),
+    )
+
+    generic_coordination_markers = [
+        "saskaņot ar interjera dizaineri",
+        "saskaņojams ar interjera dizaineri",
+        "saskaņot materiālus",
+        "materiālu saskaņošana",
+        "pirms iegādes",
+        "pirms pasūtīšanas",
+        "pirms uzstādīšanas",
+        "coordinate with the interior designer",
+        "materials shall be coordinated",
+        "material shall be coordinated",
+    ]
+    no_concrete_conflict_markers = [
+        "konkrēta neatbilstība nav atrasta",
+        "konkrētas neatbilstības nav atrastas",
+        "nav norādīta konkrēta neatbilstība",
+        "nav identificēta konkrēta neatbilstība",
+        "no specific mismatch",
+        "no concrete mismatch",
+    ]
+
+    if any(
+        marker in normalized
+        for marker in no_concrete_conflict_markers
+    ):
+        return True
+
+    if not any(
+        marker in normalized
+        for marker in generic_coordination_markers
+    ):
+        return False
+
+    # Reālai G ģimenes piezīmei vajag vismaz divus konkrētus salīdzināmus
+    # materiālus, modeļus, kodus vai parametrus.
+    concrete_values = _quoted_or_code_values(combined)
+    normalized_values = {
+        re.sub(
+            r"[^0-9a-zāčēģīķļņšūž]+",
+            "",
+            clean_text(value).casefold(),
+        )
+        for value in concrete_values
+        if clean_text(value)
+    }
+    normalized_values.discard("")
+
+    return len(normalized_values) < 2
+
+
 def is_document_identity_false_positive(
     candidate: Dict[str, Any],
     selected_pdf_items: List[Dict[str, Any]],
@@ -6654,6 +6775,20 @@ def is_document_identity_false_positive(
     if len(candidate_numbers) >= 2:
         return False
 
+    # Ja kandidāts nosauc tikai vienu pilnu numuru un tas ir tas pats,
+    # kas faila nosaukumā, faila beigās pievienots telpas/tipa apraksts
+    # nav dokumenta identitātes kļūda.
+    if filename_key:
+        candidate_has_filename_number = any(
+            number == filename_key
+            for number in candidate_numbers
+        )
+        if (
+            candidate_has_filename_number
+            and len(candidate_numbers) == 1
+        ):
+            return True
+
     low = combined.casefold()
     harmless_difference_markers = [
         "tekstuāls apraksts",
@@ -6666,6 +6801,16 @@ def is_document_identity_false_positive(
         "revīzijas numurs",
         "faila nosaukums neatbilst",
         "neatbilst dokumenta numuram titullaukā",
+        "tips ir norādīts atsevišķi",
+        "tips norādīts atsevišķi",
+        "faila nosaukumā ir apvienots pilns numurs ar tipu",
+        "faila nosaukumā pievienots tips",
+        "wc-01 tips",
+        "wc-02 tips",
+        "wc-03 tips",
+        "wc-04 tips",
+        "wc-05 tips",
+        "wc-06 tips",
     ]
 
     return (
@@ -8801,6 +8946,14 @@ def main():
                 if candidate_blocked_by_feedback(
                     candidate,
                     st.session_state.feedback_df,
+                ):
+                    continue
+                if candidate_explicitly_says_no_issue(
+                    candidate
+                ):
+                    continue
+                if candidate_is_generic_material_coordination_requirement(
+                    candidate
                 ):
                     continue
                 if candidate_is_too_vague(candidate):
