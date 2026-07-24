@@ -3,6 +3,9 @@ from __future__ import annotations
 import io
 import json
 import re
+import ssl
+import socket
+import time
 import zipfile
 from datetime import datetime
 from typing import Any
@@ -15,7 +18,7 @@ from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
 
 APP_NAME = "BP audita PDF Markup"
-APP_VERSION = "2.0.2"
+APP_VERSION = "2.0.3"
 FOLDER_MIME_TYPE = "application/vnd.google-apps.folder"
 PDF_MIME_TYPE = "application/pdf"
 XLSX_MIME_TYPE = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
@@ -102,6 +105,22 @@ def discipline_short_name(folder_name: str) -> str:
     return aliases.get(first, first or "Audit")
 
 
+def execute_with_retry(request_factory, attempts: int = 5):
+    """Execute a Google API request with retries for transient transport errors."""
+    last_error = None
+    for attempt in range(1, attempts + 1):
+        try:
+            return request_factory().execute(num_retries=2)
+        except (ssl.SSLError, socket.timeout, ConnectionError, OSError) as exc:
+            last_error = exc
+            if attempt >= attempts:
+                raise
+            time.sleep(min(8.0, 0.75 * (2 ** (attempt - 1))))
+    if last_error:
+        raise last_error
+    raise RuntimeError("Google Drive pieprasījums neizdevās.")
+
+
 @st.cache_resource(show_spinner=False)
 def get_drive_service():
     raw = st.secrets.get("GOOGLE_SERVICE_ACCOUNT_JSON")
@@ -118,14 +137,16 @@ def list_folder_items(service, folder_id: str) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     token = None
     while True:
-        response = service.files().list(
-            q=query,
-            fields="nextPageToken,files(id,name,mimeType,size,modifiedTime)",
-            pageSize=1000,
-            pageToken=token,
-            supportsAllDrives=True,
-            includeItemsFromAllDrives=True,
-        ).execute()
+        response = execute_with_retry(
+            lambda: service.files().list(
+                q=query,
+                fields="nextPageToken,files(id,name,mimeType,size,modifiedTime)",
+                pageSize=1000,
+                pageToken=token,
+                supportsAllDrives=True,
+                includeItemsFromAllDrives=True,
+            )
+        )
         rows.extend(response.get("files", []))
         token = response.get("nextPageToken")
         if not token:
@@ -145,11 +166,13 @@ def ensure_child_folder(service, parent_id: str, name: str) -> dict[str, Any]:
     existing = find_child_folder(service, parent_id, name)
     if existing:
         return existing
-    return service.files().create(
-        body={"name": name, "mimeType": FOLDER_MIME_TYPE, "parents": [parent_id]},
-        fields="id,name,mimeType",
-        supportsAllDrives=True,
-    ).execute()
+    return execute_with_retry(
+        lambda: service.files().create(
+            body={"name": name, "mimeType": FOLDER_MIME_TYPE, "parents": [parent_id]},
+            fields="id,name,mimeType",
+            supportsAllDrives=True,
+        )
+    )
 
 
 def list_pdfs_recursive(service, folder_id: str, parent_path: str = "") -> list[dict[str, Any]]:
@@ -173,13 +196,36 @@ def list_folders_recursive(service, folder_id: str, parent_path: str = "") -> li
     return sorted(rows, key=lambda x: x["path"].casefold())
 
 
+@st.cache_data(ttl=300, show_spinner=False)
+def cached_child_folders(parent_id: str) -> list[dict[str, Any]]:
+    return child_folders(get_drive_service(), parent_id)
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def cached_folders_recursive(folder_id: str, parent_path: str = "") -> list[dict[str, Any]]:
+    return list_folders_recursive(get_drive_service(), folder_id, parent_path)
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def cached_pdfs_recursive(folder_id: str, parent_path: str = "") -> list[dict[str, Any]]:
+    return list_pdfs_recursive(get_drive_service(), folder_id, parent_path)
+
+
 def download_drive_file_bytes(service, file_id: str) -> bytes:
     request = service.files().get_media(fileId=file_id, supportsAllDrives=True)
     buffer = io.BytesIO()
     downloader = MediaIoBaseDownload(buffer, request)
     done = False
+    attempts = 0
     while not done:
-        _, done = downloader.next_chunk()
+        try:
+            _, done = downloader.next_chunk(num_retries=2)
+            attempts = 0
+        except (ssl.SSLError, socket.timeout, ConnectionError, OSError):
+            attempts += 1
+            if attempts >= 5:
+                raise
+            time.sleep(min(8.0, 0.75 * (2 ** (attempts - 1))))
     return buffer.getvalue()
 
 
@@ -350,8 +396,8 @@ if st.button("Nolasīt 03_Markup struktūru", type="primary"):
         if missing:
             raise ValueError("03_Markup mapē nav atrastas mapes: " + ", ".join(missing))
         st.session_state.root_structure = {"root_id": root_id, "input": input_folder, "results": results_folder, "memory": memory_folder}
-        st.session_state.project_folders = child_folders(service, input_folder["id"])
-        st.session_state.result_folders = [{"id": results_folder["id"], "name": results_folder["name"], "path": results_folder["name"]}, *list_folders_recursive(service, results_folder["id"], results_folder["name"])]
+        st.session_state.project_folders = cached_child_folders(input_folder["id"])
+        st.session_state.result_folders = [{"id": results_folder["id"], "name": results_folder["name"], "path": results_folder["name"]}, *cached_folders_recursive(results_folder["id"], results_folder["name"])]
         st.success("03_Markup struktūra nolasīta.")
     except Exception as exc:
         st.error("Neizdevās nolasīt Google Drive struktūru.")
@@ -367,13 +413,13 @@ if root:
         st.stop()
     project_name = st.selectbox("Projekts", [x["name"] for x in projects])
     project = next(x for x in projects if x["name"] == project_name)
-    packages = child_folders(service, project["id"])
+    packages = cached_child_folders(project["id"])
     if packages:
         package_name = st.selectbox("Dokumentu komplekts", [x["name"] for x in packages])
         package = next(x for x in packages if x["name"] == package_name)
     else:
         package_name, package = project_name, project
-    discipline_folders = list_folders_recursive(service, package["id"])
+    discipline_folders = cached_folders_recursive(package["id"])
     if not discipline_folders:
         st.warning("Izvēlētajā komplektā nav mapju ar PDF dokumentiem.")
         st.stop()
@@ -397,7 +443,7 @@ if root:
         # folderis, vienu un to pašu failu sarakstā iekļauj tikai vienu reizi.
         pdf_by_id: dict[str, dict[str, Any]] = {}
         for folder in selected_folder_rows:
-            folder_pdfs = list_pdfs_recursive(service, folder["id"], folder["path"])
+            folder_pdfs = cached_pdfs_recursive(folder["id"], folder["path"])
             for pdf_item in folder_pdfs:
                 pdf_by_id[pdf_item["id"]] = pdf_item
 
