@@ -15,7 +15,7 @@ from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
 
 APP_NAME = "BP audita PDF Markup"
-APP_VERSION = "2.0.1"
+APP_VERSION = "2.0.2"
 FOLDER_MIME_TYPE = "application/vnd.google-apps.folder"
 PDF_MIME_TYPE = "application/pdf"
 XLSX_MIME_TYPE = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
@@ -373,21 +373,71 @@ if root:
         package = next(x for x in packages if x["name"] == package_name)
     else:
         package_name, package = project_name, project
-    disciplines = child_folders(service, package["id"])
-    if not disciplines:
-        st.warning("Izvēlētajā komplektā nav disciplīnu mapju.")
+    discipline_folders = list_folders_recursive(service, package["id"])
+    if not discipline_folders:
+        st.warning("Izvēlētajā komplektā nav mapju ar PDF dokumentiem.")
         st.stop()
-    discipline_name = st.selectbox("Disciplīna", [x["name"] for x in disciplines])
-    discipline = next(x for x in disciplines if x["name"] == discipline_name)
-    pdf_rows = list_pdfs_recursive(service, discipline["id"], discipline_name)
-    if not pdf_rows:
-        st.warning("Izvēlētajā disciplīnā nav PDF failu.")
-        st.stop()
-    pdf_paths = [x["path"] for x in pdf_rows]
-    select_all = st.checkbox("Atzīmēt visus PDF failus", value=True)
-    chosen_paths = st.multiselect("PDF faili", pdf_paths, default=pdf_paths if select_all else [])
-    selected_pdfs = [x for x in pdf_rows if x["path"] in chosen_paths]
-    st.caption(f"Izvēlēti {len(selected_pdfs)} PDF faili.")
+
+    st.markdown("### Mapes")
+    st.caption("Atzīmē vienu vai vairākas mapes. Pilnais mapes ceļš redzams katrā rindā.")
+
+    selected_folder_rows: list[dict[str, Any]] = []
+    folder_key_prefix = f"source_folder_{project['id']}_{package['id']}"
+    for folder in discipline_folders:
+        folder_key = f"{folder_key_prefix}_{folder['id']}"
+        if st.checkbox(folder["path"], key=folder_key, value=False):
+            selected_folder_rows.append(folder)
+
+    if not selected_folder_rows:
+        st.info("Atzīmē vismaz vienu mapi, lai parādītu tajā esošos PDF failus.")
+        selected_pdfs = []
+        discipline_name = "Vairākas_mapes"
+    else:
+        # Savāc PDF no katras izvēlētās mapes. Ja atzīmēts arī vecāks un bērna
+        # folderis, vienu un to pašu failu sarakstā iekļauj tikai vienu reizi.
+        pdf_by_id: dict[str, dict[str, Any]] = {}
+        for folder in selected_folder_rows:
+            folder_pdfs = list_pdfs_recursive(service, folder["id"], folder["path"])
+            for pdf_item in folder_pdfs:
+                pdf_by_id[pdf_item["id"]] = pdf_item
+
+        pdf_rows = sorted(pdf_by_id.values(), key=lambda x: x["path"].casefold())
+        discipline_name = (
+            selected_folder_rows[0]["name"]
+            if len(selected_folder_rows) == 1
+            else "Vairākas_mapes"
+        )
+
+        st.markdown("### PDF faili")
+        if not pdf_rows:
+            st.warning("Izvēlētajās mapēs nav PDF failu.")
+            selected_pdfs = []
+        else:
+            select_all_key = f"select_all_files_{project['id']}_{package['id']}"
+            select_all_files = st.checkbox(
+                "Atzīmēt visus failus izvēlētajās mapēs",
+                key=select_all_key,
+                value=False,
+            )
+
+            selected_pdfs = []
+            file_key_prefix = f"source_file_{project['id']}_{package['id']}"
+            for pdf_item in pdf_rows:
+                file_key = f"{file_key_prefix}_{pdf_item['id']}"
+                if select_all_files:
+                    st.session_state[file_key] = True
+                is_selected = st.checkbox(
+                    pdf_item["path"],
+                    key=file_key,
+                    value=bool(st.session_state.get(file_key, False)),
+                )
+                if is_selected:
+                    selected_pdfs.append(pdf_item)
+
+            st.caption(
+                f"Izvēlētas {len(selected_folder_rows)} mapes un "
+                f"{len(selected_pdfs)} no {len(pdf_rows)} PDF failiem."
+            )
 
     st.markdown("## 3. ChatGPT sagatavotais Excel")
     upload = st.file_uploader("Augšupielādē apstiprināto piezīmju Excel", type=["xlsx"])
