@@ -15,7 +15,7 @@ from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
 
 APP_NAME = "BP audita PDF Markup"
-APP_VERSION = "2.0.0"
+APP_VERSION = "2.0.1"
 FOLDER_MIME_TYPE = "application/vnd.google-apps.folder"
 PDF_MIME_TYPE = "application/pdf"
 XLSX_MIME_TYPE = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
