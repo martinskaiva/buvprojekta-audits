@@ -13,12 +13,14 @@ from typing import Any
 import fitz
 import pandas as pd
 import streamlit as st
-from google.oauth2 import service_account
+from google.auth.transport.requests import Request
+from google.oauth2.credentials import Credentials
+from google_auth_oauthlib.flow import Flow
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
 
 APP_NAME = "BP audita PDF Markup"
-APP_VERSION = "2.0.3"
+APP_VERSION = "2.1.0"
 FOLDER_MIME_TYPE = "application/vnd.google-apps.folder"
 PDF_MIME_TYPE = "application/pdf"
 XLSX_MIME_TYPE = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
@@ -121,15 +123,168 @@ def execute_with_retry(request_factory, attempts: int = 5):
     raise RuntimeError("Google Drive pieprasījums neizdevās.")
 
 
-@st.cache_resource(show_spinner=False)
-def get_drive_service():
-    raw = st.secrets.get("GOOGLE_SERVICE_ACCOUNT_JSON")
-    if not raw:
-        raise ValueError("Streamlit Secrets nav atrasts GOOGLE_SERVICE_ACCOUNT_JSON.")
-    credentials = service_account.Credentials.from_service_account_info(
-        json.loads(raw), scopes=["https://www.googleapis.com/auth/drive"]
+DRIVE_SCOPE = "https://www.googleapis.com/auth/drive"
+TOKEN_URI = "https://oauth2.googleapis.com/token"
+
+
+def oauth_client_config() -> dict[str, Any]:
+    client_id = clean_text(st.secrets.get("GOOGLE_OAUTH_CLIENT_ID", ""))
+    client_secret = clean_text(st.secrets.get("GOOGLE_OAUTH_CLIENT_SECRET", ""))
+    redirect_uri = clean_text(st.secrets.get("GOOGLE_OAUTH_REDIRECT_URI", ""))
+    if not client_id or not client_secret or not redirect_uri:
+        raise ValueError(
+            "Streamlit Secrets jānorāda GOOGLE_OAUTH_CLIENT_ID, "
+            "GOOGLE_OAUTH_CLIENT_SECRET un GOOGLE_OAUTH_REDIRECT_URI."
+        )
+    return {
+        "web": {
+            "client_id": client_id,
+            "client_secret": client_secret,
+            "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+            "token_uri": TOKEN_URI,
+            "redirect_uris": [redirect_uri],
+        }
+    }
+
+
+def credentials_to_dict(credentials: Credentials) -> dict[str, Any]:
+    return {
+        "token": credentials.token,
+        "refresh_token": credentials.refresh_token,
+        "token_uri": credentials.token_uri or TOKEN_URI,
+        "client_id": credentials.client_id,
+        "client_secret": credentials.client_secret,
+        "scopes": list(credentials.scopes or [DRIVE_SCOPE]),
+    }
+
+
+def credentials_from_session() -> Credentials | None:
+    payload = st.session_state.get("oauth_credentials")
+    if not payload:
+        return None
+    credentials = Credentials.from_authorized_user_info(payload, scopes=[DRIVE_SCOPE])
+    if credentials.expired and credentials.refresh_token:
+        credentials.refresh(Request())
+        st.session_state.oauth_credentials = credentials_to_dict(credentials)
+    return credentials
+
+
+def credentials_from_secrets() -> Credentials | None:
+    refresh_token = clean_text(st.secrets.get("GOOGLE_OAUTH_REFRESH_TOKEN", ""))
+    if not refresh_token:
+        return None
+    config = oauth_client_config()["web"]
+    credentials = Credentials(
+        token=None,
+        refresh_token=refresh_token,
+        token_uri=TOKEN_URI,
+        client_id=config["client_id"],
+        client_secret=config["client_secret"],
+        scopes=[DRIVE_SCOPE],
     )
+    credentials.refresh(Request())
+    return credentials
+
+
+def current_credentials() -> Credentials | None:
+    credentials = credentials_from_session()
+    if credentials:
+        return credentials
+    return credentials_from_secrets()
+
+
+def get_drive_service():
+    credentials = current_credentials()
+    if not credentials:
+        raise ValueError("Google Drive OAuth autorizācija nav pabeigta.")
     return build("drive", "v3", credentials=credentials, cache_discovery=False)
+
+
+def begin_oauth_url() -> str:
+    config = oauth_client_config()
+    redirect_uri = config["web"]["redirect_uris"][0]
+    flow = Flow.from_client_config(config, scopes=[DRIVE_SCOPE])
+    flow.redirect_uri = redirect_uri
+    authorization_url, state = flow.authorization_url(
+        access_type="offline",
+        include_granted_scopes="true",
+        prompt="consent",
+    )
+    st.session_state.oauth_state = state
+    return authorization_url
+
+
+def process_oauth_callback() -> None:
+    code = clean_text(st.query_params.get("code", ""))
+    returned_state = clean_text(st.query_params.get("state", ""))
+    error = clean_text(st.query_params.get("error", ""))
+    if error:
+        st.session_state.oauth_error = error
+        st.query_params.clear()
+        return
+    if not code:
+        return
+
+    expected_state = clean_text(st.session_state.get("oauth_state", ""))
+    if expected_state and returned_state != expected_state:
+        st.session_state.oauth_error = "OAuth state neatbilst. Sāc autorizāciju vēlreiz."
+        st.query_params.clear()
+        return
+
+    config = oauth_client_config()
+    redirect_uri = config["web"]["redirect_uris"][0]
+    flow = Flow.from_client_config(
+        config,
+        scopes=[DRIVE_SCOPE],
+        state=returned_state or None,
+    )
+    flow.redirect_uri = redirect_uri
+    flow.fetch_token(code=code)
+    credentials = flow.credentials
+    st.session_state.oauth_credentials = credentials_to_dict(credentials)
+    st.session_state.new_refresh_token = credentials.refresh_token or ""
+    st.session_state.oauth_error = ""
+    st.query_params.clear()
+
+
+def render_oauth_gate() -> bool:
+    process_oauth_callback()
+    st.markdown("## 0. Google Drive autorizācija")
+
+    if st.session_state.get("oauth_error"):
+        st.error(st.session_state.oauth_error)
+
+    credentials = current_credentials()
+    if credentials:
+        st.success("Google Drive ir pieslēgts ar lietotāja OAuth kontu.")
+        refresh_token = clean_text(st.session_state.get("new_refresh_token", ""))
+        if refresh_token:
+            st.warning(
+                "Nokopē zemāk redzamo refresh token uz Streamlit Secrets. "
+                "Pēc saglabāšanas šo lauku vari aizvērt."
+            )
+            st.code(
+                f'GOOGLE_OAUTH_REFRESH_TOKEN = "{refresh_token}"',
+                language="toml",
+            )
+        if st.button("Atvienot Google Drive šajā sesijā"):
+            st.session_state.pop("oauth_credentials", None)
+            st.session_state.pop("new_refresh_token", None)
+            st.session_state.root_structure = None
+            st.rerun()
+        return True
+
+    try:
+        authorization_url = begin_oauth_url()
+        st.info(
+            "Pieslēdz Google kontu, kuram pieder 03_Markup mape. "
+            "Pirmajā reizē Google atgriezīs refresh token."
+        )
+        st.link_button("Pieslēgt Google Drive", authorization_url, type="primary")
+    except Exception as exc:
+        st.error("OAuth konfigurācija nav derīga.")
+        st.exception(exc)
+    return False
 
 
 def list_folder_items(service, folder_id: str) -> list[dict[str, Any]]:
@@ -375,9 +530,17 @@ for key, default in {
     "completed_df": pd.DataFrame(),
     "zip_bytes": None,
     "memory_filename": "",
+    "oauth_credentials": None,
+    "oauth_state": "",
+    "oauth_error": "",
+    "new_refresh_token": "",
+    "drive_upload_message": "",
 }.items():
     if key not in st.session_state:
         st.session_state[key] = default
+
+if not render_oauth_gate():
+    st.stop()
 
 st.markdown("## 1. Google Drive struktūra")
 default_root = st.secrets.get("GOOGLE_DRIVE_MARKUP_ROOT_FOLDER_ID", "")
@@ -543,21 +706,32 @@ if root:
             project_short = project_short_name(project_name)
             discipline_short = discipline_short_name(discipline_name)
             memory_filename = f"{timestamp}_{safe_filename_part(project_short)}_{safe_filename_part(discipline_short)}_Audit.xlsx"
-            memory_project = ensure_child_folder(service, root["memory"]["id"], project_name)
-            upload_bytes_to_drive(service, memory_project["id"], memory_filename, completed_excel, XLSX_MIME_TYPE)
-            target_folder = result_folder
-            if create_session:
-                session_name = f"{timestamp}_{safe_filename_part(project_short)}_{safe_filename_part(discipline_short)}"
-                target_folder = ensure_child_folder(service, result_folder["id"], session_name)
-            for filename, data in outputs.items():
-                upload_bytes_to_drive(service, target_folder["id"], filename, data, PDF_MIME_TYPE)
             report_name = f"{timestamp}_{safe_filename_part(project_short)}_{safe_filename_part(discipline_short)}_Markup_Report.xlsx"
-            upload_bytes_to_drive(service, target_folder["id"], report_name, completed_excel, XLSX_MIME_TYPE)
             download_files = {**outputs, report_name: completed_excel}
             st.session_state.completed_df = work
             st.session_state.zip_bytes = zip_bytes(download_files)
             st.session_state.memory_filename = memory_filename
-            st.success(f"Anotēti {len(outputs)} PDF. Rezultāti saglabāti Drive un sagatavoti lejupielādei.")
+
+            try:
+                memory_project = ensure_child_folder(service, root["memory"]["id"], project_name)
+                upload_bytes_to_drive(service, memory_project["id"], memory_filename, completed_excel, XLSX_MIME_TYPE)
+                target_folder = result_folder
+                if create_session:
+                    session_name = f"{timestamp}_{safe_filename_part(project_short)}_{safe_filename_part(discipline_short)}"
+                    target_folder = ensure_child_folder(service, result_folder["id"], session_name)
+                for filename, data in outputs.items():
+                    upload_bytes_to_drive(service, target_folder["id"], filename, data, PDF_MIME_TYPE)
+                upload_bytes_to_drive(service, target_folder["id"], report_name, completed_excel, XLSX_MIME_TYPE)
+                st.session_state.drive_upload_message = (
+                    f"Anotēti {len(outputs)} PDF. Rezultāti saglabāti Drive un sagatavoti lejupielādei."
+                )
+                st.success(st.session_state.drive_upload_message)
+            except Exception as upload_exc:
+                st.session_state.drive_upload_message = (
+                    "PDF anotēšana ir pabeigta un ZIP ir pieejams, bet augšupielāde Drive neizdevās."
+                )
+                st.warning(st.session_state.drive_upload_message)
+                st.exception(upload_exc)
         except Exception as exc:
             st.error("Piezīmju uzlikšana neizdevās.")
             st.exception(exc)
@@ -566,7 +740,10 @@ if st.session_state.zip_bytes is not None:
     st.markdown("## 5. Gatavie rezultāti")
     summary = st.session_state.completed_df.groupby("Annotation_Status", dropna=False).size().reset_index(name="Skaits")
     st.dataframe(summary, use_container_width=True, hide_index=True)
-    st.info("Memory mapē saglabāts: " + st.session_state.memory_filename)
+    if st.session_state.drive_upload_message:
+        st.info(st.session_state.drive_upload_message)
+    if st.session_state.memory_filename:
+        st.caption("Memory Excel faila nosaukums: " + st.session_state.memory_filename)
     st.download_button("Lejupielādēt anotētos PDF un Excel ZIP", data=st.session_state.zip_bytes, file_name="BP_Audit_Markup_Results.zip", mime="application/zip", type="primary")
     with st.expander("Parādīt pilnu anotēšanas atskaiti"):
         st.dataframe(st.session_state.completed_df[REQUIRED_COLUMNS], use_container_width=True, hide_index=True)
