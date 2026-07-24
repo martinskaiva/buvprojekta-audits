@@ -20,7 +20,7 @@ from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
 
 APP_NAME = "BP audita PDF Markup"
-APP_VERSION = "2.1.0"
+APP_VERSION = "2.1.1"
 FOLDER_MIME_TYPE = "application/vnd.google-apps.folder"
 PDF_MIME_TYPE = "application/pdf"
 XLSX_MIME_TYPE = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
@@ -428,7 +428,10 @@ def validate_rows(df: pd.DataFrame, selected_pdf_names: set[str]) -> pd.DataFram
             status, message = "invalid", "Nav derīga Page vērtība."
         elif not row["Comment"]:
             status, message = "invalid", "Nav Comment."
-        elif not any([row["Anchor_Text"], row["Alternative_Anchor"], row["Element_Code"]]):
+        elif (
+            clean_text(row["Category"]).casefold() != "no discrepancies"
+            and not any([row["Anchor_Text"], row["Alternative_Anchor"], row["Element_Code"]])
+        ):
             status, message = "invalid", "Nav Anchor_Text, Alternative_Anchor vai Element_Code."
         statuses.append(status)
         messages.append(message)
@@ -471,31 +474,75 @@ def annotate_pdf(pdf_bytes: bytes, rows: pd.DataFrame) -> tuple[bytes, dict[int,
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     statuses: dict[int, str] = {}
     page_counts: dict[int, int] = {}
+    no_issue_pages: set[int] = set()
+
     for row_index, row in rows.iterrows():
         page_no = safe_int(row["Page"])
         comment = clean_text(row["Comment"])
+        category = clean_text(row["Category"]).casefold()
+
         if page_no is None or page_no < 1 or page_no > len(doc):
             statuses[row_index] = "page_not_found"
             continue
+
         page = doc[page_no - 1]
         page_counts.setdefault(page_no, 0)
+
+        if category == "no discrepancies":
+            if page_no not in no_issue_pages:
+                note_text = comment or "Audita rezultātā piezīmes nav konstatētas."
+                add_comment(
+                    page,
+                    fitz.Point(max(36, page.rect.width - 80), 36),
+                    note_text,
+                )
+                no_issue_pages.add(page_no)
+                statuses[row_index] = "no_issues_note_added"
+            else:
+                statuses[row_index] = "no_issues_note_duplicate_skipped"
+            continue
+
         found_rects: list[fitz.Rect] = []
         found_kind = ""
-        for kind, text in search_variants(row["Anchor_Text"], row["Alternative_Anchor"], row["Element_Code"]):
-            rects = page.search_for(text)
+
+        for kind, search_text in search_variants(
+            row["Anchor_Text"],
+            row["Alternative_Anchor"],
+            row["Element_Code"],
+        ):
+            rects = page.search_for(search_text)
             if rects:
-                found_rects, found_kind = rects, kind
+                found_rects = rects
+                found_kind = kind
                 break
+
         if not found_rects:
-            add_comment(page, fitz.Point(max(36, page.rect.width - 80), 36 + page_counts[page_no] * 24), comment)
+            add_comment(
+                page,
+                fitz.Point(
+                    max(36, page.rect.width - 80),
+                    36 + page_counts[page_no] * 24,
+                ),
+                comment,
+            )
             page_counts[page_no] += 1
             statuses[row_index] = "comment_only"
             continue
+
         rect = found_rects[0]
         highlight = page.add_highlight_annot(rect)
         highlight.set_colors(stroke=YELLOW)
         highlight.update()
-        add_comment(page, fitz.Point(min(page.rect.width - 24, rect.x1 + 8), max(24, rect.y0)), comment)
+
+        add_comment(
+            page,
+            fitz.Point(
+                min(page.rect.width - 24, rect.x1 + 8),
+                max(24, rect.y0),
+            ),
+            comment,
+        )
+
         if len(found_rects) > 1:
             statuses[row_index] = "highlighted_first_match"
         elif found_kind == "alternative":
@@ -504,11 +551,11 @@ def annotate_pdf(pdf_bytes: bytes, rows: pd.DataFrame) -> tuple[bytes, dict[int,
             statuses[row_index] = "highlighted_element_code"
         else:
             statuses[row_index] = "highlighted"
+
     output = io.BytesIO()
     doc.save(output, garbage=4, deflate=True)
     doc.close()
     return output.getvalue(), statuses
-
 
 def marked_name(filename: str) -> str:
     return re.sub(r"\.pdf$", "", filename, flags=re.I) + "_marked.pdf"
@@ -675,7 +722,6 @@ if root:
     result_folders = st.session_state.result_folders
     result_path = st.selectbox("Drive rezultātu mape", [x["path"] for x in result_folders])
     result_folder = next(x for x in result_folders if x["path"] == result_path)
-    create_session = st.checkbox("Rezultātu mapē izveidot sesijas apakšmapi", value=True)
     can_run = bool(selected_pdfs) and not st.session_state.audit_df.empty and (st.session_state.audit_df["_validation_status"] == "ok").any()
 
     if st.button("Automātiski uzlikt piezīmes", type="primary", disabled=not can_run):
@@ -706,24 +752,37 @@ if root:
             project_short = project_short_name(project_name)
             discipline_short = discipline_short_name(discipline_name)
             memory_filename = f"{timestamp}_{safe_filename_part(project_short)}_{safe_filename_part(discipline_short)}_Audit.xlsx"
-            report_name = f"{timestamp}_{safe_filename_part(project_short)}_{safe_filename_part(discipline_short)}_Markup_Report.xlsx"
-            download_files = {**outputs, report_name: completed_excel}
+
             st.session_state.completed_df = work
-            st.session_state.zip_bytes = zip_bytes(download_files)
+            st.session_state.zip_bytes = zip_bytes(outputs)
             st.session_state.memory_filename = memory_filename
 
             try:
-                memory_project = ensure_child_folder(service, root["memory"]["id"], project_name)
-                upload_bytes_to_drive(service, memory_project["id"], memory_filename, completed_excel, XLSX_MIME_TYPE)
-                target_folder = result_folder
-                if create_session:
-                    session_name = f"{timestamp}_{safe_filename_part(project_short)}_{safe_filename_part(discipline_short)}"
-                    target_folder = ensure_child_folder(service, result_folder["id"], session_name)
+                memory_project = ensure_child_folder(
+                    service,
+                    root["memory"]["id"],
+                    project_name,
+                )
+                upload_bytes_to_drive(
+                    service,
+                    memory_project["id"],
+                    memory_filename,
+                    completed_excel,
+                    XLSX_MIME_TYPE,
+                )
+
                 for filename, data in outputs.items():
-                    upload_bytes_to_drive(service, target_folder["id"], filename, data, PDF_MIME_TYPE)
-                upload_bytes_to_drive(service, target_folder["id"], report_name, completed_excel, XLSX_MIME_TYPE)
+                    upload_bytes_to_drive(
+                        service,
+                        result_folder["id"],
+                        filename,
+                        data,
+                        PDF_MIME_TYPE,
+                    )
+
                 st.session_state.drive_upload_message = (
-                    f"Anotēti {len(outputs)} PDF. Rezultāti saglabāti Drive un sagatavoti lejupielādei."
+                    f"Anotēti {len(outputs)} PDF. PDF saglabāti tieši izvēlētajā "
+                    "Drive rezultātu mapē un sagatavoti lejupielādei."
                 )
                 st.success(st.session_state.drive_upload_message)
             except Exception as upload_exc:
@@ -744,6 +803,6 @@ if st.session_state.zip_bytes is not None:
         st.info(st.session_state.drive_upload_message)
     if st.session_state.memory_filename:
         st.caption("Memory Excel faila nosaukums: " + st.session_state.memory_filename)
-    st.download_button("Lejupielādēt anotētos PDF un Excel ZIP", data=st.session_state.zip_bytes, file_name="BP_Audit_Markup_Results.zip", mime="application/zip", type="primary")
+    st.download_button("Lejupielādēt anotētos PDF ZIP", data=st.session_state.zip_bytes, file_name="BP_Audit_Marked_PDF.zip", mime="application/zip", type="primary")
     with st.expander("Parādīt pilnu anotēšanas atskaiti"):
         st.dataframe(st.session_state.completed_df[REQUIRED_COLUMNS], use_container_width=True, hide_index=True)
