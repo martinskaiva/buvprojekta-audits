@@ -21,7 +21,7 @@ from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
 
 APP_NAME = "BP audita PDF Markup"
-APP_VERSION = "2.2.1"
+APP_VERSION = "2.2.2"
 FOLDER_MIME_TYPE = "application/vnd.google-apps.folder"
 PDF_MIME_TYPE = "application/pdf"
 XLSX_MIME_TYPE = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
@@ -78,7 +78,16 @@ def clean_text(value: Any) -> str:
 
 
 def normalize_filename(value: Any) -> str:
-    return clean_text(value).casefold()
+    text = clean_text(value).casefold()
+    text = re.sub(r"\.pdf$", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\(\s*\d+\s*\)$", "", text)
+    text = re.sub(r"[^a-z0-9āčēģīķļņōŗšūž]+", "", text)
+    return text
+
+
+def normalize_document_number(value: Any) -> str:
+    text = clean_text(value).casefold()
+    return re.sub(r"[^a-z0-9āčēģīķļņōŗšūž]+", "", text)
 
 
 def safe_int(value: Any) -> int | None:
@@ -678,32 +687,130 @@ def read_audit_excel(data: bytes) -> pd.DataFrame:
     return df
 
 
-def validate_rows(df: pd.DataFrame, selected_pdf_names: set[str]) -> pd.DataFrame:
+def validate_rows(
+    df: pd.DataFrame,
+    selected_pdf_rows: list[dict[str, Any]],
+) -> pd.DataFrame:
     work = df.copy()
-    statuses, messages = [], []
+
+    selected_index: list[dict[str, Any]] = []
+    for item in selected_pdf_rows:
+        actual_name = clean_text(item.get("name"))
+        selected_index.append(
+            {
+                "id": item.get("id", ""),
+                "name": actual_name,
+                "path": clean_text(item.get("path")),
+                "filename_norm": normalize_filename(actual_name),
+                "filename_document_norm": normalize_document_number(
+                    re.sub(
+                        r"\.pdf$",
+                        "",
+                        actual_name,
+                        flags=re.IGNORECASE,
+                    )
+                ),
+            }
+        )
+
+    statuses: list[str] = []
+    messages: list[str] = []
+    matched_names: list[str] = []
+    matched_ids: list[str] = []
+    match_methods: list[str] = []
+
     for _, row in work.iterrows():
-        status, message = "ok", ""
+        status = "ok"
+        message = ""
+        matched_name = ""
+        matched_id = ""
+        match_method = ""
+
+        excel_filename = clean_text(row["Document_Filename"])
+        excel_filename_norm = normalize_filename(excel_filename)
+        document_number_norm = normalize_document_number(
+            row["Document_Number"]
+        )
+
+        matches = [
+            item
+            for item in selected_index
+            if item["filename_norm"] == excel_filename_norm
+        ]
+        if len(matches) == 1:
+            match_method = "normalized_filename"
+
+        if not matches and document_number_norm:
+            matches = [
+                item
+                for item in selected_index
+                if document_number_norm in item["filename_document_norm"]
+            ]
+            if len(matches) == 1:
+                match_method = "document_number_in_filename"
+
         if not row["Audit_ID"]:
             status, message = "invalid", "Nav Audit_ID."
-        elif not row["Document_Filename"]:
-            status, message = "invalid", "Nav Document_Filename."
-        elif row["Document_Filename_Norm"] not in selected_pdf_names:
-            status, message = "file_not_selected", "Excel norādītais PDF nav izvēlēts."
+        elif not excel_filename and not row["Document_Number"]:
+            status, message = "invalid", "Nav ne Document_Filename, ne Document_Number."
+        elif len(matches) == 0:
+            status = "file_not_selected"
+            message = (
+                "Excel norādītajam dokumentam nav atrasts izvēlēts PDF "
+                "pēc normalizēta faila nosaukuma vai Document_Number."
+            )
+        elif len(matches) > 1:
+            status = "file_match_ambiguous"
+            message = (
+                "Atrasti vairāki iespējamie PDF. Nepieciešams precīzāks "
+                "Document_Filename vai Document_Number."
+            )
         elif row["Page"] is None:
             status, message = "invalid", "Nav derīga Page vērtība."
         elif not row["Comment"]:
             status, message = "invalid", "Nav Comment."
         elif (
             clean_text(row["Category"]).casefold() != "no discrepancies"
-            and not any([row["Anchor_Text"], row["Alternative_Anchor"], row["Element_Code"]])
+            and not any(
+                [
+                    row["Anchor_Text"],
+                    row["Alternative_Anchor"],
+                    row["Element_Code"],
+                ]
+            )
         ):
-            status, message = "invalid", "Nav Anchor_Text, Alternative_Anchor vai Element_Code."
+            status, message = (
+                "invalid",
+                "Nav Anchor_Text, Alternative_Anchor vai Element_Code.",
+            )
+
+        if len(matches) == 1:
+            matched_name = matches[0]["name"]
+            matched_id = matches[0]["id"]
+
         statuses.append(status)
         messages.append(message)
+        matched_names.append(matched_name)
+        matched_ids.append(matched_id)
+        match_methods.append(match_method)
+
     work["_validation_status"] = statuses
     work["_validation_message"] = messages
-    return work
+    work["_matched_pdf_name"] = matched_names
+    work["_matched_pdf_id"] = matched_ids
+    work["_match_method"] = match_methods
 
+    valid_mask = work["_validation_status"] == "ok"
+    work.loc[valid_mask, "Document_Filename"] = work.loc[
+        valid_mask,
+        "_matched_pdf_name",
+    ]
+    work.loc[valid_mask, "Document_Filename_Norm"] = work.loc[
+        valid_mask,
+        "_matched_pdf_name",
+    ].apply(normalize_filename)
+
+    return work
 
 def completed_excel_bytes(df: pd.DataFrame) -> bytes:
     output = io.BytesIO()
@@ -1043,12 +1150,15 @@ if root:
             )
 
     st.markdown("## 3. ChatGPT sagatavotais Excel")
+    st.caption(
+        "Rīks ignorē dublikātu sufiksus, piemēram, (1), (2) un (3), "
+        "un vajadzības gadījumā sasaista dokumentu pēc Document_Number."
+    )
     upload = st.file_uploader("Augšupielādē apstiprināto piezīmju Excel", type=["xlsx"])
     if upload is not None:
         try:
             audit_df = read_audit_excel(upload.getvalue())
-            selected_names = {normalize_filename(x["name"]) for x in selected_pdfs}
-            validated = validate_rows(audit_df, selected_names)
+            validated = validate_rows(audit_df, selected_pdfs)
             st.session_state.audit_df = validated
             ok = int((validated["_validation_status"] == "ok").sum())
             c1, c2, c3 = st.columns(3)
@@ -1057,7 +1167,22 @@ if root:
             c3.metric("Neapstrādājamas", len(validated) - ok)
             if ok != len(validated):
                 with st.expander("Parādīt tehniskās validācijas problēmas"):
-                    st.dataframe(validated[validated["_validation_status"] != "ok"][["Audit_ID", "Document_Filename", "Page", "_validation_status", "_validation_message"]], use_container_width=True, hide_index=True)
+                    st.dataframe(
+                        validated[validated["_validation_status"] != "ok"][
+                            [
+                                "Audit_ID",
+                                "Document_Filename",
+                                "Document_Number",
+                                "Page",
+                                "_validation_status",
+                                "_validation_message",
+                                "_matched_pdf_name",
+                                "_match_method",
+                            ]
+                        ],
+                        use_container_width=True,
+                        hide_index=True,
+                    )
             else:
                 st.success("Visas Excel rindas ir tehniski derīgas.")
         except Exception as exc:
