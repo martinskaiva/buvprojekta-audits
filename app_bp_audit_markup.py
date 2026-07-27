@@ -13,6 +13,7 @@ from typing import Any
 import fitz
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import Flow
@@ -20,13 +21,15 @@ from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
 
 APP_NAME = "BP audita PDF Markup"
-APP_VERSION = "2.1.1"
+APP_VERSION = "2.2.0"
 FOLDER_MIME_TYPE = "application/vnd.google-apps.folder"
 PDF_MIME_TYPE = "application/pdf"
 XLSX_MIME_TYPE = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 INPUT_FOLDER_NAME = "01_Input"
 RESULTS_FOLDER_NAME = "02_Results"
 MEMORY_FOLDER_NAME = "03_Memory"
+CONFIG_FOLDER_NAME = "04_Config"
+PROJECT_CHAT_LINKS_FILENAME = "project_chat_links.json"
 EXCEL_SHEET_NAME = "Audit"
 YELLOW = (1.0, 1.0, 0.0)
 
@@ -330,6 +333,259 @@ def ensure_child_folder(service, parent_id: str, name: str) -> dict[str, Any]:
     )
 
 
+def find_child_file(
+    service,
+    parent_id: str,
+    filename: str,
+) -> dict[str, Any] | None:
+    return next(
+        (
+            item
+            for item in list_folder_items(service, parent_id)
+            if item.get("mimeType") != FOLDER_MIME_TYPE
+            and item.get("name") == filename
+        ),
+        None,
+    )
+
+
+def upsert_bytes_to_drive(
+    service,
+    folder_id: str,
+    filename: str,
+    data: bytes,
+    mime_type: str,
+) -> dict[str, Any]:
+    existing = find_child_file(service, folder_id, filename)
+    media = MediaIoBaseUpload(
+        io.BytesIO(data),
+        mimetype=mime_type,
+        resumable=False,
+    )
+
+    if existing:
+        return execute_with_retry(
+            lambda: service.files().update(
+                fileId=existing["id"],
+                media_body=media,
+                fields="id,name,webViewLink",
+                supportsAllDrives=True,
+            )
+        )
+
+    return upload_bytes_to_drive(
+        service,
+        folder_id,
+        filename,
+        data,
+        mime_type,
+    )
+
+
+def load_project_chat_links(
+    service,
+    config_folder_id: str,
+) -> dict[str, str]:
+    file_item = find_child_file(
+        service,
+        config_folder_id,
+        PROJECT_CHAT_LINKS_FILENAME,
+    )
+    if not file_item:
+        return {}
+
+    try:
+        raw = download_drive_file_bytes(
+            service,
+            file_item["id"],
+        )
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return {}
+
+    if not isinstance(payload, dict):
+        return {}
+
+    return {
+        clean_text(project_name): clean_text(chat_url)
+        for project_name, chat_url in payload.items()
+        if clean_text(project_name) and clean_text(chat_url)
+    }
+
+
+def save_project_chat_links(
+    service,
+    config_folder_id: str,
+    links: dict[str, str],
+) -> None:
+    payload = {
+        clean_text(project_name): clean_text(chat_url)
+        for project_name, chat_url in sorted(
+            links.items(),
+            key=lambda item: clean_text(item[0]).casefold(),
+        )
+        if clean_text(project_name) and clean_text(chat_url)
+    }
+    data = json.dumps(
+        payload,
+        ensure_ascii=False,
+        indent=2,
+    ).encode("utf-8")
+
+    upsert_bytes_to_drive(
+        service,
+        config_folder_id,
+        PROJECT_CHAT_LINKS_FILENAME,
+        data,
+        "application/json",
+    )
+
+
+def is_valid_chatgpt_url(value: str) -> bool:
+    url = clean_text(value)
+    return bool(
+        re.fullmatch(
+            r"https://chatgpt\.com/[^\s]+",
+            url,
+            flags=re.IGNORECASE,
+        )
+    )
+
+
+def render_project_chat_panel(
+    service,
+    config_folder_id: str,
+    project_name: str,
+) -> None:
+    st.markdown("### Projekta ChatGPT audita čats")
+    st.caption(
+        "Katram projektam vari saglabāt atšķirīgu ChatGPT čata adresi. "
+        "Čats atvērsies jaunā cilnē vai atsevišķā logā, bet Markup rīks paliks atvērts."
+    )
+
+    links = st.session_state.get("project_chat_links", {})
+    field_key = f"project_chat_url_{safe_filename_part(project_name)}"
+
+    if field_key not in st.session_state:
+        st.session_state[field_key] = clean_text(
+            links.get(project_name, "")
+        )
+
+    chat_url = st.text_input(
+        "ChatGPT projekta čata adrese",
+        key=field_key,
+        placeholder="https://chatgpt.com/c/...",
+    )
+
+    save_col, delete_col = st.columns([1, 1])
+
+    with save_col:
+        if st.button(
+            "Saglabāt čata adresi",
+            key=f"save_chat_url_{safe_filename_part(project_name)}",
+            type="primary",
+        ):
+            chat_url = clean_text(chat_url)
+            if not is_valid_chatgpt_url(chat_url):
+                st.error(
+                    "Ievadi pilnu ChatGPT adresi, kas sākas ar "
+                    "https://chatgpt.com/."
+                )
+            else:
+                links = dict(
+                    st.session_state.get(
+                        "project_chat_links",
+                        {},
+                    )
+                )
+                links[project_name] = chat_url
+                save_project_chat_links(
+                    service,
+                    config_folder_id,
+                    links,
+                )
+                st.session_state.project_chat_links = links
+                st.success(
+                    f"Projekta {project_name} čata adrese saglabāta."
+                )
+
+    with delete_col:
+        if st.button(
+            "Dzēst saglabāto adresi",
+            key=f"delete_chat_url_{safe_filename_part(project_name)}",
+            disabled=not bool(
+                clean_text(
+                    st.session_state.get(
+                        field_key,
+                        "",
+                    )
+                )
+            ),
+        ):
+            links = dict(
+                st.session_state.get(
+                    "project_chat_links",
+                    {},
+                )
+            )
+            links.pop(project_name, None)
+            save_project_chat_links(
+                service,
+                config_folder_id,
+                links,
+            )
+            st.session_state.project_chat_links = links
+            st.session_state[field_key] = ""
+            st.success(
+                f"Projekta {project_name} čata adrese izdzēsta."
+            )
+            st.rerun()
+
+    active_url = clean_text(
+        st.session_state.get(field_key, "")
+    )
+    if is_valid_chatgpt_url(active_url):
+        open_tab_col, popup_col = st.columns([1, 1])
+
+        with open_tab_col:
+            st.link_button(
+                "Atvērt ChatGPT jaunā cilnē",
+                active_url,
+                use_container_width=True,
+            )
+
+        with popup_col:
+            escaped_url = json.dumps(active_url)
+            components.html(
+                f"""
+                <button
+                    onclick='window.open(
+                        {escaped_url},
+                        "ChatGPTAudit",
+                        "width=1000,height=900,resizable=yes,scrollbars=yes"
+                    )'
+                    style="
+                        width:100%;
+                        padding:0.62rem 0.75rem;
+                        border:1px solid rgba(49,51,63,0.2);
+                        border-radius:0.5rem;
+                        background:white;
+                        color:rgb(49,51,63);
+                        font-size:1rem;
+                        cursor:pointer;
+                    "
+                >
+                    Atvērt ChatGPT atsevišķā logā
+                </button>
+                """,
+                height=48,
+            )
+    else:
+        st.info(
+            "Šim projektam vēl nav saglabāta ChatGPT čata adrese."
+        )
+
+
 def list_pdfs_recursive(service, folder_id: str, parent_path: str = "") -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for item in list_folder_items(service, folder_id):
@@ -582,6 +838,7 @@ for key, default in {
     "oauth_error": "",
     "new_refresh_token": "",
     "drive_upload_message": "",
+    "project_chat_links": {},
 }.items():
     if key not in st.session_state:
         st.session_state[key] = default
@@ -602,10 +859,37 @@ if st.button("Nolasīt 03_Markup struktūru", type="primary"):
         input_folder = find_child_folder(service, root_id, INPUT_FOLDER_NAME)
         results_folder = find_child_folder(service, root_id, RESULTS_FOLDER_NAME)
         memory_folder = find_child_folder(service, root_id, MEMORY_FOLDER_NAME)
-        missing = [n for n, x in [(INPUT_FOLDER_NAME, input_folder), (RESULTS_FOLDER_NAME, results_folder), (MEMORY_FOLDER_NAME, memory_folder)] if x is None]
+        missing = [
+            name
+            for name, item in [
+                (INPUT_FOLDER_NAME, input_folder),
+                (RESULTS_FOLDER_NAME, results_folder),
+                (MEMORY_FOLDER_NAME, memory_folder),
+            ]
+            if item is None
+        ]
         if missing:
-            raise ValueError("03_Markup mapē nav atrastas mapes: " + ", ".join(missing))
-        st.session_state.root_structure = {"root_id": root_id, "input": input_folder, "results": results_folder, "memory": memory_folder}
+            raise ValueError(
+                "03_Markup mapē nav atrastas mapes: "
+                + ", ".join(missing)
+            )
+
+        config_folder = ensure_child_folder(
+            service,
+            root_id,
+            CONFIG_FOLDER_NAME,
+        )
+        st.session_state.root_structure = {
+            "root_id": root_id,
+            "input": input_folder,
+            "results": results_folder,
+            "memory": memory_folder,
+            "config": config_folder,
+        }
+        st.session_state.project_chat_links = load_project_chat_links(
+            service,
+            config_folder["id"],
+        )
         st.session_state.project_folders = cached_child_folders(input_folder["id"])
         st.session_state.result_folders = [{"id": results_folder["id"], "name": results_folder["name"], "path": results_folder["name"]}, *cached_folders_recursive(results_folder["id"], results_folder["name"])]
         st.success("03_Markup struktūra nolasīta.")
@@ -623,6 +907,13 @@ if root:
         st.stop()
     project_name = st.selectbox("Projekts", [x["name"] for x in projects])
     project = next(x for x in projects if x["name"] == project_name)
+
+    render_project_chat_panel(
+        service,
+        root["config"]["id"],
+        project_name,
+    )
+
     packages = cached_child_folders(project["id"])
     if packages:
         package_name = st.selectbox("Dokumentu komplekts", [x["name"] for x in packages])
