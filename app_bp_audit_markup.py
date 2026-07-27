@@ -21,7 +21,7 @@ from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
 
 APP_NAME = "BP audita PDF Markup"
-APP_VERSION = "2.2.3"
+APP_VERSION = "2.2.4"
 FOLDER_MIME_TYPE = "application/vnd.google-apps.folder"
 PDF_MIME_TYPE = "application/pdf"
 XLSX_MIME_TYPE = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
@@ -1091,7 +1091,7 @@ if root:
             **item,
             "path": f"{PACKAGE_ROOT_LABEL}/{item['name']}",
         }
-        for item in cached_child_items(package["id"])
+        for item in cached_list_folder_items(package["id"])
         if item.get("mimeType") == PDF_MIME_TYPE
     ]
 
