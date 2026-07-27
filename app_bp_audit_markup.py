@@ -21,7 +21,7 @@ from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
 
 APP_NAME = "BP audita PDF Markup"
-APP_VERSION = "2.2.0"
+APP_VERSION = "2.2.1"
 FOLDER_MIME_TYPE = "application/vnd.google-apps.folder"
 PDF_MIME_TYPE = "application/pdf"
 XLSX_MIME_TYPE = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
@@ -32,6 +32,15 @@ CONFIG_FOLDER_NAME = "04_Config"
 PROJECT_CHAT_LINKS_FILENAME = "project_chat_links.json"
 EXCEL_SHEET_NAME = "Audit"
 YELLOW = (1.0, 1.0, 0.0)
+
+FAST_SAVE_SIZE_MB = 15
+FAST_SAVE_PAGE_COUNT = 30
+FAST_SAVE_TEXT_BLOCK_COUNT = 5000
+TEXTUAL_DOCUMENT_HINTS = (
+    "boq", "bill of quantities", "quantity", "take-off", "takeoff",
+    "explanatory", "description", "specification", "report",
+    "schedule", "technical note", "method statement",
+)
 
 REQUIRED_COLUMNS = [
     "Audit_ID",
@@ -726,7 +735,48 @@ def add_comment(page: fitz.Page, point: fitz.Point, comment: str) -> None:
     note.update()
 
 
-def annotate_pdf(pdf_bytes: bytes, rows: pd.DataFrame) -> tuple[bytes, dict[int, str]]:
+def is_textual_document_filename(filename: str) -> bool:
+    name = clean_text(filename).casefold()
+    return any(hint in name for hint in TEXTUAL_DOCUMENT_HINTS)
+
+
+def estimate_text_block_count(doc: fitz.Document, max_pages_to_scan: int = 12) -> int:
+    if len(doc) == 0:
+        return 0
+    pages_to_scan = min(len(doc), max_pages_to_scan)
+    sampled = 0
+    for page_index in range(pages_to_scan):
+        try:
+            sampled += len(doc[page_index].get_text("blocks"))
+        except Exception:
+            continue
+    if pages_to_scan == len(doc):
+        return sampled
+    return int(round((sampled / max(pages_to_scan, 1)) * len(doc)))
+
+
+def choose_pdf_save_mode(doc: fitz.Document, filename: str, source_size_bytes: int) -> tuple[str, dict[str, Any]]:
+    size_mb = source_size_bytes / (1024 * 1024)
+    page_count = len(doc)
+    estimated_blocks = estimate_text_block_count(doc)
+    textual_name = is_textual_document_filename(filename)
+    fast = (
+        size_mb >= FAST_SAVE_SIZE_MB
+        or page_count >= FAST_SAVE_PAGE_COUNT
+        or estimated_blocks >= FAST_SAVE_TEXT_BLOCK_COUNT
+        or (textual_name and page_count >= 8)
+    )
+    mode = "fast_text_document" if fast else "standard_drawing"
+    return mode, {
+        "mode": mode,
+        "size_mb": round(size_mb, 2),
+        "page_count": page_count,
+        "estimated_text_blocks": estimated_blocks,
+        "filename_textual": textual_name,
+    }
+
+
+def annotate_pdf(pdf_bytes: bytes, rows: pd.DataFrame, filename: str = "") -> tuple[bytes, dict[int, str], dict[str, Any]]:
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     statuses: dict[int, str] = {}
     page_counts: dict[int, int] = {}
@@ -808,10 +858,16 @@ def annotate_pdf(pdf_bytes: bytes, rows: pd.DataFrame) -> tuple[bytes, dict[int,
         else:
             statuses[row_index] = "highlighted"
 
+    save_mode, save_diagnostics = choose_pdf_save_mode(
+        doc, filename, len(pdf_bytes)
+    )
     output = io.BytesIO()
-    doc.save(output, garbage=4, deflate=True)
+    if save_mode == "fast_text_document":
+        doc.save(output, deflate=True)
+    else:
+        doc.save(output, garbage=4, deflate=True)
     doc.close()
-    return output.getvalue(), statuses
+    return output.getvalue(), statuses, save_diagnostics
 
 def marked_name(filename: str) -> str:
     return re.sub(r"\.pdf$", "", filename, flags=re.I) + "_marked.pdf"
@@ -1010,6 +1066,11 @@ if root:
             st.exception(exc)
 
     st.markdown("## 4. Rezultātu saglabāšana")
+    st.caption(
+        "Lieliem tekstuāliem PDF, piemēram, BoQ, skaidrojošajiem aprakstiem "
+        "un specifikācijām, rīks automātiski izmanto ātro saglabāšanas režīmu. "
+        "Rasējumiem paliek pilnā PDF optimizācija."
+    )
     result_folders = st.session_state.result_folders
     result_path = st.selectbox("Drive rezultātu mape", [x["path"] for x in result_folders])
     result_folder = next(x for x in result_folders if x["path"] == result_path)
@@ -1030,10 +1091,15 @@ if root:
                         work.at[row_index, "Annotation_Status"] = "file_not_found"
                     continue
                 pdf_bytes = download_drive_file_bytes(service, pdf_item["id"])
-                annotated, statuses = annotate_pdf(pdf_bytes, group)
+                annotated, statuses, save_diagnostics = annotate_pdf(pdf_bytes, group, pdf_item["name"])
                 for row_index, status in statuses.items():
                     work.at[row_index, "Annotation_Status"] = status
                 outputs[marked_name(pdf_item["name"])] = annotated
+                save_mode_label = (
+                    "ātrais teksta PDF režīms"
+                    if save_diagnostics["mode"] == "fast_text_document"
+                    else "standarta rasējumu režīms"
+                )
                 progress.progress(idx / max(len(grouped), 1), text=f"Apstrādāts {idx}. no {len(grouped)} PDF.")
             for row_index, row in work.iterrows():
                 if not row["Annotation_Status"] and row["_validation_status"] != "ok":
