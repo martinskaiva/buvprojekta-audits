@@ -21,7 +21,7 @@ from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
 
 APP_NAME = "BP audita PDF Markup"
-APP_VERSION = "2.2.2"
+APP_VERSION = "2.2.3"
 FOLDER_MIME_TYPE = "application/vnd.google-apps.folder"
 PDF_MIME_TYPE = "application/pdf"
 XLSX_MIME_TYPE = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
@@ -30,6 +30,7 @@ RESULTS_FOLDER_NAME = "02_Results"
 MEMORY_FOLDER_NAME = "03_Memory"
 CONFIG_FOLDER_NAME = "04_Config"
 PROJECT_CHAT_LINKS_FILENAME = "project_chat_links.json"
+PACKAGE_ROOT_LABEL = "Dokumentu komplekta sakne"
 EXCEL_SHEET_NAME = "Audit"
 YELLOW = (1.0, 1.0, 0.0)
 
@@ -1084,17 +1085,46 @@ if root:
     else:
         package_name, package = project_name, project
     discipline_folders = cached_folders_recursive(package["id"])
-    if not discipline_folders:
-        st.warning("Izvēlētajā komplektā nav mapju ar PDF dokumentiem.")
+
+    root_pdf_rows = [
+        {
+            **item,
+            "path": f"{PACKAGE_ROOT_LABEL}/{item['name']}",
+        }
+        for item in cached_child_items(package["id"])
+        if item.get("mimeType") == PDF_MIME_TYPE
+    ]
+
+    selectable_folders: list[dict[str, Any]] = []
+    if root_pdf_rows:
+        selectable_folders.append(
+            {
+                "id": package["id"],
+                "name": PACKAGE_ROOT_LABEL,
+                "path": PACKAGE_ROOT_LABEL,
+                "is_virtual_root": True,
+            }
+        )
+    selectable_folders.extend(discipline_folders)
+
+    if not selectable_folders:
+        st.warning(
+            "Izvēlētajā komplektā nav ne apakšmapju, ne PDF failu "
+            "dokumentu komplekta saknē."
+        )
         st.stop()
 
     st.markdown("### Mapes")
-    st.caption("Atzīmē vienu vai vairākas mapes. Pilnais mapes ceļš redzams katrā rindā.")
+    st.caption(
+        "Atzīmē vienu vai vairākas mapes. Ja PDF atrodas tieši dokumentu "
+        "komplekta mapē, izvēlies “Dokumentu komplekta sakne”."
+    )
 
     selected_folder_rows: list[dict[str, Any]] = []
     folder_key_prefix = f"source_folder_{project['id']}_{package['id']}"
-    for folder in discipline_folders:
-        folder_key = f"{folder_key_prefix}_{folder['id']}"
+    for folder in selectable_folders:
+        virtual_suffix = "_root" if folder.get("is_virtual_root") else ""
+        folder_key = f"{folder_key_prefix}_{folder['id']}{virtual_suffix}"
         if st.checkbox(folder["path"], key=folder_key, value=False):
             selected_folder_rows.append(folder)
 
@@ -1103,11 +1133,15 @@ if root:
         selected_pdfs = []
         discipline_name = "Vairākas_mapes"
     else:
-        # Savāc PDF no katras izvēlētās mapes. Ja atzīmēts arī vecāks un bērna
-        # folderis, vienu un to pašu failu sarakstā iekļauj tikai vienu reizi.
         pdf_by_id: dict[str, dict[str, Any]] = {}
         for folder in selected_folder_rows:
-            folder_pdfs = cached_pdfs_recursive(folder["id"], folder["path"])
+            if folder.get("is_virtual_root"):
+                folder_pdfs = root_pdf_rows
+            else:
+                folder_pdfs = cached_pdfs_recursive(
+                    folder["id"],
+                    folder["path"],
+                )
             for pdf_item in folder_pdfs:
                 pdf_by_id[pdf_item["id"]] = pdf_item
 
