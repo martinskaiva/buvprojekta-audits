@@ -21,7 +21,7 @@ from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
 
 APP_NAME = "BP audita PDF Markup"
-APP_VERSION = "2.2.4"
+APP_VERSION = "2.2.5"
 FOLDER_MIME_TYPE = "application/vnd.google-apps.folder"
 PDF_MIME_TYPE = "application/pdf"
 XLSX_MIME_TYPE = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
@@ -629,6 +629,11 @@ def list_folders_recursive(service, folder_id: str, parent_path: str = "") -> li
 @st.cache_data(ttl=300, show_spinner=False)
 def cached_child_folders(parent_id: str) -> list[dict[str, Any]]:
     return child_folders(get_drive_service(), parent_id)
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def cached_list_folder_items(folder_id: str) -> list[dict[str, Any]]:
+    return list_folder_items(get_drive_service(), folder_id)
 
 
 @st.cache_data(ttl=300, show_spinner=False)
