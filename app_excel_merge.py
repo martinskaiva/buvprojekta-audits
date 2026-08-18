@@ -11,39 +11,57 @@ from openpyxl.utils import get_column_letter
 
 
 EXPECTED_COLUMNS = [
-    "note_id",
-    "Nr",
-    "discipline",
-    "target_file",
-    "target_page",
-    "target_area",
-    "target_text",
-    "comment_text",
-    "issue_type",
-    "severity",
-    "comparison_files",
-    "comparison_pages",
-    "comparison_evidence",
-    "markup_type",
-    "placement_confidence",
-    "status",
+    "Audit_ID",
+    "Document_Filename",
+    "Document_Number",
+    "Page",
+    "Location",
+    "Category",
+    "Element_Code",
+    "Comment",
+    "Anchor_Text",
+    "Alternative_Anchor",
+    "Reference_Document_Filename",
+    "Reference_Document_Number",
+    "Reference_Page",
+    "Reference_Location",
+    "Reference_Evidence_Text",
+    "Annotation_Status",
 ]
 
-KEY_COLUMNS = ["note_id", "discipline", "target_file", "comment_text"]
-MIN_HEADER_MATCH = 6
+TEXT_COLUMNS = [
+    "Audit_ID",
+    "Document_Filename",
+    "Document_Number",
+    "Page",
+    "Location",
+    "Category",
+    "Element_Code",
+    "Comment",
+    "Anchor_Text",
+    "Alternative_Anchor",
+    "Reference_Document_Filename",
+    "Reference_Document_Number",
+    "Reference_Page",
+    "Reference_Location",
+    "Reference_Evidence_Text",
+    "Annotation_Status",
+]
+
+KEY_COLUMNS = ["Audit_ID", "Document_Filename", "Comment"]
+MIN_HEADER_MATCH = 10
+PREFERRED_SHEET = "Audit"
 
 st.set_page_config(page_title="Audit Excel apvienotājs", page_icon="📊", layout="wide")
 
 
 @st.cache_data(show_spinner=False)
 def read_workbook(file_bytes: bytes, filename: str) -> tuple[pd.DataFrame, dict]:
-    """Atrod visatbilstošāko datu šķirkli un normalizē to uz 16 kolonnu shēmu."""
+    """Atrod audita šķirkli un normalizē to uz kanonisko 16 kolonnu shēmu."""
     xls = pd.ExcelFile(BytesIO(file_bytes))
 
-    best_sheet = None
-    best_df = None
-    best_score = -1
     sheet_scores = []
+    parsed_sheets: dict[str, pd.DataFrame] = {}
 
     for sheet_name in xls.sheet_names:
         try:
@@ -53,38 +71,50 @@ def read_workbook(file_bytes: bytes, filename: str) -> tuple[pd.DataFrame, dict]
 
         df.columns = [str(c).strip() for c in df.columns]
         score = len(set(df.columns) & set(EXPECTED_COLUMNS))
+        parsed_sheets[sheet_name] = df
         sheet_scores.append((sheet_name, score))
 
-        if score > best_score:
-            best_score = score
-            best_sheet = sheet_name
-            best_df = df
+    if not parsed_sheets:
+        raise ValueError("Excel failā neizdevās nolasīt nevienu šķirkli.")
 
-    if best_df is None or best_score < MIN_HEADER_MATCH:
+    preferred_matches = [
+        name for name in parsed_sheets if name.strip().lower() == PREFERRED_SHEET.lower()
+    ]
+
+    if preferred_matches:
+        best_sheet = preferred_matches[0]
+        best_df = parsed_sheets[best_sheet]
+        best_score = len(set(best_df.columns) & set(EXPECTED_COLUMNS))
+    else:
+        best_sheet, best_score = max(sheet_scores, key=lambda item: item[1])
+        best_df = parsed_sheets[best_sheet]
+
+    if best_score < MIN_HEADER_MATCH:
         raise ValueError(
-            f"Neizdevās atrast audita datu šķirkli. Labākais kolonnu sakritību skaits: {max(best_score, 0)}/16."
+            f"Neizdevās atrast atbilstošu audita datu šķirkli. Labākais kolonnu sakritību skaits: {best_score}/16."
         )
 
-    original_columns = list(best_df.columns)
     missing_columns = [c for c in EXPECTED_COLUMNS if c not in best_df.columns]
     extra_columns = [c for c in best_df.columns if c not in EXPECTED_COLUMNS]
 
-    # Trūkstošās kolonnas izveido tukšas; liekās kolonnas gala failā neiekļauj.
     for col in missing_columns:
         best_df[col] = None
 
     normalized = best_df[EXPECTED_COLUMNS].copy()
-
-    # Noņem pilnībā tukšās rindas un rindas, kurās nav neviena praktiski nozīmīga lauka.
     normalized = normalized.dropna(how="all")
-    existing_keys = [c for c in KEY_COLUMNS if c in normalized.columns]
-    if existing_keys:
-        meaningful_mask = normalized[existing_keys].apply(
-            lambda row: any(pd.notna(v) and str(v).strip() != "" for v in row), axis=1
-        )
-        normalized = normalized.loc[meaningful_mask]
 
-    normalized = normalized.reset_index(drop=True)
+    meaningful_mask = normalized[KEY_COLUMNS].apply(
+        lambda row: any(pd.notna(v) and str(v).strip() != "" for v in row), axis=1
+    )
+    normalized = normalized.loc[meaningful_mask].reset_index(drop=True)
+
+    # Saglabā lapu numurus un citus laukus kā tekstu, lai nezaudētu vērtības kā "13; 18" vai "2–4".
+    for col in TEXT_COLUMNS:
+        normalized[col] = normalized[col].apply(
+            lambda value: "" if pd.isna(value) else str(value).strip()
+        )
+
+    ignored_sheets = [name for name in xls.sheet_names if name != best_sheet]
 
     info = {
         "filename": filename,
@@ -93,35 +123,37 @@ def read_workbook(file_bytes: bytes, filename: str) -> tuple[pd.DataFrame, dict]
         "rows": len(normalized),
         "missing_columns": missing_columns,
         "extra_columns": extra_columns,
+        "ignored_sheets": ignored_sheets,
         "sheet_scores": sheet_scores,
-        "original_columns": original_columns,
     }
     return normalized, info
 
 
-def combine_frames(frames: Iterable[pd.DataFrame], renumber: bool) -> pd.DataFrame:
+def combine_frames(frames: Iterable[pd.DataFrame]) -> pd.DataFrame:
     frames = list(frames)
     if not frames:
         return pd.DataFrame(columns=EXPECTED_COLUMNS)
 
     combined = pd.concat(frames, ignore_index=True)
-    combined = combined[EXPECTED_COLUMNS]
+    return combined[EXPECTED_COLUMNS]
 
-    if renumber:
-        combined["Nr"] = range(1, len(combined) + 1)
 
-    return combined
+def duplicate_audit_ids(df: pd.DataFrame) -> pd.DataFrame:
+    ids = df["Audit_ID"].astype("string").str.strip()
+    valid = ids.notna() & (ids != "")
+    duplicated_mask = valid & ids.duplicated(keep=False)
+    return df.loc[duplicated_mask].copy()
 
 
 def build_excel(df: pd.DataFrame) -> bytes:
     output = BytesIO()
 
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        df.to_excel(writer, sheet_name="Combined_Audit", index=False)
+        df.to_excel(writer, sheet_name="Audit", index=False)
 
     output.seek(0)
     wb = load_workbook(output)
-    ws = wb["Combined_Audit"]
+    ws = wb["Audit"]
 
     header_fill = PatternFill("solid", fgColor="1F4E78")
     header_font = Font(color="FFFFFF", bold=True)
@@ -136,26 +168,26 @@ def build_excel(df: pd.DataFrame) -> bytes:
     ws.row_dimensions[1].height = 32
 
     widths = {
-        "note_id": 18,
-        "Nr": 8,
-        "discipline": 14,
-        "target_file": 48,
-        "target_page": 12,
-        "target_area": 34,
-        "target_text": 42,
-        "comment_text": 60,
-        "issue_type": 30,
-        "severity": 14,
-        "comparison_files": 55,
-        "comparison_pages": 35,
-        "comparison_evidence": 65,
-        "markup_type": 16,
-        "placement_confidence": 22,
-        "status": 22,
+        "Audit_ID": 18,
+        "Document_Filename": 52,
+        "Document_Number": 30,
+        "Page": 14,
+        "Location": 40,
+        "Category": 24,
+        "Element_Code": 20,
+        "Comment": 68,
+        "Anchor_Text": 48,
+        "Alternative_Anchor": 48,
+        "Reference_Document_Filename": 52,
+        "Reference_Document_Number": 32,
+        "Reference_Page": 20,
+        "Reference_Location": 40,
+        "Reference_Evidence_Text": 68,
+        "Annotation_Status": 22,
     }
 
     for idx, col_name in enumerate(EXPECTED_COLUMNS, start=1):
-        ws.column_dimensions[get_column_letter(idx)].width = widths.get(col_name, 20)
+        ws.column_dimensions[get_column_letter(idx)].width = widths.get(col_name, 24)
 
     for row in ws.iter_rows(min_row=2):
         for cell in row:
@@ -172,21 +204,15 @@ def format_list(values: list[str]) -> str:
 
 
 st.title("📊 Audit Excel apvienotājs")
-st.caption("Apvieno vairākus audita Excel failus vienā failā ar vienotu 16 kolonnu struktūru.")
+st.caption("Apvieno vairākus audita Excel failus vienā failā ar Kywatrace kanonisko 16 kolonnu struktūru.")
 
-with st.expander("Gala 16 kolonnu struktūra", expanded=False):
+with st.expander("Kanoniskā 16 kolonnu struktūra", expanded=False):
     st.code(" | ".join(EXPECTED_COLUMNS), language=None)
 
 uploaded_files = st.file_uploader(
     "Augšupielādē vienu vai vairākus Excel failus",
     type=["xlsx", "xlsm"],
     accept_multiple_files=True,
-)
-
-renumber = st.checkbox(
-    "Pārrēķināt Nr. kolonnu secīgi visam apvienotajam failam",
-    value=True,
-    help="note_id netiek mainīts; tikai Nr. tiek izveidots 1, 2, 3... pēc failu apvienošanas.",
 )
 
 if uploaded_files:
@@ -213,28 +239,30 @@ if uploaded_files:
                     "Importētās rindas": info["rows"],
                     "Trūkstošās kolonnas": format_list(info["missing_columns"]),
                     "Ignorētās liekās kolonnas": format_list(info["extra_columns"]),
+                    "Ignorētie šķirkļi": format_list(info["ignored_sheets"]),
                 }
             )
 
         st.subheader("Failu pārbaude")
         st.dataframe(pd.DataFrame(status_rows), use_container_width=True, hide_index=True)
 
-        combined = combine_frames(frames, renumber=renumber)
-
-        duplicate_note_ids = 0
-        if "note_id" in combined.columns:
-            note_ids = combined["note_id"].astype("string").str.strip()
-            duplicate_note_ids = int(note_ids[note_ids.notna() & (note_ids != "")].duplicated().sum())
+        combined = combine_frames(frames)
+        duplicates = duplicate_audit_ids(combined)
 
         c1, c2, c3 = st.columns(3)
         c1.metric("Apvienotie faili", len(infos))
         c2.metric("Gala rindas", len(combined))
-        c3.metric("Dublēti note_id", duplicate_note_ids)
+        c3.metric("Dublēti Audit_ID", len(duplicates))
 
-        if duplicate_note_ids:
+        if not duplicates.empty:
+            duplicate_id_count = duplicates["Audit_ID"].nunique()
             st.warning(
-                "Apvienotajā failā ir dublēti note_id. Rīks tos automātiski nepārraksta, jo note_id var būt sasaistīts ar citiem procesiem."
+                f"Atrasti {duplicate_id_count} dublēti Audit_ID. Rīks tos automātiski nepārraksta, lai nesalauztu sasaistes ar citiem procesiem."
             )
+            with st.expander("Parādīt dublētās rindas"):
+                st.dataframe(duplicates, use_container_width=True, hide_index=True)
+        else:
+            st.success("Audit_ID dublikāti nav atrasti.")
 
         st.subheader("Priekšskatījums")
         st.dataframe(combined.head(100), use_container_width=True, hide_index=True)
@@ -252,4 +280,4 @@ if uploaded_files:
         st.error("Daļu failu neizdevās importēt.")
         st.dataframe(pd.DataFrame(errors), use_container_width=True, hide_index=True)
 else:
-    st.info("Ieliec Excel failus, un rīks automātiski atradīs audita datu šķirkli katrā failā.")
+    st.info("Ieliec Excel failus. Ja failā ir šķirklis 'Audit', rīks izmantos to un ignorēs pārējos šķirkļus.")
