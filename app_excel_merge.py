@@ -47,13 +47,9 @@ KEY_COLUMNS = ["Audit_ID", "Document_Filename", "Comment"]
 MIN_SCHEMA_MATCH = 8
 PREFERRED_CANONICAL_SHEET = "Audit"
 
-# Audit_ID un Annotation_Status nav satura identitātes daļa.
-CONTENT_DUPLICATE_COLUMNS = [
-    "Document_Filename", "Document_Number", "Page", "Location", "Category",
-    "Element_Code", "Comment", "Anchor_Text", "Alternative_Anchor",
-    "Reference_Document_Filename", "Reference_Document_Number", "Reference_Page",
-    "Reference_Location", "Reference_Evidence_Text",
-]
+# GOLD piemēru bibliotēkai konkrētais rasējums, lapa, vieta un anchor nav piezīmes identitāte.
+# Par vienādu piemēru uzskatām vienādu kategoriju + vienādu piezīmes tekstu.
+CONTENT_DUPLICATE_COLUMNS = ["Category", "Comment"]
 
 st.set_page_config(page_title="Audit Excel apvienotājs", page_icon="📊", layout="wide")
 
@@ -236,7 +232,7 @@ def source_comparison(group: pd.DataFrame) -> pd.DataFrame:
         rows.append({
             "Avota Excel": source,
             "Piezīmju rindas": source_rows[source],
-            "Unikālas piezīmes avotā": len(own),
+            "Unikāli GOLD piemēri avotā": len(own),
             "Sakrīt ar citu avotu": len(own & other_union),
             "Tikai šajā avotā": len(own - other_union),
         })
@@ -331,7 +327,7 @@ def format_list(values: list[str]) -> str:
 
 
 st.title("📊 Audit Excel apvienotājs")
-st.caption("Apvieno GOLD audita Excel un vecos C2-3 tipa audita failus vienā Kywatrace 16 kolonnu Audit failā.")
+st.caption("Apvieno audita Excel vienā 16 kolonnu GOLD piemēru bibliotēkā nākamajiem Kywatrace auditiem.")
 
 with st.expander("Kanoniskā 16 kolonnu struktūra", expanded=False):
     st.code(" | ".join(CANONICAL_COLUMNS), language=None)
@@ -383,18 +379,18 @@ if uploaded_files:
         c1.metric("Apvienotie faili", len(infos))
         c2.metric("Importētās rindas", len(combined_raw))
         c3.metric("Audit_ID sadursmju rindas", len(id_collisions))
-        c4.metric("Satura dublikātu rindas", len(initial_duplicates))
+        c4.metric("Atkārtotu GOLD piemēru rindas", len(initial_duplicates))
 
         st.caption(
-            "Audit_ID sadursme nozīmē tikai to, ka dažādos avota Excel izmantots vienāds ID; "
-            "tā pati par sevi nav satura dublikāts."
+            "GOLD dublikāts tiek noteikts pēc kategorijas un piezīmes teksta. "
+            "Konkrētais PDF, lapa, vieta, elementa kods un anchor dublikātu noteikšanā netiek ņemti vērā."
         )
 
         source_choices: dict[str, str] = {}
         if repeated_groups:
             st.warning(
                 f"Atrasti {len(repeated_groups)} PDF dokumenti, kuru piezīmes ir vairākos augšupielādētajos Excel failos. "
-                "Katram dokumentam zemāk vari izvēlēties, kuru avotu izmantot."
+                "Avotu izvēle nav obligāta — atkārtoti GOLD piemēri tāpat tiks noņemti automātiski."
             )
             st.subheader("Atkārtoto dokumentu avotu salīdzinājums")
 
@@ -414,36 +410,15 @@ if uploaded_files:
                     source_choices[doc_key] = choice
 
                     selected_preview = group if choice == "Paturēt visus avotus" else group[group["_Source_Workbook"] == choice]
-                    st.caption(f"Ar šo izvēli no šī PDF gala failā paliks {len(selected_preview)} rindas.")
+                    st.caption(f"Ar šo izvēli no šī PDF pirms GOLD dublikātu noņemšanas paliks {len(selected_preview)} rindas.")
 
         selected_df = apply_document_source_choices(combined_raw, source_choices)
-        after_selection_duplicates = content_duplicate_rows(selected_df)
         removed_by_source_selection = len(combined_raw) - len(selected_df)
 
-        if repeated_groups:
-            s1, s2, s3 = st.columns(3)
-            s1.metric("Rindas pēc avotu izvēles", len(selected_df))
-            s2.metric("Atmestas ar avotu izvēli", removed_by_source_selection)
-            s3.metric("Atlikušo satura dublikātu rindas", len(after_selection_duplicates))
-
-        if not after_selection_duplicates.empty:
-            duplicate_groups = len(after_selection_duplicates.drop_duplicates(subset=CONTENT_DUPLICATE_COLUMNS))
-            st.warning(
-                f"Pēc avotu izvēles vēl ir {len(after_selection_duplicates)} rindas, kas ietilpst "
-                f"{duplicate_groups} identisku piezīmju grupās."
-            )
-            with st.expander("Parādīt atlikušos satura dublikātus"):
-                display_cols = ["_Source_Workbook"] + CANONICAL_COLUMNS
-                st.dataframe(after_selection_duplicates[display_cols], use_container_width=True, hide_index=True)
-
-        remove_duplicates = st.checkbox(
-            "Gala failā noņemt identiskas satura piezīmes (paturēt pirmo)",
-            value=False,
-            help="Audit_ID un Annotation_Status netiek izmantoti satura dublikāta noteikšanai.",
-        )
-
-        final_df = remove_content_duplicates(selected_df) if remove_duplicates else selected_df.copy()
-        removed_duplicates = len(selected_df) - len(final_df)
+        # GOLD bibliotēkā dublikātus noņemam vienmēr un automātiski.
+        before_dedup_count = len(selected_df)
+        final_df = remove_content_duplicates(selected_df)
+        removed_duplicates = before_dedup_count - len(final_df)
 
         renumber_ids = st.checkbox(
             "Gala failam izveidot jaunus unikālus Audit_ID pēc dokumentiem",
@@ -453,20 +428,30 @@ if uploaded_files:
         if renumber_ids:
             final_df = assign_global_audit_ids(final_df)
 
+        st.success(
+            f"Automātiski noņemti {removed_duplicates} atkārtoti GOLD piemēri. "
+            f"Gala bibliotēkā paliek {len(final_df)} unikāli piemēri."
+        )
+
         m1, m2, m3, m4 = st.columns(4)
-        m1.metric("Gala rindas", len(final_df))
+        m1.metric("Gala GOLD piemēri", len(final_df))
         m2.metric("Atmestas ar avotu izvēli", removed_by_source_selection)
-        m3.metric("Noņemtie identiskie dublikāti", removed_duplicates)
+        m3.metric("Automātiski noņemtie dublikāti", removed_duplicates)
         m4.metric("PDF dokumenti", final_df["Document_Filename"].replace("", pd.NA).nunique())
+
+        if not initial_duplicates.empty:
+            with st.expander("Parādīt, kuras rindas tika atpazītas kā atkārtoti GOLD piemēri"):
+                display_cols = ["_Source_Workbook"] + CANONICAL_COLUMNS
+                st.dataframe(initial_duplicates[display_cols], use_container_width=True, hide_index=True)
 
         st.subheader("Priekšskatījums")
         st.dataframe(final_df[CANONICAL_COLUMNS].head(100), use_container_width=True, hide_index=True)
 
         excel_bytes = build_excel(final_df)
         st.download_button(
-            "⬇️ Lejupielādēt apvienoto Excel",
+            "⬇️ Lejupielādēt apvienoto GOLD Excel",
             data=excel_bytes,
-            file_name="combined_audit_16_columns.xlsx",
+            file_name="combined_gold_audit_examples_16_columns.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             type="primary",
         )
@@ -475,4 +460,4 @@ if uploaded_files:
         st.error("Daļu failu neizdevās importēt.")
         st.dataframe(pd.DataFrame(errors), use_container_width=True, hide_index=True)
 else:
-    st.info("Vari vienlaikus likt gan GOLD failus, gan vecos C2-3 audita failus.")
+    st.info("Vari vienlaikus likt gan GOLD failus, gan vecos C2-3 audita failus. Atkārtoti piemēri tiks noņemti automātiski.")
