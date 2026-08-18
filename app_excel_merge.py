@@ -10,7 +10,7 @@ from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 
 
-EXPECTED_COLUMNS = [
+CANONICAL_COLUMNS = [
     "Audit_ID",
     "Document_Filename",
     "Document_Number",
@@ -29,40 +29,98 @@ EXPECTED_COLUMNS = [
     "Annotation_Status",
 ]
 
-TEXT_COLUMNS = [
-    "Audit_ID",
-    "Document_Filename",
-    "Document_Number",
-    "Page",
-    "Location",
-    "Category",
-    "Element_Code",
-    "Comment",
-    "Anchor_Text",
-    "Alternative_Anchor",
-    "Reference_Document_Filename",
-    "Reference_Document_Number",
-    "Reference_Page",
-    "Reference_Location",
-    "Reference_Evidence_Text",
-    "Annotation_Status",
+LEGACY_COLUMNS = [
+    "note_id",
+    "Nr",
+    "discipline",
+    "target_file",
+    "target_page",
+    "target_area",
+    "target_text",
+    "comment_text",
+    "issue_type",
+    "severity",
+    "comparison_files",
+    "comparison_pages",
+    "comparison_evidence",
+    "markup_type",
+    "placement_confidence",
+    "status",
+]
+
+LEGACY_TO_CANONICAL = {
+    "Audit_ID": "note_id",
+    "Document_Filename": "target_file",
+    "Document_Number": None,
+    "Page": "target_page",
+    "Location": "target_area",
+    "Category": "issue_type",
+    "Element_Code": None,
+    "Comment": "comment_text",
+    "Anchor_Text": "target_text",
+    "Alternative_Anchor": None,
+    "Reference_Document_Filename": "comparison_files",
+    "Reference_Document_Number": None,
+    "Reference_Page": "comparison_pages",
+    "Reference_Location": None,
+    "Reference_Evidence_Text": "comparison_evidence",
+    "Annotation_Status": "status",
+}
+
+LEGACY_UNUSED_COLUMNS = [
+    "Nr",
+    "discipline",
+    "severity",
+    "markup_type",
+    "placement_confidence",
 ]
 
 KEY_COLUMNS = ["Audit_ID", "Document_Filename", "Comment"]
-MIN_HEADER_MATCH = 10
-PREFERRED_SHEET = "Audit"
+MIN_SCHEMA_MATCH = 8
+PREFERRED_CANONICAL_SHEET = "Audit"
 
 st.set_page_config(page_title="Audit Excel apvienotājs", page_icon="📊", layout="wide")
 
 
+def clean_text(value) -> str:
+    if pd.isna(value):
+        return ""
+    return str(value).strip()
+
+
+def normalize_canonical(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str], list[str]]:
+    missing = [c for c in CANONICAL_COLUMNS if c not in df.columns]
+    extra = [c for c in df.columns if c not in CANONICAL_COLUMNS]
+
+    work = df.copy()
+    for col in missing:
+        work[col] = ""
+
+    normalized = work[CANONICAL_COLUMNS].copy()
+    return normalized, missing, extra
+
+
+def convert_legacy(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str], list[str]]:
+    missing_source = [c for c in LEGACY_COLUMNS if c not in df.columns]
+    extra_source = [c for c in df.columns if c not in LEGACY_COLUMNS]
+
+    converted = pd.DataFrame(index=df.index)
+    for canonical_col in CANONICAL_COLUMNS:
+        legacy_col = LEGACY_TO_CANONICAL[canonical_col]
+        if legacy_col and legacy_col in df.columns:
+            converted[canonical_col] = df[legacy_col]
+        else:
+            converted[canonical_col] = ""
+
+    return converted, missing_source, extra_source
+
+
 @st.cache_data(show_spinner=False)
 def read_workbook(file_bytes: bytes, filename: str) -> tuple[pd.DataFrame, dict]:
-    """Atrod audita šķirkli un normalizē to uz kanonisko 16 kolonnu shēmu."""
+    """Atpazīst GOLD vai veco C2-3 shēmu un atgriež vienotu 16 kolonnu Audit struktūru."""
     xls = pd.ExcelFile(BytesIO(file_bytes))
 
-    sheet_scores = []
-    parsed_sheets: dict[str, pd.DataFrame] = {}
-
+    candidates = []
     for sheet_name in xls.sheet_names:
         try:
             df = pd.read_excel(xls, sheet_name=sheet_name, dtype=object)
@@ -70,61 +128,83 @@ def read_workbook(file_bytes: bytes, filename: str) -> tuple[pd.DataFrame, dict]
             continue
 
         df.columns = [str(c).strip() for c in df.columns]
-        score = len(set(df.columns) & set(EXPECTED_COLUMNS))
-        parsed_sheets[sheet_name] = df
-        sheet_scores.append((sheet_name, score))
+        canonical_score = len(set(df.columns) & set(CANONICAL_COLUMNS))
+        legacy_score = len(set(df.columns) & set(LEGACY_COLUMNS))
 
-    if not parsed_sheets:
-        raise ValueError("Excel failā neizdevās nolasīt nevienu šķirkli.")
-
-    preferred_matches = [
-        name for name in parsed_sheets if name.strip().lower() == PREFERRED_SHEET.lower()
-    ]
-
-    if preferred_matches:
-        best_sheet = preferred_matches[0]
-        best_df = parsed_sheets[best_sheet]
-        best_score = len(set(best_df.columns) & set(EXPECTED_COLUMNS))
-    else:
-        best_sheet, best_score = max(sheet_scores, key=lambda item: item[1])
-        best_df = parsed_sheets[best_sheet]
-
-    if best_score < MIN_HEADER_MATCH:
-        raise ValueError(
-            f"Neizdevās atrast atbilstošu audita datu šķirkli. Labākais kolonnu sakritību skaits: {best_score}/16."
+        candidates.append(
+            {
+                "sheet": sheet_name,
+                "df": df,
+                "canonical_score": canonical_score,
+                "legacy_score": legacy_score,
+            }
         )
 
-    missing_columns = [c for c in EXPECTED_COLUMNS if c not in best_df.columns]
-    extra_columns = [c for c in best_df.columns if c not in EXPECTED_COLUMNS]
+    if not candidates:
+        raise ValueError("Excel failā neizdevās nolasīt nevienu šķirkli.")
 
-    for col in missing_columns:
-        best_df[col] = None
+    preferred = [
+        c
+        for c in candidates
+        if c["sheet"].strip().lower() == PREFERRED_CANONICAL_SHEET.lower()
+        and c["canonical_score"] >= MIN_SCHEMA_MATCH
+    ]
 
-    normalized = best_df[EXPECTED_COLUMNS].copy()
+    if preferred:
+        selected = max(preferred, key=lambda c: c["canonical_score"])
+        schema = "GOLD / kanoniskā"
+        normalized, missing, extra = normalize_canonical(selected["df"])
+        schema_score = selected["canonical_score"]
+        source_column_count = len(CANONICAL_COLUMNS)
+        unused_legacy = []
+    else:
+        selected = max(
+            candidates,
+            key=lambda c: max(c["canonical_score"], c["legacy_score"]),
+        )
+
+        if selected["canonical_score"] >= selected["legacy_score"] and selected["canonical_score"] >= MIN_SCHEMA_MATCH:
+            schema = "GOLD / kanoniskā"
+            normalized, missing, extra = normalize_canonical(selected["df"])
+            schema_score = selected["canonical_score"]
+            source_column_count = len(CANONICAL_COLUMNS)
+            unused_legacy = []
+        elif selected["legacy_score"] >= MIN_SCHEMA_MATCH:
+            schema = "Vecā C2-3 → pārveidota"
+            normalized, missing, extra = convert_legacy(selected["df"])
+            schema_score = selected["legacy_score"]
+            source_column_count = len(LEGACY_COLUMNS)
+            unused_legacy = [c for c in LEGACY_UNUSED_COLUMNS if c in selected["df"].columns]
+        else:
+            raise ValueError(
+                "Neizdevās atpazīt ne GOLD, ne veco C2-3 audita struktūru. "
+                f"Labākā GOLD sakritība: {selected['canonical_score']}/16; "
+                f"labākā C2-3 sakritība: {selected['legacy_score']}/16."
+            )
+
     normalized = normalized.dropna(how="all")
 
+    for col in CANONICAL_COLUMNS:
+        normalized[col] = normalized[col].apply(clean_text)
+
     meaningful_mask = normalized[KEY_COLUMNS].apply(
-        lambda row: any(pd.notna(v) and str(v).strip() != "" for v in row), axis=1
+        lambda row: any(str(v).strip() != "" for v in row), axis=1
     )
     normalized = normalized.loc[meaningful_mask].reset_index(drop=True)
 
-    # Saglabā lapu numurus un citus laukus kā tekstu, lai nezaudētu vērtības kā "13; 18" vai "2–4".
-    for col in TEXT_COLUMNS:
-        normalized[col] = normalized[col].apply(
-            lambda value: "" if pd.isna(value) else str(value).strip()
-        )
-
-    ignored_sheets = [name for name in xls.sheet_names if name != best_sheet]
+    ignored_sheets = [name for name in xls.sheet_names if name != selected["sheet"]]
 
     info = {
         "filename": filename,
-        "sheet": best_sheet,
-        "header_match": best_score,
+        "sheet": selected["sheet"],
+        "schema": schema,
+        "schema_score": schema_score,
+        "source_column_count": source_column_count,
         "rows": len(normalized),
-        "missing_columns": missing_columns,
-        "extra_columns": extra_columns,
+        "missing_columns": missing,
+        "extra_columns": extra,
+        "unused_legacy_columns": unused_legacy,
         "ignored_sheets": ignored_sheets,
-        "sheet_scores": sheet_scores,
     }
     return normalized, info
 
@@ -132,10 +212,10 @@ def read_workbook(file_bytes: bytes, filename: str) -> tuple[pd.DataFrame, dict]
 def combine_frames(frames: Iterable[pd.DataFrame]) -> pd.DataFrame:
     frames = list(frames)
     if not frames:
-        return pd.DataFrame(columns=EXPECTED_COLUMNS)
+        return pd.DataFrame(columns=CANONICAL_COLUMNS)
 
     combined = pd.concat(frames, ignore_index=True)
-    return combined[EXPECTED_COLUMNS]
+    return combined[CANONICAL_COLUMNS]
 
 
 def duplicate_audit_ids(df: pd.DataFrame) -> pd.DataFrame:
@@ -186,7 +266,7 @@ def build_excel(df: pd.DataFrame) -> bytes:
         "Annotation_Status": 22,
     }
 
-    for idx, col_name in enumerate(EXPECTED_COLUMNS, start=1):
+    for idx, col_name in enumerate(CANONICAL_COLUMNS, start=1):
         ws.column_dimensions[get_column_letter(idx)].width = widths.get(col_name, 24)
 
     for row in ws.iter_rows(min_row=2):
@@ -204,10 +284,12 @@ def format_list(values: list[str]) -> str:
 
 
 st.title("📊 Audit Excel apvienotājs")
-st.caption("Apvieno vairākus audita Excel failus vienā failā ar Kywatrace kanonisko 16 kolonnu struktūru.")
+st.caption(
+    "Apvieno GOLD audita Excel un vecos C2-3 tipa audita failus vienā Kywatrace 16 kolonnu Audit failā."
+)
 
 with st.expander("Kanoniskā 16 kolonnu struktūra", expanded=False):
-    st.code(" | ".join(EXPECTED_COLUMNS), language=None)
+    st.code(" | ".join(CANONICAL_COLUMNS), language=None)
 
 uploaded_files = st.file_uploader(
     "Augšupielādē vienu vai vairākus Excel failus",
@@ -235,10 +317,11 @@ if uploaded_files:
                 {
                     "Fails": info["filename"],
                     "Izmantotais šķirklis": info["sheet"],
-                    "Kolonnu sakritība": f'{info["header_match"]}/16',
+                    "Atpazītais formāts": info["schema"],
+                    "Shēmas sakritība": f'{info["schema_score"]}/{info["source_column_count"]}',
                     "Importētās rindas": info["rows"],
-                    "Trūkstošās kolonnas": format_list(info["missing_columns"]),
-                    "Ignorētās liekās kolonnas": format_list(info["extra_columns"]),
+                    "Trūkstošie avota lauki": format_list(info["missing_columns"]),
+                    "Neizmantotie vecās shēmas lauki": format_list(info["unused_legacy_columns"]),
                     "Ignorētie šķirkļi": format_list(info["ignored_sheets"]),
                 }
             )
@@ -246,18 +329,26 @@ if uploaded_files:
         st.subheader("Failu pārbaude")
         st.dataframe(pd.DataFrame(status_rows), use_container_width=True, hide_index=True)
 
+        converted_count = sum(info["schema"].startswith("Vecā C2-3") for info in infos)
+        if converted_count:
+            st.info(
+                f"{converted_count} faili automātiski pārveidoti no vecās C2-3 shēmas uz GOLD 16 kolonnu struktūru."
+            )
+
         combined = combine_frames(frames)
         duplicates = duplicate_audit_ids(combined)
 
-        c1, c2, c3 = st.columns(3)
+        c1, c2, c3, c4 = st.columns(4)
         c1.metric("Apvienotie faili", len(infos))
-        c2.metric("Gala rindas", len(combined))
-        c3.metric("Dublēti Audit_ID", len(duplicates))
+        c2.metric("Pārveidoti C2-3 faili", converted_count)
+        c3.metric("Gala rindas", len(combined))
+        c4.metric("Dublētu Audit_ID rindas", len(duplicates))
 
         if not duplicates.empty:
             duplicate_id_count = duplicates["Audit_ID"].nunique()
             st.warning(
-                f"Atrasti {duplicate_id_count} dublēti Audit_ID. Rīks tos automātiski nepārraksta, lai nesalauztu sasaistes ar citiem procesiem."
+                f"Atrasti {duplicate_id_count} Audit_ID, kas atkārtojas vairākos ierakstos. "
+                "Rīks tos automātiski nepārraksta."
             )
             with st.expander("Parādīt dublētās rindas"):
                 st.dataframe(duplicates, use_container_width=True, hide_index=True)
@@ -280,4 +371,6 @@ if uploaded_files:
         st.error("Daļu failu neizdevās importēt.")
         st.dataframe(pd.DataFrame(errors), use_container_width=True, hide_index=True)
 else:
-    st.info("Ieliec Excel failus. Ja failā ir šķirklis 'Audit', rīks izmantos to un ignorēs pārējos šķirkļus.")
+    st.info(
+        "Vari vienlaikus likt gan GOLD failus ar šķirkli 'Audit', gan vecos C2-3 audita failus ar note_id/target_file/comment_text struktūru."
+    )
