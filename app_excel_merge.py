@@ -79,6 +79,24 @@ KEY_COLUMNS = ["Audit_ID", "Document_Filename", "Comment"]
 MIN_SCHEMA_MATCH = 8
 PREFERRED_CANONICAL_SHEET = "Audit"
 
+# Audit_ID un Annotation_Status nav daļa no satura identitātes.
+CONTENT_DUPLICATE_COLUMNS = [
+    "Document_Filename",
+    "Document_Number",
+    "Page",
+    "Location",
+    "Category",
+    "Element_Code",
+    "Comment",
+    "Anchor_Text",
+    "Alternative_Anchor",
+    "Reference_Document_Filename",
+    "Reference_Document_Number",
+    "Reference_Page",
+    "Reference_Location",
+    "Reference_Evidence_Text",
+]
+
 st.set_page_config(page_title="Audit Excel apvienotājs", page_icon="📊", layout="wide")
 
 
@@ -86,6 +104,10 @@ def clean_text(value) -> str:
     if pd.isna(value):
         return ""
     return str(value).strip()
+
+
+def normalized_key(value) -> str:
+    return " ".join(clean_text(value).lower().split())
 
 
 def normalize_canonical(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str], list[str]]:
@@ -192,6 +214,9 @@ def read_workbook(file_bytes: bytes, filename: str) -> tuple[pd.DataFrame, dict]
     )
     normalized = normalized.loc[meaningful_mask].reset_index(drop=True)
 
+    # Iekšējs lauks diagnostikai; gala 16 kolonnu Excel tas netiek eksportēts.
+    normalized["_Source_Workbook"] = filename
+
     ignored_sheets = [name for name in xls.sheet_names if name != selected["sheet"]]
 
     info = {
@@ -212,24 +237,99 @@ def read_workbook(file_bytes: bytes, filename: str) -> tuple[pd.DataFrame, dict]
 def combine_frames(frames: Iterable[pd.DataFrame]) -> pd.DataFrame:
     frames = list(frames)
     if not frames:
-        return pd.DataFrame(columns=CANONICAL_COLUMNS)
+        return pd.DataFrame(columns=CANONICAL_COLUMNS + ["_Source_Workbook"])
 
-    combined = pd.concat(frames, ignore_index=True)
-    return combined[CANONICAL_COLUMNS]
+    return pd.concat(frames, ignore_index=True)
 
 
-def duplicate_audit_ids(df: pd.DataFrame) -> pd.DataFrame:
+def audit_id_collision_rows(df: pd.DataFrame) -> pd.DataFrame:
     ids = df["Audit_ID"].astype("string").str.strip()
     valid = ids.notna() & (ids != "")
-    duplicated_mask = valid & ids.duplicated(keep=False)
-    return df.loc[duplicated_mask].copy()
+    mask = valid & ids.duplicated(keep=False)
+    return df.loc[mask].copy()
+
+
+def content_duplicate_rows(df: pd.DataFrame) -> pd.DataFrame:
+    work = df.copy()
+    key_columns = []
+
+    for col in CONTENT_DUPLICATE_COLUMNS:
+        key_col = f"__key_{col}"
+        work[key_col] = work[col].apply(normalized_key)
+        key_columns.append(key_col)
+
+    mask = work.duplicated(subset=key_columns, keep=False)
+    return df.loc[mask].copy()
+
+
+def remove_content_duplicates(df: pd.DataFrame) -> pd.DataFrame:
+    work = df.copy()
+    key_columns = []
+
+    for col in CONTENT_DUPLICATE_COLUMNS:
+        key_col = f"__key_{col}"
+        work[key_col] = work[col].apply(normalized_key)
+        key_columns.append(key_col)
+
+    keep_mask = ~work.duplicated(subset=key_columns, keep="first")
+    return df.loc[keep_mask].reset_index(drop=True)
+
+
+def overlapping_documents(df: pd.DataFrame) -> pd.DataFrame:
+    work = df.copy()
+    work["__doc_key"] = work["Document_Filename"].apply(normalized_key)
+    work = work[work["__doc_key"] != ""]
+
+    if work.empty:
+        return pd.DataFrame(columns=["Document_Filename", "Excel failu skaits", "Excel faili", "Piezīmju rindas"])
+
+    grouped = []
+    for _, group in work.groupby("__doc_key", sort=False):
+        sources = list(dict.fromkeys(group["_Source_Workbook"].tolist()))
+        if len(sources) > 1:
+            grouped.append(
+                {
+                    "Document_Filename": group.iloc[0]["Document_Filename"],
+                    "Excel failu skaits": len(sources),
+                    "Excel faili": " | ".join(sources),
+                    "Piezīmju rindas": len(group),
+                }
+            )
+
+    return pd.DataFrame(grouped)
+
+
+def assign_global_audit_ids(df: pd.DataFrame) -> pd.DataFrame:
+    """Izveido unikālus Audit_ID: dokumenta kārtas numurs.piezīmes kārtas numurs."""
+    work = df.copy().reset_index(drop=True)
+    document_numbers: dict[str, int] = {}
+    note_counts: dict[str, int] = {}
+    next_document_number = 1
+    new_ids = []
+
+    for row_index, row in work.iterrows():
+        filename = normalized_key(row["Document_Filename"])
+        document_number = normalized_key(row["Document_Number"])
+        doc_key = filename or document_number or f"__row_{row_index}"
+
+        if doc_key not in document_numbers:
+            document_numbers[doc_key] = next_document_number
+            note_counts[doc_key] = 0
+            next_document_number += 1
+
+        note_counts[doc_key] += 1
+        new_ids.append(f"{document_numbers[doc_key]}.{note_counts[doc_key]}")
+
+    work["Audit_ID"] = new_ids
+    return work
 
 
 def build_excel(df: pd.DataFrame) -> bytes:
+    export_df = df[CANONICAL_COLUMNS].copy()
     output = BytesIO()
 
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        df.to_excel(writer, sheet_name="Audit", index=False)
+        export_df.to_excel(writer, sheet_name="Audit", index=False)
 
     output.seek(0)
     wb = load_workbook(output)
@@ -335,30 +435,69 @@ if uploaded_files:
                 f"{converted_count} faili automātiski pārveidoti no vecās C2-3 shēmas uz GOLD 16 kolonnu struktūru."
             )
 
-        combined = combine_frames(frames)
-        duplicates = duplicate_audit_ids(combined)
+        combined_raw = combine_frames(frames)
+        id_collisions = audit_id_collision_rows(combined_raw)
+        content_duplicates = content_duplicate_rows(combined_raw)
+        overlaps = overlapping_documents(combined_raw)
 
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("Apvienotie faili", len(infos))
-        c2.metric("Pārveidoti C2-3 faili", converted_count)
-        c3.metric("Gala rindas", len(combined))
-        c4.metric("Dublētu Audit_ID rindas", len(duplicates))
+        c2.metric("Importētās rindas", len(combined_raw))
+        c3.metric("Audit_ID sadursmju rindas", len(id_collisions))
+        c4.metric("Satura dublikātu rindas", len(content_duplicates))
 
-        if not duplicates.empty:
-            duplicate_id_count = duplicates["Audit_ID"].nunique()
+        st.caption(
+            "Audit_ID sadursme nozīmē tikai to, ka dažādos avota Excel izmantots vienāds ID. "
+            "Tā pati par sevi NAV pierādījums, ka piezīme dublējas."
+        )
+
+        if not overlaps.empty:
             st.warning(
-                f"Atrasti {duplicate_id_count} Audit_ID, kas atkārtojas vairākos ierakstos. "
-                "Rīks tos automātiski nepārraksta."
+                f"Atrasti {len(overlaps)} PDF dokumenti, kuru piezīmes ir vairāk nekā vienā augšupielādētajā Excel failā. "
+                "Pārbaudi, vai nav ielikta gan sākotnējā, gan Corrected/Final versija."
             )
-            with st.expander("Parādīt dublētās rindas"):
-                st.dataframe(duplicates, use_container_width=True, hide_index=True)
-        else:
-            st.success("Audit_ID dublikāti nav atrasti.")
+            with st.expander("Parādīt dokumentus, kas atkārtojas vairākos Excel"):
+                st.dataframe(overlaps, use_container_width=True, hide_index=True)
+
+        if not content_duplicates.empty:
+            duplicate_groups = len(content_duplicates.drop_duplicates(subset=CONTENT_DUPLICATE_COLUMNS))
+            st.warning(
+                f"Atrastas {len(content_duplicates)} rindas, kas ietilpst {duplicate_groups} vienādu piezīmju grupās."
+            )
+            with st.expander("Parādīt satura dublikātus"):
+                display_cols = ["_Source_Workbook"] + CANONICAL_COLUMNS
+                st.dataframe(content_duplicates[display_cols], use_container_width=True, hide_index=True)
+
+        remove_duplicates = st.checkbox(
+            "Gala failā noņemt identiskas satura piezīmes (paturēt pirmo)",
+            value=False,
+            help=(
+                "Salīdzina dokumentu, lapu, vietu, kategoriju, komentāru, anchor un references laukus. "
+                "Audit_ID un Annotation_Status netiek izmantoti dublikāta noteikšanai."
+            ),
+        )
+
+        final_df = remove_content_duplicates(combined_raw) if remove_duplicates else combined_raw.copy()
+        removed_count = len(combined_raw) - len(final_df)
+
+        renumber_ids = st.checkbox(
+            "Gala failam izveidot jaunus unikālus Audit_ID pēc dokumentiem",
+            value=True,
+            help="Pirmajam dokumentam 1.1, 1.2..., nākamajam 2.1, 2.2... utt.",
+        )
+
+        if renumber_ids:
+            final_df = assign_global_audit_ids(final_df)
+
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Gala rindas", len(final_df))
+        m2.metric("Noņemtie satura dublikāti", removed_count)
+        m3.metric("PDF dokumenti", final_df["Document_Filename"].replace("", pd.NA).nunique())
 
         st.subheader("Priekšskatījums")
-        st.dataframe(combined.head(100), use_container_width=True, hide_index=True)
+        st.dataframe(final_df[CANONICAL_COLUMNS].head(100), use_container_width=True, hide_index=True)
 
-        excel_bytes = build_excel(combined)
+        excel_bytes = build_excel(final_df)
         st.download_button(
             "⬇️ Lejupielādēt apvienoto Excel",
             data=excel_bytes,
