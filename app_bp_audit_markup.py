@@ -20,7 +20,7 @@ from google_auth_oauthlib.flow import Flow
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
 
-APP_NAME = "BP audita PDF Markup"
+APP_NAME = "Kywatrace Markup"
 APP_VERSION = "2.2.5"
 FOLDER_MIME_TYPE = "application/vnd.google-apps.folder"
 PDF_MIME_TYPE = "application/pdf"
