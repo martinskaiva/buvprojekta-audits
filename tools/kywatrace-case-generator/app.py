@@ -1,10 +1,9 @@
-import base64
 import io
+import hashlib
 
-import numpy as np
 import streamlit as st
 from PIL import Image, ImageDraw, ImageFont, ImageFilter
-import streamlit_drawable_canvas as sdc
+from streamlit_cropper import st_cropper
 
 st.set_page_config(
     page_title="KywaTrace Case Example Generator",
@@ -19,7 +18,7 @@ st.markdown(
         div[data-testid="stToolbar"] {display: none;}
         #MainMenu {visibility: hidden;}
         footer {visibility: hidden;}
-        .block-container {padding-top: 1.4rem; padding-bottom: 2rem;}
+        .block-container {padding-top: 1.2rem; padding-bottom: 2rem;}
     </style>
     """,
     unsafe_allow_html=True,
@@ -88,96 +87,24 @@ def fit_image(img, target_w, target_h):
     return canvas
 
 
-def pil_to_data_uri(image: Image.Image) -> str:
-    image = image.copy()
-    if image.mode not in ("RGB", "RGBA"):
-        image = image.convert("RGBA")
-    buf = io.BytesIO()
-    image.save(buf, format="PNG")
-    encoded = base64.b64encode(buf.getvalue()).decode("utf-8")
-    return f"data:image/png;base64,{encoded}"
-
-
-def st_canvas_cloud(
-    fill_color="#eee",
-    stroke_width=20,
-    stroke_color="black",
-    background_color="",
-    background_image=None,
-    update_streamlit=True,
-    height=400,
-    width=600,
-    drawing_mode="freedraw",
-    initial_drawing=None,
-    display_toolbar=True,
-    point_display_radius=3,
-    key=None,
-):
-    """Cloud-safe wrapper around streamlit-drawable-canvas using an embedded background image."""
-    background_image_url = None
-    if background_image is not None:
-        resized = background_image.resize((width, height), Image.LANCZOS)
-        background_image_url = pil_to_data_uri(resized)
-        background_color = ""
-
-    initial_drawing = {"version": "4.4.0"} if initial_drawing is None else initial_drawing
-    initial_drawing["background"] = background_color
-
-    component_value = sdc._component_func(
-        fillColor=fill_color,
-        strokeWidth=stroke_width,
-        strokeColor=stroke_color,
-        backgroundColor=background_color,
-        backgroundImageURL=background_image_url,
-        realtimeUpdateStreamlit=update_streamlit and (drawing_mode != "polygon"),
-        canvasHeight=height,
-        canvasWidth=width,
-        drawingMode=drawing_mode,
-        initialDrawing=initial_drawing,
-        displayToolbar=display_toolbar,
-        displayRadius=point_display_radius,
-        key=key,
-        default=None,
-    )
-
-    if component_value is None:
-        return sdc.CanvasResult()
-
-    return sdc.CanvasResult(
-        np.asarray(sdc._data_url_to_image(component_value["data"])),
-        component_value["raw"],
-    )
-
-
-def apply_blur_zones(source, objects, canvas_w, canvas_h, blur_radius):
+def apply_blur_zones(source, zones, blur_radius, skip_index=None):
     out = source.copy()
-    if not objects:
-        return out
-
-    scale_x = source.width / canvas_w
-    scale_y = source.height / canvas_h
-
-    for obj in objects:
-        if obj.get("type") != "rect":
+    for idx, zone in enumerate(zones):
+        if skip_index is not None and idx == skip_index:
             continue
-
-        left = float(obj.get("left", 0))
-        top = float(obj.get("top", 0))
-        width = float(obj.get("width", 0)) * float(obj.get("scaleX", 1))
-        height = float(obj.get("height", 0)) * float(obj.get("scaleY", 1))
-
-        x1 = max(0, int(left * scale_x))
-        y1 = max(0, int(top * scale_y))
-        x2 = min(source.width, int((left + width) * scale_x))
-        y2 = min(source.height, int((top + height) * scale_y))
-
+        left = int(zone["left"])
+        top = int(zone["top"])
+        width = int(zone["width"])
+        height = int(zone["height"])
+        x1 = max(0, left)
+        y1 = max(0, top)
+        x2 = min(out.width, left + width)
+        y2 = min(out.height, top + height)
         if x2 <= x1 or y2 <= y1:
             continue
-
         region = out.crop((x1, y1, x2, y2))
         region = region.filter(ImageFilter.GaussianBlur(radius=blur_radius))
         out.paste(region, (x1, y1, x2, y2))
-
     return out
 
 
@@ -194,11 +121,7 @@ def build_card(fragment, audience, issue, requirement, project, impact, footer, 
     footer_font = get_font(19, False)
 
     panel_x1, panel_y1, panel_x2, panel_y2 = 50, 55, 1030, 650
-    draw.rounded_rectangle(
-        (panel_x1, panel_y1, panel_x2, panel_y2),
-        radius=20,
-        fill=hex_to_rgb(BRAND_WHITE),
-    )
+    draw.rounded_rectangle((panel_x1, panel_y1, panel_x2, panel_y2), radius=20, fill=hex_to_rgb(BRAND_WHITE))
     fitted = fit_image(fragment, panel_x2 - panel_x1 - 30, panel_y2 - panel_y1 - 30)
     img.paste(fitted, (panel_x1 + 15, panel_y1 + 15))
 
@@ -246,10 +169,7 @@ def build_card(fragment, audience, issue, requirement, project, impact, footer, 
 
 
 st.title("KywaTrace Case Example Generator")
-st.caption(
-    "Uzzīmē blur zonas tieši uz rasējuma. Vispirms uzzīmē taisnstūri, pēc tam pārslēdzies uz koriģēšanas režīmu, "
-    "lai to pārvietotu vai pavilktu malas."
-)
+st.caption("Blur zonu velc un koriģē tieši uz rasējuma ar peli. Saglabā vairākas zonas un pēc vajadzības atgriezies pie jebkuras no tām.")
 
 with st.sidebar:
     st.header("Ievade")
@@ -265,12 +185,7 @@ with st.sidebar:
         max_value=80,
         value=22,
         step=2,
-        help="Mazāks skaitlis ļauj nojaust, kas atrodas zem blur; lielāks gandrīz pilnībā noslēpj saturu.",
-    )
-    edit_mode = st.radio(
-        "Darbība ar peli",
-        ["Pievienot blur zonu", "Koriģēt esošu zonu"],
-        help="Pievieno vairākus taisnstūrus. Koriģēšanas režīmā klikšķini uz jau uzzīmētās zonas un velc to vai tās malas.",
+        help="Mazāks skaitlis ļauj nojaust saturu zem blur; lielāks to noslēpj daudz izteiktāk.",
     )
 
     st.divider()
@@ -288,41 +203,73 @@ if not uploaded:
     st.info("Augšupielādē rasējuma fragmentu kreisajā pusē.")
     st.stop()
 
-source = Image.open(uploaded).convert("RGB")
+raw_bytes = uploaded.getvalue()
+file_id = hashlib.sha1(raw_bytes).hexdigest()
+source = Image.open(io.BytesIO(raw_bytes)).convert("RGB")
 
-MAX_CANVAS_W = 1100
-MAX_CANVAS_H = 720
-scale = min(MAX_CANVAS_W / source.width, MAX_CANVAS_H / source.height, 1.0)
-canvas_w = max(1, int(source.width * scale))
-canvas_h = max(1, int(source.height * scale))
-canvas_bg = source.resize((canvas_w, canvas_h), Image.LANCZOS)
+if st.session_state.get("blur_file_id") != file_id:
+    st.session_state.blur_file_id = file_id
+    st.session_state.blur_zones = []
 
-st.subheader("1. Atzīmē anonimizējamās vietas")
-st.caption(
-    "Zīmē tieši uz rasējuma. Ja taisnstūris jāpielāgo, pārslēdzies uz koriģēšanas režīmu un pavelc tā malas vai pārvieto visu zonu."
+zones = st.session_state.blur_zones
+
+st.subheader("1. Blur zonas")
+choices = ["+ Jauna blur zona"] + [f"Zona {i + 1}" for i in range(len(zones))]
+current_choice = st.selectbox("Rediģējamā zona", choices, key="blur_zone_choice")
+edit_index = -1 if current_choice.startswith("+") else int(current_choice.split()[-1]) - 1
+
+editor_background = apply_blur_zones(source, zones, blur_radius, skip_index=edit_index if edit_index >= 0 else None)
+
+if edit_index >= 0:
+    z = zones[edit_index]
+    default_coords = (
+        int(z["left"]),
+        int(z["left"] + z["width"]),
+        int(z["top"]),
+        int(z["top"] + z["height"]),
+    )
+else:
+    default_coords = None
+
+st.caption("Velc dzeltenā rāmja malas vai stūrus, lai mainītu izmēru. Satver rāmja iekšpusi, lai to pārvietotu.")
+
+rect = st_cropper(
+    img_file=editor_background,
+    realtime_update=True,
+    default_coords=default_coords,
+    box_color=BRAND_YELLOW,
+    aspect_ratio=None,
+    return_type="box",
+    key=f"blur_cropper_{file_id}_{edit_index}",
+    stroke_width=3,
 )
+rect = {k: int(v) for k, v in rect.items()}
 
-canvas_mode = "rect" if edit_mode == "Pievienot blur zonu" else "transform"
+c1, c2, c3 = st.columns([1, 1, 1])
+with c1:
+    if edit_index < 0:
+        if st.button("Pievienot blur zonu", use_container_width=True):
+            st.session_state.blur_zones.append(rect)
+            st.rerun()
+    else:
+        if st.button("Saglabāt izmaiņas", use_container_width=True):
+            st.session_state.blur_zones[edit_index] = rect
+            st.rerun()
+with c2:
+    if edit_index >= 0 and st.button("Dublēt zonu", use_container_width=True):
+        duplicate = dict(rect)
+        duplicate["left"] = min(source.width - duplicate["width"], duplicate["left"] + 20)
+        duplicate["top"] = min(source.height - duplicate["height"], duplicate["top"] + 20)
+        st.session_state.blur_zones.append(duplicate)
+        st.rerun()
+with c3:
+    if edit_index >= 0 and st.button("Dzēst zonu", use_container_width=True):
+        del st.session_state.blur_zones[edit_index]
+        st.rerun()
 
-canvas_result = st_canvas_cloud(
-    fill_color="rgba(242, 212, 0, 0.16)",
-    stroke_width=2,
-    stroke_color=BRAND_YELLOW,
-    background_color="#FFFFFF",
-    background_image=canvas_bg,
-    update_streamlit=True,
-    height=canvas_h,
-    width=canvas_w,
-    drawing_mode=canvas_mode,
-    display_toolbar=True,
-    key="blur_canvas",
-)
+st.caption(f"Saglabātas blur zonas: {len(zones)}" if zones else "Neviena blur zona vēl nav saglabāta.")
 
-objects = []
-if canvas_result.json_data and "objects" in canvas_result.json_data:
-    objects = canvas_result.json_data["objects"]
-
-blurred = apply_blur_zones(source, objects, canvas_w, canvas_h, blur_radius)
+blurred = apply_blur_zones(source, zones, blur_radius)
 logo = Image.open(logo_file).convert("RGBA") if logo_file else None
 card = build_card(blurred, audience, issue, requirement, project, impact, footer, logo)
 
@@ -345,6 +292,4 @@ st.download_button(
     use_container_width=True,
 )
 
-st.warning(
-    "Pirms publicēšanas pārbaudi gala PNG: blur palīdz anonimizēt, bet pats par sevi negarantē, ka visi projekta identifikatori ir paslēpti."
-)
+st.warning("Pirms publicēšanas pārbaudi gala PNG: blur palīdz anonimizēt, bet pats par sevi negarantē, ka visi projekta identifikatori ir paslēpti.")
