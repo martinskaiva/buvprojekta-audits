@@ -109,61 +109,74 @@ def apply_blur_zones(source, zones, blur_radius, skip_index=None):
 
 
 def build_card(fragment, audience, issue, requirement, project, impact, footer, logo=None):
-    W, H = 1080, 1350
+    W, H = 1080, 1080
     img = Image.new("RGB", (W, H), hex_to_rgb(BRAND_LIGHT))
     draw = ImageDraw.Draw(img)
 
-    title_font = get_font(42, True)
-    small_font = get_font(22, False)
-    label_font = get_font(24, True)
-    body_font = get_font(28, False)
-    body_bold = get_font(28, True)
-    footer_font = get_font(19, False)
+    title_font = get_font(34, True)
+    small_font = get_font(20, False)
+    label_font = get_font(22, True)
+    body_font = get_font(25, False)
+    body_bold = get_font(25, True)
+    footer_font = get_font(18, False)
 
-    panel_x1, panel_y1, panel_x2, panel_y2 = 50, 55, 1030, 650
-    draw.rounded_rectangle((panel_x1, panel_y1, panel_x2, panel_y2), radius=20, fill=hex_to_rgb(BRAND_WHITE))
-    fitted = fit_image(fragment, panel_x2 - panel_x1 - 30, panel_y2 - panel_y1 - 30)
-    img.paste(fitted, (panel_x1 + 15, panel_y1 + 15))
+    panel_x1, panel_y1, panel_x2, panel_y2 = 40, 38, 1040, 610
+    draw.rounded_rectangle((panel_x1, panel_y1, panel_x2, panel_y2), radius=24, fill=hex_to_rgb(BRAND_WHITE))
+    fitted = fit_image(fragment, panel_x2 - panel_x1 - 24, panel_y2 - panel_y1 - 24)
+    img.paste(fitted, (panel_x1 + 12, panel_y1 + 12))
 
-    y = 695
-    draw.text((50, y), "KONSTATĒTS", font=label_font, fill=hex_to_rgb(BRAND_DARK))
-    y += 42
-    y = draw_wrapped(draw, issue, (50, y), body_bold, hex_to_rgb(BRAND_DARK), 980, 8)
-    y += 26
+    if logo is not None:
+        lg = logo.convert("RGBA")
+        ratio = min(170 / lg.width, 84 / lg.height)
+        lg = lg.resize((max(1, int(lg.width * ratio)), max(1, int(lg.height * ratio))), Image.LANCZOS)
 
-    col_gap = 24
-    col_w = (980 - col_gap) // 2
-    card_h = 205
-    left = (50, y, 50 + col_w, y + card_h)
-    right = (50 + col_w + col_gap, y, 1030, y + card_h)
+        logo_pad_x = 14
+        logo_pad_y = 10
+        logo_bg_w = lg.width + logo_pad_x * 2
+        logo_bg_h = lg.height + logo_pad_y * 2
+        logo_x = panel_x1 + 34
+        logo_y = panel_y1 + 155
+
+        draw.rounded_rectangle(
+            (logo_x, logo_y, logo_x + logo_bg_w, logo_y + logo_bg_h),
+            radius=14,
+            fill=hex_to_rgb(BRAND_WHITE),
+        )
+        img.paste(lg.convert("RGB"), (logo_x + logo_pad_x, logo_y + logo_pad_y))
+    else:
+        draw.text((panel_x1 + 36, panel_y1 + 36), "KywaTrace", font=title_font, fill=hex_to_rgb(BRAND_DARK))
+
+    y = 642
+    draw.text((40, y), "KONSTATĒTS", font=label_font, fill=hex_to_rgb(BRAND_DARK))
+    y += 34
+    y = draw_wrapped(draw, issue, (40, y), body_bold, hex_to_rgb(BRAND_DARK), 1000, 5)
+    y += 16
+
+    col_gap = 22
+    col_w = (1000 - col_gap) // 2
+    card_h = 132
+    left = (40, y, 40 + col_w, y + card_h)
+    right = (40 + col_w + col_gap, y, 1040, y + card_h)
 
     draw.rounded_rectangle(left, radius=18, fill=hex_to_rgb(BRAND_WHITE))
     draw.rounded_rectangle(right, radius=18, fill=hex_to_rgb(BRAND_WHITE))
     draw.rectangle((left[0], left[1], left[0] + 8, left[3]), fill=hex_to_rgb(BRAND_YELLOW))
     draw.rectangle((right[0], right[1], right[0] + 8, right[3]), fill=hex_to_rgb(BRAND_MID))
 
-    draw.text((left[0] + 24, left[1] + 18), "PASŪTĪTĀJA PRASĪBA", font=small_font, fill=hex_to_rgb(BRAND_DARK))
-    draw_wrapped(draw, requirement, (left[0] + 24, left[1] + 55), body_font, hex_to_rgb(BRAND_DARK), col_w - 48, 6)
+    draw.text((left[0] + 24, left[1] + 15), "PASŪTĪTĀJA PRASĪBA", font=small_font, fill=hex_to_rgb(BRAND_DARK))
+    draw_wrapped(draw, requirement, (left[0] + 24, left[1] + 44), body_font, hex_to_rgb(BRAND_DARK), col_w - 48, 4)
 
-    draw.text((right[0] + 24, right[1] + 18), "PROJEKTĀ", font=small_font, fill=hex_to_rgb(BRAND_DARK))
-    draw_wrapped(draw, project, (right[0] + 24, right[1] + 55), body_font, hex_to_rgb(BRAND_DARK), col_w - 48, 6)
+    draw.text((right[0] + 24, right[1] + 15), "PROJEKTĀ", font=small_font, fill=hex_to_rgb(BRAND_DARK))
+    draw_wrapped(draw, project, (right[0] + 24, right[1] + 44), body_font, hex_to_rgb(BRAND_DARK), col_w - 48, 4)
 
-    y += card_h + 30
-    draw.text((50, y), "KĀPĒC TAS IR SVARĪGI?", font=label_font, fill=hex_to_rgb(BRAND_DARK))
-    y += 42
-    draw_wrapped(draw, impact, (50, y), body_font, hex_to_rgb(BRAND_DARK), 980, 7)
+    y += card_h + 18
+    draw.text((40, y), "KĀPĒC TAS IR SVARĪGI?", font=label_font, fill=hex_to_rgb(BRAND_DARK))
+    y += 33
+    draw_wrapped(draw, impact, (40, y), body_font, hex_to_rgb(BRAND_DARK), 1000, 5)
 
-    draw.rectangle((0, H - 92, W, H), fill=hex_to_rgb(BRAND_DARK))
-    draw.text((50, H - 62), footer, font=footer_font, fill=hex_to_rgb(BRAND_WHITE))
-    draw.text((W - 280, H - 66), audience.upper(), font=small_font, fill=hex_to_rgb(BRAND_YELLOW))
-
-    if logo is not None:
-        lg = logo.convert("RGBA")
-        ratio = min(210 / lg.width, 46 / lg.height)
-        lg = lg.resize((max(1, int(lg.width * ratio)), max(1, int(lg.height * ratio))), Image.LANCZOS)
-        img.paste(lg.convert("RGB"), (W - lg.width - 48, 20))
-    else:
-        draw.text((50, 18), "KywaTrace", font=title_font, fill=hex_to_rgb(BRAND_DARK))
+    draw.rectangle((0, H - 74, W, H), fill=hex_to_rgb(BRAND_DARK))
+    draw.text((40, H - 49), footer, font=footer_font, fill=hex_to_rgb(BRAND_WHITE))
+    draw.text((W - 250, H - 51), audience.upper(), font=small_font, fill=hex_to_rgb(BRAND_YELLOW))
 
     return img
 
