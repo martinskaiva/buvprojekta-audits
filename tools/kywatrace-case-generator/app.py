@@ -1,8 +1,9 @@
+import base64
 import io
 
 import streamlit as st
 from PIL import Image, ImageDraw, ImageFont, ImageFilter
-from streamlit_drawable_canvas import st_canvas
+import streamlit_drawable_canvas as sdc
 
 st.set_page_config(
     page_title="KywaTrace Case Example Generator",
@@ -10,7 +11,6 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# Hide Streamlit top toolbar/header. The app should feel like a focused working tool.
 st.markdown(
     """
     <style>
@@ -87,8 +87,30 @@ def fit_image(img, target_w, target_h):
     return canvas
 
 
+def pil_to_data_uri(image: Image.Image) -> str:
+    image = image.copy()
+    if image.mode not in ("RGB", "RGBA"):
+        image = image.convert("RGBA")
+    buf = io.BytesIO()
+    image.save(buf, format="PNG")
+    b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+    return f"data:image/png;base64,{b64}"
+
+
+_original_image_to_url = sdc.st_image.image_to_url
+
+
+def _patched_image_to_url(image, *args, **kwargs):
+    if isinstance(image, Image.Image):
+        return pil_to_data_uri(image)
+    return _original_image_to_url(image, *args, **kwargs)
+
+
+sdc.st_image.image_to_url = _patched_image_to_url
+st_canvas = sdc.st_canvas
+
+
 def apply_blur_zones(source, objects, canvas_w, canvas_h, blur_radius):
-    """Apply every rectangle from drawable canvas as a blur zone on the full-resolution source."""
     out = source.copy()
     if not objects:
         return out
@@ -185,7 +207,10 @@ def build_card(fragment, audience, issue, requirement, project, impact, footer, 
 
 
 st.title("KywaTrace Case Example Generator")
-st.caption("Uzzīmē blur zonas tieši uz rasējuma ar peli. Vari pievienot vairākas zonas, tās pārvietot un mainīt izmēru, pavelkot malas.")
+st.caption(
+    "Uzzīmē blur zonas tieši uz rasējuma. Vispirms uzzīmē taisnstūri, pēc tam pārslēdzies uz koriģēšanas režīmu, "
+    "lai to pārvietotu vai pavilktu malas."
+)
 
 with st.sidebar:
     st.header("Ievade")
@@ -205,8 +230,8 @@ with st.sidebar:
     )
     edit_mode = st.radio(
         "Darbība ar peli",
-        ["Pievienot blur zonu", "Pārvietot / mainīt izmēru"],
-        help="Pievieno vairākus taisnstūrus. Pārslēdz uz pārvietošanas režīmu, lai zonu pārbīdītu vai pavilktu tās malas.",
+        ["Pievienot blur zonu", "Koriģēt esošu zonu"],
+        help="Pievieno vairākus taisnstūrus. Koriģēšanas režīmā klikšķini uz jau uzzīmētās zonas un velc to vai tās malas.",
     )
 
     st.divider()
@@ -214,7 +239,10 @@ with st.sidebar:
     issue = st.text_area("Konstatēts", "Neatbilstība starp projektēto risinājumu un Design Brief prasībām.")
     requirement = st.text_area("Pasūtītāja prasība", "Gatavās grīdas līmeņiem jābūt vienā līnijā.")
     project = st.text_area("Projektā", "Terases grīdas līmenis paredzēts -20 mm.")
-    impact = st.text_area("Kāpēc tas ir svarīgi?", "Savlaicīga neatbilstības identificēšana pirms tendera samazina izmaiņu, RFI, kavējumu un papildu izmaksu risku.")
+    impact = st.text_area(
+        "Kāpēc tas ir svarīgi?",
+        "Savlaicīga neatbilstības identificēšana pirms tendera samazina izmaiņu, RFI, kavējumu un papildu izmaksu risku.",
+    )
     footer = st.text_input("Footer", "Anonimizēts ilustratīvs piemērs no KywaTrace audita")
 
 if not uploaded:
@@ -223,7 +251,6 @@ if not uploaded:
 
 source = Image.open(uploaded).convert("RGB")
 
-# Keep canvas manageable while preserving the source aspect ratio.
 MAX_CANVAS_W = 1100
 MAX_CANVAS_H = 720
 scale = min(MAX_CANVAS_W / source.width, MAX_CANVAS_H / source.height, 1.0)
@@ -232,7 +259,9 @@ canvas_h = max(1, int(source.height * scale))
 canvas_bg = source.resize((canvas_w, canvas_h), Image.LANCZOS)
 
 st.subheader("1. Atzīmē anonimizējamās vietas")
-st.caption("Velc peli pāri vietai, ko vēlies aizblurēt. Vari uzzīmēt tik zonu, cik nepieciešams. Pārvietošanas režīmā klikšķini uz zonas un velc to vai tās malas.")
+st.caption(
+    "Zīmē tieši uz rasējuma. Ja taisnstūris jāpielāgo, pārslēdzies uz koriģēšanas režīmu un pavelc tā malas vai pārvieto visu zonu."
+)
 
 canvas_mode = "rect" if edit_mode == "Pievienot blur zonu" else "transform"
 
@@ -240,6 +269,7 @@ canvas_result = st_canvas(
     fill_color="rgba(242, 212, 0, 0.16)",
     stroke_width=2,
     stroke_color=BRAND_YELLOW,
+    background_color="#FFFFFF",
     background_image=canvas_bg,
     update_streamlit=True,
     height=canvas_h,
@@ -276,4 +306,6 @@ st.download_button(
     use_container_width=True,
 )
 
-st.warning("Pirms publicēšanas pārbaudi gala PNG: blur palīdz anonimizēt, bet pats par sevi negarantē, ka visi projekta identifikatori ir paslēpti.")
+st.warning(
+    "Pirms publicēšanas pārbaudi gala PNG: blur palīdz anonimizēt, bet pats par sevi negarantē, ka visi projekta identifikatori ir paslēpti."
+)
