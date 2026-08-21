@@ -1,6 +1,7 @@
 import base64
 import io
 
+import numpy as np
 import streamlit as st
 from PIL import Image, ImageDraw, ImageFont, ImageFilter
 import streamlit_drawable_canvas as sdc
@@ -93,21 +94,59 @@ def pil_to_data_uri(image: Image.Image) -> str:
         image = image.convert("RGBA")
     buf = io.BytesIO()
     image.save(buf, format="PNG")
-    b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
-    return f"data:image/png;base64,{b64}"
+    encoded = base64.b64encode(buf.getvalue()).decode("utf-8")
+    return f"data:image/png;base64,{encoded}"
 
 
-_original_image_to_url = sdc.st_image.image_to_url
+def st_canvas_cloud(
+    fill_color="#eee",
+    stroke_width=20,
+    stroke_color="black",
+    background_color="",
+    background_image=None,
+    update_streamlit=True,
+    height=400,
+    width=600,
+    drawing_mode="freedraw",
+    initial_drawing=None,
+    display_toolbar=True,
+    point_display_radius=3,
+    key=None,
+):
+    """Cloud-safe wrapper around streamlit-drawable-canvas using an embedded background image."""
+    background_image_url = None
+    if background_image is not None:
+        resized = background_image.resize((width, height), Image.LANCZOS)
+        background_image_url = pil_to_data_uri(resized)
+        background_color = ""
 
+    initial_drawing = {"version": "4.4.0"} if initial_drawing is None else initial_drawing
+    initial_drawing["background"] = background_color
 
-def _patched_image_to_url(image, *args, **kwargs):
-    if isinstance(image, Image.Image):
-        return pil_to_data_uri(image)
-    return _original_image_to_url(image, *args, **kwargs)
+    component_value = sdc._component_func(
+        fillColor=fill_color,
+        strokeWidth=stroke_width,
+        strokeColor=stroke_color,
+        backgroundColor=background_color,
+        backgroundImageURL=background_image_url,
+        realtimeUpdateStreamlit=update_streamlit and (drawing_mode != "polygon"),
+        canvasHeight=height,
+        canvasWidth=width,
+        drawingMode=drawing_mode,
+        initialDrawing=initial_drawing,
+        displayToolbar=display_toolbar,
+        displayRadius=point_display_radius,
+        key=key,
+        default=None,
+    )
 
+    if component_value is None:
+        return sdc.CanvasResult()
 
-sdc.st_image.image_to_url = _patched_image_to_url
-st_canvas = sdc.st_canvas
+    return sdc.CanvasResult(
+        np.asarray(sdc._data_url_to_image(component_value["data"])),
+        component_value["raw"],
+    )
 
 
 def apply_blur_zones(source, objects, canvas_w, canvas_h, blur_radius):
@@ -265,7 +304,7 @@ st.caption(
 
 canvas_mode = "rect" if edit_mode == "Pievienot blur zonu" else "transform"
 
-canvas_result = st_canvas(
+canvas_result = st_canvas_cloud(
     fill_color="rgba(242, 212, 0, 0.16)",
     stroke_width=2,
     stroke_color=BRAND_YELLOW,
