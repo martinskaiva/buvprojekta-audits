@@ -469,7 +469,11 @@ def render_project(project: pd.Series):
             display = filtered[[
                 "source_audit_id", "discipline", "document_number", "page", "location",
                 "category", "comment", "knowledge_status", "drive_file_url"
-            ]].rename(columns={
+            ]].copy()
+
+            display["drive_file_url"] = display["drive_file_url"].apply(safe_link)
+
+            display = display.rename(columns={
                 "source_audit_id": "Audit ID",
                 "discipline": "Disciplīna",
                 "document_number": "Dokumenta Nr.",
@@ -478,7 +482,7 @@ def render_project(project: pd.Series):
                 "category": "Kategorija",
                 "comment": "Piezīme",
                 "knowledge_status": "Statuss",
-                "drive_file_url": "PDF Drive",
+                "drive_file_url": "Rasējums",
             })
             st.dataframe(
                 display,
@@ -488,7 +492,11 @@ def render_project(project: pd.Series):
                 column_config={
                     "Piezīme": st.column_config.TextColumn("Piezīme", width="large"),
                     "Vieta": st.column_config.TextColumn("Vieta", width="medium"),
-                    "PDF Drive": st.column_config.LinkColumn("PDF Drive"),
+                    "Rasējums": st.column_config.LinkColumn(
+                        "Rasējums",
+                        display_text="Atvērt rasējumu ↗",
+                        width="medium",
+                    ),
                 },
             )
 
