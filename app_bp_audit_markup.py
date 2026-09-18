@@ -21,7 +21,7 @@ from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
 
 APP_NAME = "Kywatrace Markup"
-APP_VERSION = "2.2.5"
+APP_VERSION = "2.2.6"
 FOLDER_MIME_TYPE = "application/vnd.google-apps.folder"
 PDF_MIME_TYPE = "application/pdf"
 XLSX_MIME_TYPE = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
@@ -60,6 +60,25 @@ REQUIRED_COLUMNS = [
     "Reference_Location",
     "Reference_Evidence_Text",
     "Annotation_Status",
+]
+
+CANONICAL_COLUMNS = [
+    "note_id",
+    "Nr",
+    "discipline",
+    "target_file",
+    "target_page",
+    "target_area",
+    "target_text",
+    "comment_text",
+    "issue_type",
+    "severity",
+    "comparison_files",
+    "comparison_pages",
+    "comparison_evidence",
+    "markup_type",
+    "placement_confidence",
+    "status",
 ]
 
 st.set_page_config(page_title=f"{APP_NAME} v{APP_VERSION}", layout="wide")
@@ -675,23 +694,77 @@ def upload_bytes_to_drive(service, folder_id: str, filename: str, data: bytes, m
 
 
 def read_audit_excel(data: bytes) -> pd.DataFrame:
+    """Read either the KywaTrace canonical 16-column register or the legacy Markup schema.
+
+    Internally the Markup engine continues to use the legacy field names so the
+    annotation code stays stable. Canonical input columns are preserved unchanged
+    for the completed audit register and audit trail.
+    """
     xls = pd.ExcelFile(io.BytesIO(data))
     sheet = EXCEL_SHEET_NAME if EXCEL_SHEET_NAME in xls.sheet_names else xls.sheet_names[0]
-    df = pd.read_excel(io.BytesIO(data), sheet_name=sheet).dropna(how="all").copy()
-    df.columns = [clean_text(c) for c in df.columns]
-    missing = [c for c in REQUIRED_COLUMNS if c not in df.columns]
-    if missing:
-        raise ValueError("Excel trūkst obligāto kolonnu: " + ", ".join(missing))
-    df = df[REQUIRED_COLUMNS].copy()
-    df["Page"] = df["Page"].apply(safe_int)
-    df["Reference_Page"] = df["Reference_Page"].apply(safe_int)
-    for column in REQUIRED_COLUMNS:
-        if column not in {"Page", "Reference_Page"}:
-            df[column] = df[column].apply(clean_text)
-    df["Document_Filename_Norm"] = df["Document_Filename"].apply(normalize_filename)
-    df["Annotation_Status"] = ""
-    return df
+    source = pd.read_excel(io.BytesIO(data), sheet_name=sheet).dropna(how="all").copy()
+    source.columns = [clean_text(c) for c in source.columns]
 
+    has_canonical = all(col in source.columns for col in CANONICAL_COLUMNS)
+    has_legacy = all(col in source.columns for col in REQUIRED_COLUMNS)
+
+    if not has_canonical and not has_legacy:
+        missing_canonical = [c for c in CANONICAL_COLUMNS if c not in source.columns]
+        missing_legacy = [c for c in REQUIRED_COLUMNS if c not in source.columns]
+        raise ValueError(
+            "Excel neatbilst ne KywaTrace 16 kolonnu struktūrai, ne legacy Markup struktūrai. "
+            "KywaTrace trūkst: "
+            + ", ".join(missing_canonical)
+            + ". Legacy trūkst: "
+            + ", ".join(missing_legacy)
+        )
+
+    if has_canonical:
+        source = source[CANONICAL_COLUMNS].copy()
+        for column in CANONICAL_COLUMNS:
+            if column != "target_page":
+                source[column] = source[column].apply(clean_text)
+        source["target_page"] = source["target_page"].apply(safe_int)
+
+        df = source.copy()
+        df["_input_schema"] = "canonical16"
+        df["_markup_type"] = df["markup_type"].apply(clean_text).str.casefold()
+        df["_placement_confidence"] = df["placement_confidence"].apply(clean_text).str.casefold()
+
+        # Adapter to the existing Markup engine. Do not discard canonical fields.
+        df["Audit_ID"] = df.apply(
+            lambda row: clean_text(row["note_id"]) or clean_text(row["Nr"]),
+            axis=1,
+        )
+        df["Document_Filename"] = df["target_file"].apply(clean_text)
+        df["Document_Number"] = ""
+        df["Page"] = df["target_page"]
+        df["Location"] = df["target_area"].apply(clean_text)
+        df["Category"] = df["issue_type"].apply(clean_text)
+        df["Element_Code"] = ""
+        df["Comment"] = df["comment_text"].apply(clean_text)
+        df["Anchor_Text"] = df["target_text"].apply(clean_text)
+        df["Alternative_Anchor"] = ""
+        df["Reference_Document_Filename"] = df["comparison_files"].apply(clean_text)
+        df["Reference_Document_Number"] = ""
+        df["Reference_Page"] = None
+        df["Reference_Location"] = ""
+        df["Reference_Evidence_Text"] = df["comparison_evidence"].apply(clean_text)
+        df["Annotation_Status"] = ""
+    else:
+        df = source[REQUIRED_COLUMNS].copy()
+        df["_input_schema"] = "legacy16"
+        df["_markup_type"] = ""
+        df["_placement_confidence"] = ""
+        df["Page"] = df["Page"].apply(safe_int)
+        df["Reference_Page"] = df["Reference_Page"].apply(safe_int)
+        for column in REQUIRED_COLUMNS:
+            if column not in {"Page", "Reference_Page"}:
+                df[column] = df[column].apply(clean_text)
+        df["Annotation_Status"] = ""
+
+    df["Document_Filename_Norm"] = df["Document_Filename"].apply(normalize_filename)
+    return df
 
 def validate_rows(
     df: pd.DataFrame,
@@ -777,6 +850,7 @@ def validate_rows(
             status, message = "invalid", "Nav Comment."
         elif (
             clean_text(row["Category"]).casefold() != "no discrepancies"
+            and clean_text(row.get("_markup_type", "")).casefold() != "page_note"
             and not any(
                 [
                     row["Anchor_Text"],
@@ -787,7 +861,7 @@ def validate_rows(
         ):
             status, message = (
                 "invalid",
-                "Nav Anchor_Text, Alternative_Anchor vai Element_Code.",
+                "Nav target_text/Anchor_Text. Ja precīzs enkurs nav iespējams, izmanto markup_type = page_note.",
             )
 
         if len(matches) == 1:
@@ -819,17 +893,61 @@ def validate_rows(
     return work
 
 def completed_excel_bytes(df: pd.DataFrame) -> bytes:
+    """Write the same register schema that was uploaded.
+
+    Canonical KywaTrace input remains the canonical 16-column register. Markup
+    execution results are written to a separate Markup_Report sheet so the
+    production data contract is not mutated.
+    """
     output = io.BytesIO()
+    is_canonical = (
+        "_input_schema" in df.columns
+        and (df["_input_schema"] == "canonical16").any()
+        and all(col in df.columns for col in CANONICAL_COLUMNS)
+    )
+
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        df[REQUIRED_COLUMNS].to_excel(writer, sheet_name=EXCEL_SHEET_NAME, index=False)
-        ws = writer.book[EXCEL_SHEET_NAME]
-        ws.freeze_panes = "A2"
-        ws.auto_filter.ref = ws.dimensions
-        widths = [14, 52, 34, 10, 42, 24, 18, 95, 45, 38, 52, 34, 14, 42, 60, 28]
+        if is_canonical:
+            df[CANONICAL_COLUMNS].to_excel(
+                writer,
+                sheet_name=EXCEL_SHEET_NAME,
+                index=False,
+            )
+            report_columns = [
+                "Audit_ID",
+                "Document_Filename",
+                "Page",
+                "Annotation_Status",
+                "_validation_status",
+                "_validation_message",
+                "_matched_pdf_name",
+                "_match_method",
+            ]
+            report_columns = [col for col in report_columns if col in df.columns]
+            df[report_columns].to_excel(
+                writer,
+                sheet_name="Markup_Report",
+                index=False,
+            )
+            ws = writer.book[EXCEL_SHEET_NAME]
+            ws.freeze_panes = "A2"
+            ws.auto_filter.ref = ws.dimensions
+            widths = [18, 10, 14, 55, 12, 38, 48, 95, 28, 16, 55, 24, 70, 18, 22, 24]
+        else:
+            df[REQUIRED_COLUMNS].to_excel(
+                writer,
+                sheet_name=EXCEL_SHEET_NAME,
+                index=False,
+            )
+            ws = writer.book[EXCEL_SHEET_NAME]
+            ws.freeze_panes = "A2"
+            ws.auto_filter.ref = ws.dimensions
+            widths = [14, 52, 34, 10, 42, 24, 18, 95, 45, 38, 52, 34, 14, 42, 60, 28]
+
         for idx, width in enumerate(widths, 1):
             ws.column_dimensions[chr(64 + idx)].width = width
-    return output.getvalue()
 
+    return output.getvalue()
 
 def search_variants(primary: str, alternative: str, element_code: str) -> list[tuple[str, str]]:
     variants: list[tuple[str, str]] = []
@@ -899,6 +1017,7 @@ def annotate_pdf(pdf_bytes: bytes, rows: pd.DataFrame, filename: str = "") -> tu
         page_no = safe_int(row["Page"])
         comment = clean_text(row["Comment"])
         category = clean_text(row["Category"]).casefold()
+        markup_type = clean_text(row.get("_markup_type", "")).casefold()
 
         if page_no is None or page_no < 1 or page_no > len(doc):
             statuses[row_index] = "page_not_found"
@@ -919,6 +1038,22 @@ def annotate_pdf(pdf_bytes: bytes, rows: pd.DataFrame, filename: str = "") -> tu
                 statuses[row_index] = "no_issues_note_added"
             else:
                 statuses[row_index] = "no_issues_note_duplicate_skipped"
+            continue
+
+        if (
+            markup_type == "page_note"
+            or clean_text(row["Anchor_Text"]).upper() == "MANUAL_PLACEMENT_REQUIRED"
+        ):
+            add_comment(
+                page,
+                fitz.Point(
+                    max(36, page.rect.width - 80),
+                    36 + page_counts[page_no] * 24,
+                ),
+                comment,
+            )
+            page_counts[page_no] += 1
+            statuses[row_index] = "page_note"
             continue
 
         found_rects: list[fitz.Rect] = []
@@ -1175,10 +1310,11 @@ if root:
                 file_key = f"{file_key_prefix}_{pdf_item['id']}"
                 if select_all_files:
                     st.session_state[file_key] = True
+                elif file_key not in st.session_state:
+                    st.session_state[file_key] = False
                 is_selected = st.checkbox(
                     pdf_item["path"],
                     key=file_key,
-                    value=bool(st.session_state.get(file_key, False)),
                 )
                 if is_selected:
                     selected_pdfs.append(pdf_item)
@@ -1190,8 +1326,9 @@ if root:
 
     st.markdown("## 3. ChatGPT sagatavotais Excel")
     st.caption(
-        "Rīks ignorē dublikātu sufiksus, piemēram, (1), (2) un (3), "
-        "un vajadzības gadījumā sasaista dokumentu pēc Document_Number."
+        "Primārais formāts ir KywaTrace 16 kolonnu Issue Register. "
+        "Legacy Markup Excel joprojām tiek atbalstīts. Rīks ignorē dublikātu "
+        "sufiksus, piemēram, (1), (2) un (3)."
     )
     upload = st.file_uploader("Augšupielādē apstiprināto piezīmju Excel", type=["xlsx"])
     if upload is not None:
