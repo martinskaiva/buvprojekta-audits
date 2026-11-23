@@ -94,14 +94,18 @@ def first_stage_url(files: pd.DataFrame, stage: str) -> str | None:
 def render_all_projects(projects: pd.DataFrame):
     st.subheader("Projektu pārskats")
 
-    c1, c2, c3, c4 = st.columns(4)
+    c1, c2, c3, c4, c5, c6 = st.columns(6)
     c1.metric("Projekti", len(projects))
     c2.metric("Auditētie dokumenti", int(projects["documents_count"].fillna(0).sum()))
-    c3.metric("Audita piezīmes", int(projects["findings_count"].fillna(0).sum()))
-    c4.metric("GOLD piemēri", int(projects["gold_examples_count"].fillna(0).sum()))
+    c3.metric("Pārbaudes", int(projects["checks_count"].fillna(0).sum()))
+    c4.metric("Pierādījumi", int(projects["evidence_count"].fillna(0).sum()))
+    c5.metric("Inženiera piezīmes", int(projects["review_notes_count"].fillna(0).sum()))
+    c6.metric("GOLD piemēri", int(projects["gold_examples_count"].fillna(0).sum()))
 
     overview = projects[[
-        "code", "name", "documents_count", "findings_count", "gold_examples_count",
+        "code", "name", "documents_count", "checks_count", "evidence_count",
+        "review_notes_count", "non_compliant_count", "review_required_count",
+        "findings_count", "gold_examples_count",
         "pending_count", "no_discrepancy_count", "deliverables_count", "deliverables_status"
     ]].copy()
     overview["deliverables_status"] = overview["deliverables_status"].map(STATUS_LABELS).fillna(overview["deliverables_status"])
@@ -109,7 +113,12 @@ def render_all_projects(projects: pd.DataFrame):
         "code": "Projekts",
         "name": "Nosaukums",
         "documents_count": "Dokumenti",
-        "findings_count": "Piezīmes",
+        "checks_count": "Pārbaudes",
+        "evidence_count": "Pierādījumi",
+        "review_notes_count": "Inženiera piezīmes",
+        "non_compliant_count": "Konstatēts",
+        "review_required_count": "Pārbaudei",
+        "findings_count": "Gala piezīmes",
         "gold_examples_count": "GOLD",
         "pending_count": "Pending",
         "no_discrepancy_count": "No discrepancies",
@@ -212,12 +221,19 @@ def render_project(project: pd.Series):
     title = project.get("name") or selected
     st.subheader(f"{selected} — {title}" if title != selected else selected)
 
-    c1, c2, c3, c4, c5 = st.columns(5)
+    c1, c2, c3, c4, c5, c6 = st.columns(6)
     c1.metric("Dokumenti", metric_value(project, "documents_count"))
-    c2.metric("Piezīmes", metric_value(project, "findings_count"))
-    c3.metric("GOLD", metric_value(project, "gold_examples_count"))
-    c4.metric("Pending", metric_value(project, "pending_count"))
-    c5.metric("Nodevumi", metric_value(project, "deliverables_count"))
+    c2.metric("Pārbaudes", metric_value(project, "checks_count"))
+    c3.metric("Pierādījumi", metric_value(project, "evidence_count"))
+    c4.metric("Inženiera piezīmes", metric_value(project, "review_notes_count"))
+    c5.metric("Gala piezīmes", metric_value(project, "findings_count"))
+    c6.metric("Nodevumi", metric_value(project, "deliverables_count"))
+
+    if metric_value(project, "review_notes_count"):
+        st.caption(
+            f"Inženiera piezīmes: {metric_value(project, 'non_compliant_count')} konstatētas; "
+            f"{metric_value(project, 'review_required_count')} pārbaudei."
+        )
 
     files = fetch_all(
         "project_file_overview",
@@ -553,7 +569,8 @@ def main():
     projects = fetch_all(
         "project_overview",
         "id,code,name,status,drive_folder_url,deliverables_status,documents_count,audit_runs_count,"
-        "findings_count,gold_examples_count,pending_count,no_discrepancy_count,deliverables_count",
+        "findings_count,gold_examples_count,pending_count,no_discrepancy_count,deliverables_count,"
+        "checks_count,evidence_count,review_notes_count,non_compliant_count,review_required_count",
     )
     if projects.empty:
         st.info("Datubāzē nav projektu.")
