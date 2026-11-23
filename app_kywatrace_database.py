@@ -19,6 +19,11 @@ STAGE_LABELS = {
     "other": "Citi",
 }
 
+MARKED_DRAWINGS_URLS = {
+    "PILLAR-VITOLU-A": "https://drive.google.com/drive/folders/19oAQw8ziDetxr4T4vngCe6pF3hVQnRsc",
+    "SVSK": "https://drive.google.com/drive/folders/1wnRIPQoots7CDXuNM0P3GJIrTrEQdunb",
+}
+
 
 @st.cache_resource
 def get_db():
@@ -105,6 +110,7 @@ def render_all_projects(projects: pd.DataFrame):
         "pending_count", "no_discrepancy_count", "deliverables_count", "deliverables_status"
     ]].copy()
     overview["deliverables_status"] = overview["deliverables_status"].map(STATUS_LABELS).fillna(overview["deliverables_status"])
+    overview["marked_drawings_url"] = overview["code"].map(MARKED_DRAWINGS_URLS).fillna("")
     overview = overview.rename(columns={
         "code": "Projekts",
         "name": "Nosaukums",
@@ -115,8 +121,20 @@ def render_all_projects(projects: pd.DataFrame):
         "no_discrepancy_count": "No discrepancies",
         "deliverables_count": "Nodevumi",
         "deliverables_status": "Nodevumu statuss",
+        "marked_drawings_url": "Rasējumi ar piezīmēm",
     })
-    st.dataframe(overview, use_container_width=True, hide_index=True)
+    st.dataframe(
+        overview,
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "Rasējumi ar piezīmēm": st.column_config.LinkColumn(
+                "Rasējumi ar piezīmēm",
+                display_text="Atvērt rasējumus ↗",
+                width="medium",
+            ),
+        },
+    )
 
     st.markdown("#### GOLD sadalījums pa projektiem")
     chart = projects[["code", "gold_examples_count"]].copy().set_index("code")
@@ -233,7 +251,7 @@ def render_project(project: pd.Series):
         {"code": selected},
     )
 
-    b1, b2, b3, b4 = st.columns(4)
+    b1, b2, b3, b4, b5 = st.columns(5)
     for col, label, stage in [
         (b1, "📥 Input", "input"),
         (b2, "📝 Results", "result"),
@@ -246,6 +264,22 @@ def render_project(project: pd.Series):
                 st.link_button(label, url, use_container_width=True)
             else:
                 st.button(label, disabled=True, use_container_width=True, key=f"disabled_{selected}_{stage}")
+
+    with b5:
+        marked_drawings_url = MARKED_DRAWINGS_URLS.get(selected)
+        if marked_drawings_url:
+            st.link_button(
+                "🖍️ Rasējumi ar piezīmēm",
+                marked_drawings_url,
+                use_container_width=True,
+            )
+        else:
+            st.button(
+                "🖍️ Rasējumi ar piezīmēm",
+                disabled=True,
+                use_container_width=True,
+                key=f"disabled_{selected}_marked_drawings",
+            )
 
     tabs = st.tabs([
         "Kopsavilkums",
