@@ -24,6 +24,51 @@ MARKED_DRAWINGS_URLS = {
     "SVSK": "https://drive.google.com/drive/folders/1wnRIPQoots7CDXuNM0P3GJIrTrEQdunb",
 }
 
+PROJECT_DELIVERABLE_FOLDERS = {
+    "SVSK": "https://drive.google.com/drive/folders/1DSILdCSjKFReAwF2_u5KJQlqTku3CYLE",
+}
+
+PROJECT_DELIVERABLES = {
+    "SVSK": [
+        {
+            "project_code": "SVSK",
+            "deliverable_name": "SVSK_KywaTrace_Zinojums_2026-11-14.pdf",
+            "deliverable_type": "Gala ziņojums",
+            "version": "2026-11-14",
+            "issue_date": "14.11.2026",
+            "status": "Gatavs",
+            "drive_file_url": "https://drive.google.com/file/d/1rSWIzCgZ2LRmyqzVhtqcNsDm1aadfjpz/view",
+            "client_delivery_folder_url": "https://drive.google.com/drive/folders/1DSILdCSjKFReAwF2_u5KJQlqTku3CYLE",
+            "sent_date": "",
+            "notes": "",
+        },
+        {
+            "project_code": "SVSK",
+            "deliverable_name": "SVSK_KywaTrace_Piezimju_Registrs_2026-11-14.xlsx",
+            "deliverable_type": "Piezīmju reģistrs",
+            "version": "2026-11-14",
+            "issue_date": "14.11.2026",
+            "status": "Gatavs",
+            "drive_file_url": "https://drive.google.com/file/d/1pbSsV_SdkYrkYWdNR0rrFmulckVYS3Rh/view",
+            "client_delivery_folder_url": "https://drive.google.com/drive/folders/1DSILdCSjKFReAwF2_u5KJQlqTku3CYLE",
+            "sent_date": "",
+            "notes": "",
+        },
+        {
+            "project_code": "SVSK",
+            "deliverable_name": "Marķēti rasējumi",
+            "deliverable_type": "Auditētie rasējumi",
+            "version": "2026-11-14",
+            "issue_date": "14.11.2026",
+            "status": "Gatavs",
+            "drive_file_url": "https://drive.google.com/drive/folders/1ckWq-9U7BkDkDPRiJXSm83-K_ojLxzN5",
+            "client_delivery_folder_url": "https://drive.google.com/drive/folders/1DSILdCSjKFReAwF2_u5KJQlqTku3CYLE",
+            "sent_date": "",
+            "notes": "Marķētie rasējumi sadalīti pa projekta sadaļām.",
+        },
+    ],
+}
+
 
 @st.cache_resource
 def get_db():
@@ -109,6 +154,10 @@ def render_all_projects(projects: pd.DataFrame):
         "code", "name", "documents_count", "findings_count", "gold_examples_count",
         "pending_count", "no_discrepancy_count", "deliverables_count", "deliverables_status"
     ]].copy()
+    for code, items in PROJECT_DELIVERABLES.items():
+        mask = overview["code"] == code
+        overview.loc[mask, "deliverables_count"] = len(items)
+        overview.loc[mask, "deliverables_status"] = "available"
     overview["deliverables_status"] = overview["deliverables_status"].map(STATUS_LABELS).fillna(overview["deliverables_status"])
     overview["marked_drawings_url"] = overview["code"].map(MARKED_DRAWINGS_URLS).fillna("")
     overview = overview.rename(columns={
@@ -235,7 +284,11 @@ def render_project(project: pd.Series):
     c2.metric("Piezīmes", metric_value(project, "findings_count"))
     c3.metric("GOLD", metric_value(project, "gold_examples_count"))
     c4.metric("Pending", metric_value(project, "pending_count"))
-    c5.metric("Nodevumi", metric_value(project, "deliverables_count"))
+    deliverables_count = max(
+        metric_value(project, "deliverables_count"),
+        len(PROJECT_DELIVERABLES.get(selected, [])),
+    )
+    c5.metric("Nodevumi", deliverables_count)
 
     files = fetch_all(
         "project_file_overview",
@@ -259,6 +312,8 @@ def render_project(project: pd.Series):
         (b4, "📦 Nodevums", "deliverable"),
     ]:
         url = first_stage_url(files, stage)
+        if stage == "deliverable":
+            url = PROJECT_DELIVERABLE_FOLDERS.get(selected) or url
         with col:
             if url:
                 st.link_button(label, url, use_container_width=True)
@@ -541,6 +596,13 @@ def render_project(project: pd.Series):
             "client_delivery_folder_url,sent_date,notes",
             {"project_code": selected},
         )
+        static_deliverables = pd.DataFrame(PROJECT_DELIVERABLES.get(selected, []))
+        if not static_deliverables.empty:
+            deliverables = pd.concat([deliverables, static_deliverables], ignore_index=True)
+            deliverables = deliverables.drop_duplicates(
+                subset=["deliverable_name", "drive_file_url"],
+                keep="last",
+            )
         if deliverables.empty:
             status = project.get("deliverables_status") or "—"
             if status == "not_created":
